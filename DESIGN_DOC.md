@@ -1,0 +1,391 @@
+# David — Design Document
+
+*Personal executive assistant bot. Single author, single user. Last updated: March 9 2026.*
+
+---
+
+## Why
+
+The problem is not a lack of information or ambition — it is a gap between intention and execution caused by two compounding failure modes.
+
+The first is reactive decision-making. Without a structured system that holds long-term goals in view, daily decisions get made in response to immediate pressure rather than actual priority. A message arrives, a task surfaces, and attention shifts — not because it should, but because the friction of re-evaluating everything from scratch every time is too high.
+
+The second is decision fatigue compounding into paralysis. The same friction that causes reactive decisions also causes perfectionism to stall progress. If the cost of deciding what to do next is high, the temptation is to either react or do nothing. Neither moves the needle on what actually matters.
+
+What's missing is a system that holds context across time — one that knows not just what's on the calendar today, but why it's there, what it connects to, and what would happen if it moved. Off-the-shelf AI assistants cannot do this. They have no persistent memory of decisions and rationale, no ability to write to a calendar, and no mechanism to trigger reviews or check-ins without manual initiation. They are reactive by design, and they may have one or a few of these capabilities, but are not integrated or seamless in terms of user experience.
+
+David is a custom-built personal assistant for myself with a front-end user interface on Telegram, integrates directly with Google Calendar, and maintains a living context document injected into every reasoning call. The goal is not to automate decisions but to reduce the cost of making good ones and stick with them, so that structured thinking becomes the path of least resistance rather than a tax on willpower; I believe in systems. You don't rise to the level of your goals, you fall to the level of your systems.
+
+In three months, success looks like: a more structured daily plan that flexes based on actual priorities, less friction between intention and action, and a clearer sense of how each day connects to longer-term goals. The gym is already frictionless. David should extend that quality — habitual, low-overhead, consistent — to cognitively demanding work.
+
+---
+
+## What
+
+### Success Criteria
+
+David works if, after three months of use:
+
+- Daily and weekly plans are proposed, confirmed, and largely followed — with changes made intentionally rather than reactively
+- Long-term goals remain visible and connected to near-term actions, not buried until a quarterly review
+- The cost of deciding what to do next is low enough that it no longer becomes a reason to stall
+
+These are intentionally qualitative. This is a personal productivity system, not a production ML service — the measure is whether it changes behaviour, not whether it hits a metric.
+
+### Functional Requirements
+
+David must handle three interaction modes. 
+- The first is automated: a daily morning check-in and a Sunday weekly review, both triggered without manual initiation. 
+- The second is operational ad hoc: short exchanges to reschedule events, retrieve past decisions, or block time. 
+- The third is reasoning ad hoc: open-ended brainstorming and priority discussion sessions that may run long.
+
+All calendar writes require explicit user confirmation before execution. The bot proposes, the user confirms or adjusts, only then does anything get written to Google Calendar.
+
+The Sunday review must read the prior week's actual calendar against what was planned, reason about the gap, propose the coming week's time blocks, and wait for sign-off before writing anything.
+
+The system must maintain three persistent context documents — a goals poster, a weekly state, and a decision log — and inject all three into every LLM call. This is what separates David from a stateless chat assistant: it always knows the why behind the current state of the calendar.
+
+### Technical Requirements and Constraints
+
+David runs as a single-user system on a VPS with always-on availability — no cold starts, no sleep timeouts. The Telegram interface must be responsive to messages at any hour. Scheduled triggers must fire reliably without manual intervention.
+
+Total cost must stay under $20/month. Expected actual cost is approximately $8–9/month including infrastructure, LLM API calls, and observability tooling.
+
+Any calendar write must be auditable after the fact. The system must log what was proposed, whether it was confirmed, and when it was executed. Need to handle timeouts and automatically close reasoning loops, with requests or triggers queued especially for scheduled runs
+
+### Out of Scope (v1)
+
+The following are explicitly deferred: multi-user or shared calendar access, voice input, work calendar integration, semantic search over historical decisions, and any mobile notification mechanism beyond Telegram messages. Data privacy hardening (encryption at rest, self-hosted LLM) is also deferred.
+
+### Assumptions
+
+I am the only user. 
+Daily interaction volume is low — on the order of 5–15 exchanges per day across all modes. 
+The reasoning workload is primarily natural language (priority tradeoffs, goal framing, scheduling logic), not structured ML inference. Google Calendar is the single source of truth for scheduled time.
+
+---
+
+## How
+
+### Methodology
+
+The core design decision is to treat context as a first-class artifact rather than relying on conversation history. Every LLM call is assembled by a `ContextBuilder` that reads three flat files — `goals.md`, `weekly_state.md`, `decision_log.md` — along with a live read of the Google Calendar. This means the reasoning model always has the full picture, regardless of whether the current exchange is a 1-turn reschedule request or a 30-turn brainstorm. (Original implementation didn't consider hand-offs or routing. Markdown files for iteration, but may need a more structured approach because multiple database tables were not feasible for first few runs)
+
+The system uses two models in a tiered arrangement, a higher-cost reasoning model (Gemini 3.1 Pro in this version) and a lower-cost general driver model (Gemini 3 Flash in this version). 
+
+Gemini Flash handles daily check-ins, operational ad hoc requests, and all turns during a brainstorming session. 
+When Flash detects a tradeoff or ambiguity that warrants deeper reasoning, it emits an `[[ESCALATE: reason]]` signal and the orchestrator routes the full context to Gemini 3.1 Pro. 
+Pro also handles every Sunday review directly, and synthesises all brainstorming sessions at close — distilling decisions made, rationale, and any calendar actions into the decision log.
+
+This two-tier arrangement keeps the majority of API cost on Flash (~$0.50/$3 per 1M tokens) while reserving Pro (~$2/$12 per 1M tokens) for the moments that actually require its reasoning depth, especially as general models have improved in reasoning. At expected usage, total LLM cost is forecasted to be under $3/month.
+
+Brainstorming sessions run on Flash throughout — cheap, 1M context, good enough for exploration — and close when the user presses a confirmation button or after 30 minutes of inactivity. At close, the full session transcript is sent to Pro for synthesis. This avoids the cost of Pro for every brainstorm turn while ensuring the output (decisions, rationale, calendar actions) benefits from stronger reasoning. (Need to test more on abstract reasoning if Flash is arguing on a sufficiently strong level)
+
+### System Design
+
+The system has five layers.
+
+```mermaid
+flowchart TD
+    %% ─────────────────────────────────────────
+    %% EXTERNAL
+    %% ─────────────────────────────────────────
+    USER(["Isaac (Telegram)"])
+    GCAL[(" Google Calendar 
+    All Calendars")]
+    LANGFUSE["📊 Langfuse
+    LLM Traces + Cost"]
+    SENTRY["🚨 Sentry
+    Error Alerting"]
+
+    %% ─────────────────────────────────────────
+    %% INTERFACE LAYER
+    %% ─────────────────────────────────────────
+    subgraph INTERFACE["Telegram Interface"]
+        TG["python-telegram-bot 20.x
+        async message + button handlers"]
+    end
+
+    %% ─────────────────────────────────────────
+    %% ORCHESTRATION LAYER
+    %% ─────────────────────────────────────────
+    subgraph ORCH["⚙️ Orchestration Layer"]
+        SM["SessionManager
+        IDLE → ACTIVE → CLOSING → IDLE"]
+        MR["MessageRouter
+        Mode A: Operational
+        Mode B: Brainstorm"]
+        CB["ContextBuilder
+        goals + weekly_state +
+        decision_log + calendar"]
+        EH["EscalationHandler
+        Flash → Pro handoff
+        Pro synthesis at session close"]
+        CQ["ConfirmationQueue
+        pending calendar writes
+        status: pending → confirmed"]
+        TS["TriggerScheduler
+        APScheduler
+        daily 7–9am + Sunday 10am
+        conflict resolution"]
+    end
+
+    %% ─────────────────────────────────────────
+    %% REASONING LAYER
+    %% ─────────────────────────────────────────
+    subgraph REASONING["🧠 Reasoning Layer"]
+        FLASH["Gemini Flash
+        Daily check-ins
+        Ad hoc operational Brainstorm turns 
+        ~$0.50/$3 per 1M tokens 
+        1M context"]
+        PRO["Gemini 3.1 Pro
+        
+        Sunday review
+        Escalated decisions
+        Session synthesis
+        ~$2/$12 per 1M tokens
+        1M context"]
+    end
+
+    %% ─────────────────────────────────────────
+    %% CONTEXT LAYER
+    %% ─────────────────────────────────────────
+    subgraph CONTEXT["📄 Context Layer (flat files)"]
+        GOALS["goals.md
+        long / medium / short term
+        human-edited"]
+        WEEKLY["weekly_state.md
+        current week priorities
+        overwritten every Sunday"]
+        DLOG["decision_log.md
+        rationale trail
+        append-only, bot writes"]
+    end
+
+    %% ─────────────────────────────────────────
+    %% PERSISTENCE LAYER
+    %% ─────────────────────────────────────────
+    subgraph PERSIST["🗄️ Persistence Layer"]
+        subgraph SQLITE["SQLite — assistant.db"]
+            T_SESS["sessions\ntype, status, tokens, synthesis"]
+            T_DEC["decisions\nrationale log"]
+            T_CAL["calendar_writes\naudit trail"]
+            T_ESC["escalations\nhandoff log"]
+            T_SNAP["weekly_snapshots\nSunday outputs"]
+        end
+    end
+
+    %% ─────────────────────────────────────────
+    %% OBSERVABILITY
+    %% ─────────────────────────────────────────
+    subgraph OBS["🔍 Observability"]
+        LOGURU["loguru\nstructured file logs\n/logs/app.log"]
+    end
+
+    %% ─────────────────────────────────────────
+    %% INFRASTRUCTURE
+    %% ─────────────────────────────────────────
+    subgraph INFRA["🖥️ Infrastructure — AWS Lightsail"]
+        SYSTEMD["systemd service\nauto-restart"]
+        BACKUP["rclone → Backblaze B2\ndaily SQLite + /context backup"]
+    end
+
+    %% ─────────────────────────────────────────
+    %% FLOWS
+    %% ─────────────────────────────────────────
+
+    USER -- "message / button press" --> TG
+    TG -- "routes to" --> SM
+    SM -- "classifies intent" --> MR
+
+    MR -- "Mode A: single-turn" --> CB
+    MR -- "Mode B: multi-turn session" --> CB
+
+    CB -- "reads" --> GOALS
+    CB -- "reads" --> WEEKLY
+    CB -- "reads" --> DLOG
+    CB -- "reads events" --> GCAL
+
+    CB -- "assembled context" --> FLASH
+
+    FLASH -- "ESCALATE signal" --> EH
+    FLASH -- "normal response" --> TG
+
+    EH -- "full context + Flash summary" --> PRO
+    PRO -- "synthesised response" --> TG
+
+    PRO -- "decisions + actions" --> DLOG
+    PRO -- "overwrite" --> WEEKLY
+
+    FLASH -- "proposes calendar write" --> CQ
+    PRO -- "proposes calendar write" --> CQ
+    CQ -- "awaits confirmation" --> TG
+    TG -- "user confirms" --> CQ
+    CQ -- "confirmed write" --> GCAL
+
+    TS -- "daily 7–9am" --> CB
+    TS -- "Sunday 10am → Pro direct" --> PRO
+    TS -- "conflict: queue or nudge" --> SM
+
+    SM --> T_SESS
+    CQ --> T_CAL
+    EH --> T_ESC
+    CB --> T_DEC
+    PRO --> T_SNAP
+
+    FLASH --> LANGFUSE
+    PRO --> LANGFUSE
+    SM --> LOGURU
+    CQ --> LOGURU
+
+    SYSTEMD -.-> ORCH
+    BACKUP -.-> PERSIST
+    BACKUP -.-> CONTEXT
+
+    SENTRY -.-> ORCH
+    SENTRY -.-> REASONING
+```
+
+The **interface layer** is a `python-telegram-bot` 20.x async process. It receives messages and button presses, routes them to the orchestration layer, and sends responses back. Inline buttons handle confirmation flows and session close actions.
+
+The **orchestration layer** is self-built Python — no LangChain, no LangGraph. It owns six concerns: session lifecycle state (`SessionManager`), intent classification (`MessageRouter`), context assembly (`ContextBuilder`), Flash-to-Pro routing (`EscalationHandler`), confirmation-gated calendar writes (`ConfirmationQueue`), and scheduled trigger management (`TriggerScheduler`). Each is a single-responsibility class; the whole layer is approximately 400–500 lines.
+
+The **reasoning layer** is two Gemini clients — Flash and Pro — both via the `google-generativeai` SDK. Both have 1M token context windows, which means the assembled context (goals + weekly state + decision log + calendar) never needs to be trimmed.
+
+The **context layer** is three markdown files on disk. They are read by `ContextBuilder` on every call and written by Pro at the end of brainstorm sessions and Sunday reviews. Keeping them as flat files rather than database rows means they are human-readable and human-editable, and straightforward to debug.
+
+The **persistence layer** is SQLite with five tables: `sessions`, `decisions`, `calendar_writes`, `escalations`, and `weekly_snapshots`. This is the structured audit trail — not the LLM's working memory, which lives in the context files.
+
+### Conversation Lifecycle
+
+Every conversation has an explicit lifecycle: `IDLE → ACTIVE → CLOSING → IDLE`. The transition from `ACTIVE` to `CLOSING` is triggered either by the user pressing a `/done` button on Telegram (which surfaces two options — close without calendar actions, or close and propose calendar changes) or by a 30-minute inactivity timeout. At `CLOSING`, the session transcript is sent to Pro for synthesis before the session is marked closed.
+
+Scheduled triggers respect active sessions. If the daily check-in fires during an active brainstorm, it is queued and delivered immediately after the session closes. If the Sunday review fires during an active session, a non-intrusive nudge is sent and the review waits for manual initiation or fires automatically one hour after the session closes.
+
+### Infrastructure
+
+David runs as a `systemd` service on a AWS Lightsail data centre, approximately 600km from Toronto.  Latency is 15–20ms — imperceptible given LLM call times of 1–3 seconds. The service costs approximately USD $5/month. Daily backups of `assistant.db` and the `/context` directory are pushed to Backblaze B2 via `rclone` at negligible cost.
+
+Observability uses three tools: Langfuse (cloud free tier) for per-call LLM traces, token counts, and cost tracking; Sentry (free tier) for exception capture; and `loguru` for structured local logs with rotation.
+
+### Tech Stack
+
+| Layer | Tool |
+|---|---|
+| Language | Python 3.12 |
+| Dependency management | `uv` |
+| Telegram interface | `python-telegram-bot` 20.x |
+| LLM — daily/ad hoc | Gemini Flash (`google-generativeai`) |
+| LLM — weekly/escalated | Gemini 3.1 Pro |
+| Calendar | `google-api-python-client` + `google-auth-oauthlib` |
+| Scheduler | `APScheduler` 3.x |
+| Database | SQLite + `sqlite-utils` |
+| Config | `python-dotenv` |
+| Logging | `loguru` |
+| LLM tracing | Langfuse |
+| Error alerting | Sentry |
+| Deployment | AWS Lightsail + `systemd` |
+| Backups | `rclone` → Backblaze B2 |
+
+### Cost
+
+| Item | Monthly |
+|---|---|
+| AWS Lightsail | ~$5 USD |
+| Gemini Flash (daily + ad hoc) | ~$1 |
+| Gemini 3.1 Pro (weekly + escalations + synthesis) | ~$1.50 |
+| Langfuse, Sentry, Backblaze B2 | $0 |
+| **Total** | **~$8.50** |
+
+---
+
+## Alternatives Considered and Rejected
+
+**LangChain / LangGraph as the orchestration framework.** Both were considered and rejected. LangChain adds abstraction over APIs that are already mature and easy to use directly; the abstraction makes debugging harder without meaningful benefit at this scale. LangGraph is well-suited for complex agent graphs with parallel branches and many nodes — the orchestration here is sequential with a single escalation path, which is better served by 400 lines of clean Python than by a graph framework.
+
+**Three-layer router architecture (daily layer → strategy layer → logic layer).** Considered at the suggestion of common agentic design patterns. Rejected because the complexity — additional latency, a separate routing model, more prompt engineering surface area — is not justified for a single-user, low-volume system. The two-tier Flash + conditional escalation to Pro achieves the same functional outcome with far less to debug.
+
+**Claude Sonnet 4.6 as the reasoning model.** Strong instruction-following and structured output reliability. Rejected primarily on cost ($3/$15 per 1M tokens vs. $2/$12 for Gemini 3.1 Pro) and context window (200k vs. 1M). The 1M context window eliminates an entire class of engineering problems — no need to trim the context document as the decision log grows. Gemini 3.1 Pro also leads most major agentic benchmarks as of March 2026.
+
+**GPT-5.4 as the reasoning model.** Impressive benchmark performance. Rejected because its tiered pricing doubles past 272k tokens for the full session — an active risk for a system that deliberately injects large context on every call.
+
+**PostgreSQL instead of SQLite.** Rejected. PostgreSQL introduces a separate server process, network overhead, connection management, and ops complexity. For a single-user system generating ~50–100 rows per day, SQLite is the correct choice — it handles millions of rows, provides full ACID transactions, and is a single file that can be backed up with `cp`.
+
+**Fly.io or Render for deployment.** Both considered. Fly.io has usage-based pricing that is hard to predict and risks cold starts. Render's free tier sleeps on inactivity — fatal for an always-on bot. The paid Render tier that avoids sleep costs $19/month before compute. An AWS Lightsail service provides full control, predictable cost, and no cold start behaviour.
+
+**Offloading brainstorming to an external chatbot (Claude.ai, ChatGPT).** Considered as a way to leverage better UX for long reasoning sessions and avoid LLM costs during multi-turn exchanges. Rejected because it breaks the integrated workflow: an external chatbot has no awareness of the goals poster, decision log, or calendar state, so it cannot make grounded recommendations. The Flash-drafts-Pro-synthesises approach achieves low cost during exploration and high-quality output at session close, without leaving the integrated system.
+
+---
+
+## Appendix
+
+### Repository Structure
+
+```
+david/
+├── main.py
+├── .env
+├── .env.example
+├── requirements.txt
+│
+├── bot/
+│   ├── handlers.py
+│   └── keyboards.py
+│
+├── orchestrator/
+│   ├── session_manager.py
+│   ├── message_router.py
+│   ├── context_builder.py
+│   ├── escalation_handler.py
+│   ├── confirmation_queue.py
+│   └── trigger_scheduler.py
+│
+├── reasoning/
+│   ├── flash_client.py
+│   ├── pro_client.py
+│   └── prompts/
+│       ├── daily_checkin.txt
+│       ├── adhoc_operational.txt
+│       ├── adhoc_brainstorm.txt
+│       ├── synthesis.txt
+│       └── sunday_review.txt
+│
+├── integrations/
+│   ├── calendar.py
+│   └── auth.py
+│
+├── persistence/
+│   ├── database.py
+│   └── models.py
+│
+├── context/
+│   ├── goals.md
+│   ├── weekly_state.md
+│   └── decision_log.md
+│
+├── data/
+│   └── assistant.db
+│
+├── logs/
+│   └── app.log
+│
+└── scripts/
+    ├── setup.py
+    └── backup.sh
+```
+
+### Build Order
+
+1. Repo scaffold + `uv` environment
+2. Google Calendar OAuth + basic read test
+3. Telegram bot loop (echo test)
+4. `ContextBuilder` + `goals.md` schema
+5. First Gemini Flash call through orchestrator
+6. Calendar write with confirmation queue
+7. APScheduler daily trigger
+8. Session lifecycle (`SessionManager` + `/done` button)
+9. Sunday review flow (Pro)
+10. Escalation handler
+11. Langfuse + Sentry wiring
+12. Backup script
