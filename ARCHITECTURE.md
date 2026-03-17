@@ -136,7 +136,7 @@ flowchart TD
     subgraph CONTEXT["📄 Context Layer"]
         GOALS["goals.md\nlong / medium / short term\nhuman-edited"]
         WEEKLY["weekly_state.md\ncurrent week priorities\noverwritten every Sunday"]
-        DLOG["decision_log.md\nrationale trail\nappend-only"]
+        DLOG["decision_log.md\nrationale trail\nappended daily, synthesized weekly"]
     end
 
     subgraph PERSIST["🗄️ Persistence — SQLite"]

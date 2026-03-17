@@ -160,7 +160,7 @@ flowchart TD
         overwritten every Sunday"]
         DLOG["decision_log.md
         rationale trail
-        append-only, bot writes"]
+        appended daily, synthesized weekly"]
     end
 
     %% ─────────────────────────────────────────
@@ -255,17 +255,17 @@ The **reasoning layer** is two Gemini clients — Flash and Pro — both via the
 
 The **context layer** is three markdown files on disk. They are read by `ContextBuilder` on every call and written by Pro at the end of brainstorm sessions and Sunday reviews. Keeping them as flat files rather than database rows means they are human-readable and human-editable, and straightforward to debug.
 
-The **persistence layer** is SQLite with five tables: `sessions`, `decisions`, `calendar_writes`, `escalations`, and `weekly_snapshots`. This is the structured audit trail — not the LLM's working memory, which lives in the context files.
+The **persistence layer** is SQLite with five tables: `sessions`, `decisions`, `calendar_writes`, `escalations`, and `weekly_snapshots`. This is the structured audit trail — not the LLM's working memory, which lives in the context files. The `decision_log.md` is synthesized weekly to maintain a rolling window of recent decisions, preventing indefinite growth.
 
 ### Conversation Lifecycle
 
-Every conversation has an explicit lifecycle: `IDLE → ACTIVE → CLOSING → IDLE`. The transition from `ACTIVE` to `CLOSING` is triggered either by the user pressing a `/done` button on Telegram (which surfaces two options — close without calendar actions, or close and propose calendar changes) or by a 30-minute inactivity timeout. At `CLOSING`, the session transcript is sent to Pro for synthesis before the session is marked closed.
+Every conversation has an explicit lifecycle: `IDLE → ACTIVE → CLOSING → IDLE`. The transition from `ACTIVE` to `CLOSING` is triggered either by the user pressing a `/done` button on Telegram (which surfaces two options — close without calendar actions, or close and propose calendar changes) or by a 30-minute inactivity timeout. At `CLOSING`, the session transcript is sent to Pro to distill decisions, rationale, and calendar actions, which are then **appended** to the current `decision_log.md`. The full log is only synthesized and compacted into a rolling window once a week during the Sunday review.
 
 Scheduled triggers respect active sessions. If the daily check-in fires during an active brainstorm, it is queued and delivered immediately after the session closes. If the Sunday review fires during an active session, a non-intrusive nudge is sent and the review waits for manual initiation or fires automatically one hour after the session closes.
 
 ### Infrastructure
 
-David runs as a `systemd` service on a AWS Lightsail data centre, approximately 600km from Toronto.  Latency is 15–20ms — imperceptible given LLM call times of 1–3 seconds. The service costs approximately USD $5/month. Daily backups of `assistant.db` and the `/context` directory are pushed to Backblaze B2 via `rclone` at negligible cost.
+David runs as a `systemd` service on a AWS Lightsail data centre. Latency is 15–20ms — imperceptible given LLM call times of 1–3 seconds. The service costs approximately USD $5/month. Daily backups of `assistant.db` and the `/context` directory are pushed to Backblaze B2 via `rclone` at negligible cost.
 
 Observability uses three tools: Langfuse (cloud free tier) for per-call LLM traces, token counts, and cost tracking; Sentry (free tier) for exception capture; and `loguru` for structured local logs with rotation.
 

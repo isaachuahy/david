@@ -1,0 +1,21 @@
+[project]
+name = "david"
+version = "0.1.0"
+description = "Personal executive AI assistant with abstract long-term goal reasoning, persistent memory and calendar integration."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "python-telegram-bot[job-queue]>=20.8",
+    "google-generativeai>=0.4.0",
+    "google-api-python-client>=2.120.0",
+    "google-auth-oauthlib>=1.2.0",
+    "APScheduler>=3.10.4",
+    "sqlite-utils>=3.36",
+    "python-dotenv>=1.0.1",
+    "loguru>=0.7.2",
+    "langfuse>=2.14.0",
+    "sentry-sdk>=1.40.6"
+]
+
+[tool.uv]
+managed = true
