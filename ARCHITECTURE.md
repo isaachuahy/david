@@ -6,7 +6,7 @@
 
 ## 1. System Context
 
-The highest level view. David sits between Isaac and three external systems: Telegram (interface), Google Calendar (integration), and the Gemini API (reasoning). Everything else is internal.
+The highest-level view. David sits between Isaac and three external systems: Telegram (interface), Google Calendar (integration), and the Gemini API (reasoning). Everything else is internal.
 
 ```mermaid
 C4Context
@@ -18,7 +18,7 @@ C4Context
 
     System_Ext(telegram, "Telegram", "Message interface. Delivers check-ins, receives commands, surfaces confirmation buttons.")
     System_Ext(gcal, "Google Calendar", "Source of truth for scheduled time. David reads all calendars and writes confirmed blocks.")
-    System_Ext(gemini, "Gemini API (Google)", "Reasoning layer. Flash for daily/ad hoc. 3.1 Pro for weekly review, escalations, session synthesis.")
+    System_Ext(gemini, "Gemini API (Google)", "Reasoning layer. Flash for daily/ad hoc. Pro for weekly review, escalations, session synthesis.")
     System_Ext(langfuse, "Langfuse", "LLM observability. Traces every call with token counts and cost.")
     System_Ext(sentry, "Sentry", "Error alerting. Catches unhandled exceptions.")
     System_Ext(b2, "Backblaze B2", "Off-site backup. Daily snapshot of SQLite + context files.")
@@ -54,19 +54,19 @@ flowchart TD
     C -- "Mode A\noperational" --> E[ContextBuilder\nAssemble prompt]
     C -- "Mode B\nbrainstorm" --> F[ContextBuilder\nAssemble prompt\n+ session history]
 
-    E --> G["Gemini Flash\n(single-turn)"]
-    F --> H["Gemini Flash\n(brainstorm turn)"]
+    E --> G["Gemini Flash\nReturns structured FlashResponse\n{message, should_escalate, escalation_reason}"]
+    F --> H["Gemini Flash\nReturns structured FlashResponse\n(brainstorm turn)"]
 
-    G --> I{Response contains\nESCALATE signal?}
+    G --> I{flash_response\n.should_escalate?}
     H --> J{Session closing?\n/done or 30min timeout}
 
-    I -- "No" --> K["Send response\nto Telegram"]
-    I -- "Yes" --> L["EscalationHandler\nPass full context\n+ Flash summary to Pro"]
+    I -- "False" --> K["Send response\nto Telegram"]
+    I -- "True" --> L["EscalationHandler\nBuilds escalation prompt:\nassembled_context +\nflash message +\nescalation_reason"]
 
-    J -- "No\nstill active" --> K
-    J -- "Yes\nclosing" --> M["Send full transcript\nto Gemini 3.1 Pro\nfor synthesis"]
+    J -- "False\nstill active" --> K
+    J -- "True\nclosing" --> M["Send full transcript\nto Gemini Pro\nfor synthesis"]
 
-    L --> N["Gemini 3.1 Pro\n(escalated reasoning)"]
+    L --> N["Gemini Pro\n(escalated reasoning)\nReceives full context +\nFlash draft + reason"]
     M --> N
 
     N --> O["Pro response\nor synthesis output"]
@@ -97,7 +97,11 @@ flowchart TD
 
 ### Key invariants
 
-Every calendar write passes through `ConfirmationQueue` — there is no path from a model response to a Google Calendar write that bypasses user confirmation. The `[[ESCALATE: reason]]` signal is emitted by Flash as plain text at the end of its response; the orchestrator checks for it with a simple string match. Session synthesis always goes to Pro regardless of whether the session was escalated mid-way.
+Every calendar write passes through `ConfirmationQueue` — there is no path from a model response to a Google Calendar write that bypasses user confirmation.
+
+Flash always returns a typed `FlashResponse` object with a `should_escalate: bool` field. The orchestrator reads this field directly — there is no string matching or signal parsing. When escalation fires, `EscalationHandler` constructs a prompt containing the full assembled context, Flash's draft message, and the structured escalation reason. Pro therefore receives *more* information than Flash had, not less — it sees the full picture plus Flash's initial assessment.
+
+Session synthesis always goes to Pro regardless of whether the session was escalated mid-way.
 
 ---
 
@@ -116,27 +120,27 @@ flowchart TD
     SENTRY["🚨 Sentry\nError Alerting"]
 
     subgraph INTERFACE["📱 Telegram Interface"]
-        TG["python-telegram-bot 20.x\nasync message + button handlers"]
+        TG["python-telegram-bot\nasync message + button handlers"]
     end
 
     subgraph ORCH["⚙️ Orchestration Layer"]
         SM["SessionManager\nIDLE → ACTIVE → CLOSING → IDLE"]
         MR["MessageRouter\nMode A: Operational\nMode B: Brainstorm"]
         CB["ContextBuilder\ngoals + weekly_state +\ndecision_log + calendar"]
-        EH["EscalationHandler\nFlash → Pro handoff\nPro synthesis at session close"]
+        EH["EscalationHandler\nReads flash_response.should_escalate\nBuilds escalation prompt for Pro\nLogs to escalations table"]
         CQ["ConfirmationQueue\npending calendar writes\nstatus: pending → confirmed"]
         TS["TriggerScheduler\nAPScheduler\ndaily 7–9am + Sunday 10am\nconflict resolution"]
     end
 
     subgraph REASONING["🧠 Reasoning Layer"]
-        FLASH["Gemini Flash\n\nDaily check-ins\nAd hoc operational\nBrainstorm turns\n~$0.50/$3 per 1M tokens\n1M context"]
-        PRO["Gemini 3.1 Pro\n\nSunday review\nEscalated decisions\nSession synthesis\n~$2/$12 per 1M tokens\n1M context"]
+        FLASH["Gemini Flash\n\nDaily check-ins\nAd hoc operational\nBrainstorm turns\nReturns typed FlashResponse\n~$0.50/$3 per 1M tokens"]
+        PRO["Gemini Pro\n\nSunday review\nEscalated decisions\nSession synthesis\nReceives full context + Flash draft\n~$2/$12 per 1M tokens"]
     end
 
     subgraph CONTEXT["📄 Context Layer"]
         GOALS["goals.md\nlong / medium / short term\nhuman-edited"]
         WEEKLY["weekly_state.md\ncurrent week priorities\noverwritten every Sunday"]
-        DLOG["decision_log.md\nrationale trail\nappended daily, synthesized weekly"]
+        DLOG["decision_log.md\nrationale trail\nappended daily, synthesised weekly"]
     end
 
     subgraph PERSIST["🗄️ Persistence — SQLite"]
@@ -151,7 +155,7 @@ flowchart TD
         LOGURU["loguru / app.log"]
     end
 
-    subgraph INFRA["AWS Lightsail"]
+    subgraph INFRA["🖥️ AWS Lightsail"]
         SYSTEMD["systemd — auto-restart"]
         BACKUP["rclone → Backblaze B2"]
     end
@@ -164,9 +168,9 @@ flowchart TD
     CB --> GOALS & WEEKLY & DLOG & GCAL
     CB --> FLASH
 
-    FLASH -- "ESCALATE" --> EH
-    FLASH -- "response" --> TG
-    EH --> PRO
+    FLASH -- "should_escalate: true" --> EH
+    FLASH -- "should_escalate: false" --> TG
+    EH -- "full context + Flash draft + reason" --> PRO
     PRO --> TG
     PRO --> DLOG & WEEKLY
 
