@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "python-telegram-bot[job-queue]>=20.8",
-    "google-generativeai>=0.4.0",
+    "google-genai>=0.3.0",
     "google-api-python-client>=2.120.0",
     "google-auth-oauthlib>=1.2.0",
     "APScheduler>=3.10.4",

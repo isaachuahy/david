@@ -204,3 +204,4 @@ data/*.db
 data/*.db-journal
 
 .DS_Store
+google_genai_reference.md

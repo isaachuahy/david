@@ -4,6 +4,9 @@ from loguru import logger
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
+from orchestrator.context_builder import build_context
+from reasoning.flash_client import generate_flash_response
+
 # Load environment variables from .env
 load_dotenv()
 
@@ -15,10 +18,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Hello! I am David. I am currently running in echo mode.")
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Echoes the user message back to them."""
+    """Handles ad-hoc messages by passing them through the ContextBuilder and Flash model."""
     text = update.message.text
     logger.info(f"Received message: {text}")
-    await update.message.reply_text(f"Echo: {text}")
+    
+    try:
+        context_block = build_context()
+        flash_response = generate_flash_response(user_message=text, context_block=context_block)
+        
+        logger.info(f"Flash Escalate Signal: {flash_response.should_escalate}")
+        if flash_response.should_escalate:
+            logger.info(f"Escalation Reason: {flash_response.escalation_reason}")
+            
+        await update.message.reply_text(flash_response.message)
+    except Exception as e:
+        logger.error(f"Error during reasoning loop: {e}")
+        await update.message.reply_text("Sorry, I encountered an error while thinking. Please check the logs.")
 
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
