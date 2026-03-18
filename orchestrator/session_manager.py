@@ -15,6 +15,10 @@ def is_session_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Checks if the user currently has an active session."""
     return context.user_data.get('session_state') == SessionStatus.ACTIVE
 
+def get_session_state(context: ContextTypes.DEFAULT_TYPE) -> SessionStatus:
+    """Retrieves the current session state."""
+    return context.user_data.get('session_state', SessionStatus.IDLE)
+
 def get_chat_history(context: ContextTypes.DEFAULT_TYPE) -> list:
     """Retrieves the current session's chat history."""
     return context.user_data.get('chat_history', [])
@@ -94,6 +98,23 @@ def start_session(context: ContextTypes.DEFAULT_TYPE) -> str:
     logger.info(f"Started new session: {session_id}")
     return session_id
 
+async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
+    """Background job to synthesize the session transcript and finalize closing."""
+    job_data = context.job.data
+    chat_id = job_data["chat_id"]
+    session_id = job_data.get("session_id")
+    
+    logger.info(f"Running background synthesis for session {session_id}...")
+    # TODO: Execute Gemini Pro log synthesis here
+    
+    # Finalize transition to IDLE
+    context.user_data['chat_history'] = []
+    context.user_data['session_state'] = SessionStatus.IDLE
+    context.user_data['current_session_id'] = None
+    
+    # Evaluate the trigger queue
+    await prompt_next_trigger(context, chat_id)
+
 async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: str = "done"):
     """Ends the active session, clears short-term memory, and checks for pending triggers."""
     session_id = context.user_data.get('current_session_id')
@@ -103,22 +124,19 @@ async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: 
             "status": SessionStatus.CLOSING.value,
             "end_time": datetime.now(timezone.utc).isoformat()
         })
-        logger.info(f"Closed session: {session_id}")
+        logger.info(f"Transitioning session {session_id} to CLOSING.")
+        
+    context.user_data['session_state'] = SessionStatus.CLOSING
         
     if reason == "timeout":
-        text = "Session closed after 30 minutes of inactivity. Transcript ready for synthesis."
+        text = "Session timed out. Synthesizing decisions in the background..."
     else:
-        text = "Session closed. Transcript ready for synthesis."
+        text = "Session closed. Synthesizing decisions in the background..."
         
     try:
         await context.bot.send_message(chat_id=chat_id, text=text)
     except Exception as e:
         logger.error(f"Failed to send session close message: {e}")
         
-    # Clear short-term memory
-    context.user_data['chat_history'] = []
-    context.user_data['session_state'] = SessionStatus.IDLE
-    context.user_data['current_session_id'] = None
-    
-    # Evaluate the trigger queue to see if anything was delayed
-    await prompt_next_trigger(context, chat_id)
+    # Schedule the synthesis task to run immediately without blocking the UI
+    context.job_queue.run_once(execute_synthesis_task, 0, data={"chat_id": chat_id, "session_id": session_id})

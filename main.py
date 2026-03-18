@@ -10,7 +10,7 @@ from reasoning.flash_client import generate_flash_response
 from orchestrator.confirmation_queue import add_pending_write, confirm_write, reject_write, get_pending_write
 from orchestrator.trigger_scheduler import setup_scheduler, queue_trigger, consume_trigger
 from orchestrator.session_manager import (
-    start_session, end_session, reset_session_timeout, cancel_session_timeout,
+    start_session, end_session, reset_session_timeout, cancel_session_timeout, get_session_state,
     is_session_active, get_chat_history, append_chat_history,
     add_pending_write_ui_state, get_pending_write_ui_states, remove_pending_write_ui_state, clear_pending_write_ui_states
 )
@@ -116,6 +116,11 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles ad-hoc messages by passing them through the ContextBuilder and Flash model."""
+    # Block new messages if the session is currently synthesizing
+    if get_session_state(context) == SessionStatus.CLOSING:
+        await update.message.reply_text("⏳ *I am currently synthesizing our last session. Please give me a moment...*", parse_mode="Markdown")
+        return
+        
     # Check if they sent a text message while a write is waiting for confirmation
     pending_writes = get_pending_write_ui_states(context)
     if pending_writes:

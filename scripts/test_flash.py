@@ -1,5 +1,10 @@
 import os
+import sys
 from dotenv import load_dotenv
+
+# Add the project root to sys.path so we can import local modules
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from reasoning.flash_client import generate_flash_response
 
 def main():
