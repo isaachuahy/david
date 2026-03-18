@@ -60,51 +60,65 @@ async def test_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Store the pending write in user data so we can cancel it if they type a text message
     add_pending_write_ui_state(context, write_id, message.message_id)
 
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles inline button presses for the confirmation queue."""
+async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles confirmation of a proposed calendar write."""
     query = update.callback_query
-    await query.answer() # Acknowledge the button press to Telegram
+    await query.answer()
     
-    data = query.data
-    if data.startswith("confirm_"):
-        write_id = data.split("confirm_")[1]
-    elif data.startswith("reject_"):
-        write_id = data.split("reject_")[1]
-    elif data.startswith("start_trigger_"):
-        trigger_type = data.split("start_trigger_")[1]
-        consume_trigger(context, trigger_type)
-        if trigger_type == "daily_checkin":
-            await query.edit_message_text("🌅 *Daily Check-in Started.* What are your top priorities for today?", parse_mode="Markdown")
-        elif trigger_type == "weekly_review":
-            await query.edit_message_text("📅 *Starting Sunday Review. Analyzing your week...*", parse_mode="Markdown")
-            await run_sunday_review(update, context)
-        return
-    elif data == "delay_trigger":
-        await query.edit_message_text("Got it. We will chat first. I'll hold onto this trigger until you're ready.", parse_mode="Markdown")
-        return
-    elif data == "confirm_weekly_state":
-        await execute_weekly_state_update(update, context)
-        return
-    else:
-        return
-        
-    # Clear from state so it doesn't trigger the text interruption logic later
+    write_id = query.data.split("confirm_")[1]
     remove_pending_write_ui_state(context, write_id)
         
-    # Ensure it hasn't timed out or been interrupted already
     record = get_pending_write(write_id)
     if not record or record.status != CalendarWriteStatus.PENDING:
         await query.edit_message_text(text="❌ *This request is no longer valid or has already been processed.*", parse_mode="Markdown")
         return
 
-    if data.startswith("confirm_"):
-        success = confirm_write(write_id)
-        text = f"{query.message.text}\n\n✅ *Event Confirmed and Scheduled.*" if success else f"{query.message.text}\n\n❌ *Failed to schedule event.*"
-        await query.edit_message_text(text=text, parse_mode="Markdown")
-    elif data.startswith("reject_"):
-        success = reject_write(write_id)
-        text = f"{query.message.text}\n\n🚫 *Event Rejected.*" if success else f"{query.message.text}\n\n❌ *Failed to reject event.*"
-        await query.edit_message_text(text=text, parse_mode="Markdown")
+    success = confirm_write(write_id)
+    text = f"{query.message.text}\n\n✅ *Event Confirmed and Scheduled.*" if success else f"{query.message.text}\n\n❌ *Failed to schedule event.*"
+    await query.edit_message_text(text=text, parse_mode="Markdown")
+
+async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles rejection of a proposed calendar write."""
+    query = update.callback_query
+    await query.answer()
+    
+    write_id = query.data.split("reject_")[1]
+    remove_pending_write_ui_state(context, write_id)
+        
+    record = get_pending_write(write_id)
+    if not record or record.status != CalendarWriteStatus.PENDING:
+        await query.edit_message_text(text="❌ *This request is no longer valid or has already been processed.*", parse_mode="Markdown")
+        return
+
+    success = reject_write(write_id)
+    text = f"{query.message.text}\n\n🚫 *Event Rejected.*" if success else f"{query.message.text}\n\n❌ *Failed to reject event.*"
+    await query.edit_message_text(text=text, parse_mode="Markdown")
+
+async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles starting a scheduled trigger."""
+    query = update.callback_query
+    await query.answer()
+    
+    trigger_type = query.data.split("start_trigger_")[1]
+    consume_trigger(context, trigger_type)
+    
+    if trigger_type == "daily_checkin":
+        await query.edit_message_text("🌅 *Daily Check-in Started.* What are your top priorities for today?", parse_mode="Markdown")
+    elif trigger_type == "weekly_review":
+        await query.edit_message_text("📅 *Starting Sunday Review. Analyzing your week...*", parse_mode="Markdown")
+        await run_sunday_review(update, context)
+
+async def handle_delay_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles delaying a scheduled trigger."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Got it. We will chat first. I'll hold onto this trigger until you're ready.", parse_mode="Markdown")
+
+async def handle_confirm_weekly_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles confirmation to overwrite the weekly state."""
+    query = update.callback_query
+    await query.answer()
+    await execute_weekly_state_update(update, context)
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Closes the active session and checks for pending triggers."""
@@ -189,7 +203,11 @@ def main():
     app.add_handler(CommandHandler("done", done_command, filters=user_filter))
     app.add_handler(CommandHandler("test_trigger", test_trigger, filters=user_filter))
     app.add_handler(CommandHandler("test_schedule", test_schedule, filters=user_filter))
-    app.add_handler(CallbackQueryHandler(handle_button))
+    app.add_handler(CallbackQueryHandler(handle_confirm, pattern=r"^confirm_"))
+    app.add_handler(CallbackQueryHandler(handle_reject, pattern=r"^reject_"))
+    app.add_handler(CallbackQueryHandler(handle_start_trigger, pattern=r"^start_trigger_"))
+    app.add_handler(CallbackQueryHandler(handle_delay_trigger, pattern=r"^delay_trigger$"))
+    app.add_handler(CallbackQueryHandler(handle_confirm_weekly_state, pattern=r"^confirm_weekly_state$"))
     # MessageHandler is a catch-all for any text messsages that aren't commands
     app.add_handler(MessageHandler(user_filter & filters.TEXT & ~filters.COMMAND, handle_message))
 
