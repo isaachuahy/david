@@ -1,5 +1,6 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from typing import Optional
 from loguru import logger
 
 from persistence.database import get_db
@@ -28,15 +29,15 @@ def add_pending_write(summary: str, start_time: datetime, end_time: datetime, de
         "created_at": now_iso
     }
     
-    db["calendar_writes"].insert(record)
+    db["calendar_writes"].insert(record)  # type: ignore
     logger.info(f"Added pending calendar write [{write_id}]: '{summary}'")
     return write_id
 
-def get_pending_write(write_id: str) -> dict:
+def get_pending_write(write_id: str) -> Optional[dict]:
     """Retrieves a pending write from the database by ID."""
     db = get_db()
     try:
-        return db["calendar_writes"].get(write_id)
+        return db["calendar_writes"].get(write_id)  # type: ignore
     except Exception as e:
         logger.error(f"Failed to retrieve pending write {write_id}: {e}")
         return None
@@ -50,6 +51,13 @@ def confirm_write(write_id: str) -> bool:
     
     if not record or record["status"] != "pending":
         logger.warning(f"Cannot confirm write {write_id}: not found or not pending.")
+        return False
+        
+    # Lazy Expiration: Check if the proposal is older than 2 hours
+    created_at = datetime.fromisoformat(record["created_at"])
+    if datetime.now(timezone.utc) - created_at > timedelta(hours=2):
+        logger.warning(f"Pending write {write_id} has expired (older than 2 hours). Auto-rejecting.")
+        db["calendar_writes"].update(write_id, {"status": "expired"})  # type: ignore
         return False
         
     logger.info(f"Confirming write {write_id}...")
@@ -66,7 +74,7 @@ def confirm_write(write_id: str) -> bool:
     )
     
     if created_event:
-        db["calendar_writes"].update(write_id, {"status": "executed"})
+        db["calendar_writes"].update(write_id, {"status": "executed"})  # type: ignore
         logger.success(f"Successfully executed write {write_id} to Google Calendar.")
         return True
     else:
@@ -82,6 +90,6 @@ def reject_write(write_id: str) -> bool:
         logger.warning(f"Cannot reject write {write_id}: not found or not pending.")
         return False
         
-    db["calendar_writes"].update(write_id, {"status": "rejected"})
+    db["calendar_writes"].update(write_id, {"status": "rejected"})  # type: ignore
     logger.info(f"Rejected pending write {write_id}.")
     return True

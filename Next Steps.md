@@ -1,9 +1,0 @@
-- ENSURE THAT FLASH & PRO CAN HANDLE MULTI-TURN CONVERSATIONS
-- read events from past week
-- Ensure testing suite is consistent across scripts and tests directory (and ensure they are testing each individual function/method now)
-- how long does a session last? ensure they get handled properly across sessions.
-- storing timeout events? rejected events?
-- context passes consistently and is persistent across Flash to Pro reasoning
-- strict prompt injection protections
-- Multiple calendar writes functionality
-- Brainstorming is grounded by Google search?

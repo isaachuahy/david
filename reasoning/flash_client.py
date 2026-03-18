@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, cast
 from pydantic import BaseModel, Field
 from google import genai
 from loguru import logger
@@ -55,4 +55,4 @@ def generate_flash_response(user_message: str, context_block: str, chat_history:
         }
     )
     
-    return response.parsed
+    return cast(FlashResponse, response.parsed)

@@ -11,13 +11,10 @@ from reasoning.pro_client import generate_sunday_review
 from integrations.calendar import get_past_events
 from orchestrator.confirmation_queue import add_pending_write, confirm_write, reject_write, get_pending_write
 from orchestrator.trigger_scheduler import setup_scheduler, queue_trigger
-from orchestrator.session_manager import start_session, end_session
+from orchestrator.session_manager import start_session, end_session, reset_session_timeout, cancel_session_timeout
 
 # Load environment variables from .env
 load_dotenv()
-
-SESSION_INACTIVITY_TIMEOUT = timedelta(minutes=30)
-SESSION_TIMEOUT_JOB_PREFIX = "session_inactivity_timeout"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /start command."""
@@ -25,60 +22,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"User {user_id} started the bot.")
     # Echo for now, but this is where we can add more complex interactions later
     await update.message.reply_text("Hello! I am David.")
-
-async def timeout_pending_write(context: ContextTypes.DEFAULT_TYPE):
-    """Job to automatically reject a pending write if no action is taken."""
-    write_id, chat_id, message_id = context.job.data
-    
-    record = get_pending_write(write_id)
-    if record and record.get("status") == "pending":
-        logger.info(f"Pending write {write_id} timed out. Auto-rejecting.")
-        reject_write(write_id)
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text="⏳ *Request timed out after 30 seconds. Event not scheduled.*",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"Failed to update timeout message UI: {e}")
-
-def get_session_timeout_job_name(user_id: int) -> str:
-    """Builds a stable job name for a user's inactivity timeout."""
-    return f"{SESSION_TIMEOUT_JOB_PREFIX}_{user_id}"
-
-def cancel_session_timeout(context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    """Cancels any scheduled inactivity timeout for the user."""
-    for job in context.job_queue.get_jobs_by_name(get_session_timeout_job_name(user_id)):
-        job.schedule_removal()
-
-def reset_session_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
-    """Restarts the inactivity timeout countdown for the active session."""
-    cancel_session_timeout(context, user_id)
-    context.job_queue.run_once(
-        timeout_inactive_session,
-        SESSION_INACTIVITY_TIMEOUT,
-        data={"chat_id": chat_id},
-        name=get_session_timeout_job_name(user_id),
-        chat_id=chat_id,
-        user_id=user_id,
-    )
-
-async def timeout_inactive_session(context: ContextTypes.DEFAULT_TYPE):
-    """Closes the active session after 30 minutes without a new message."""
-    chat_id = context.job.data["chat_id"]
-
-    if context.user_data.get('session_state') != 'ACTIVE':
-        logger.info(f"Inactivity timeout fired for chat {chat_id}, but no active session remained.")
-        return
-
-    logger.info(f"Session timed out after 30 minutes of inactivity for chat {chat_id}.")
-    await end_session(context, chat_id)
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="Session closed after 30 minutes of inactivity. Transcript ready for synthesis."
-    )
 
 async def test_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Temporary command to test the trigger queue."""
@@ -112,11 +55,6 @@ async def test_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Store the pending write in user data so we can cancel it if they type a text message
     context.user_data['pending_write'] = (write_id, message.message_id)
-    
-    # Schedule the 30-second timeout
-    context.job_queue.run_once(
-        timeout_pending_write, 30, data=(write_id, update.effective_chat.id, message.message_id)
-    )
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles inline button presses for the confirmation queue."""
