@@ -5,9 +5,24 @@ from telegram.ext import ContextTypes
 
 from persistence.database import get_db
 from orchestrator.trigger_scheduler import prompt_next_trigger
+from persistence.models import SessionRecord, SessionStatus
 
 SESSION_INACTIVITY_TIMEOUT = timedelta(minutes=30)
 SESSION_TIMEOUT_JOB_PREFIX = "session_inactivity_timeout"
+
+def is_session_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Checks if the user currently has an active session."""
+    return context.user_data.get('session_state') == SessionStatus.ACTIVE
+
+def get_chat_history(context: ContextTypes.DEFAULT_TYPE) -> list:
+    """Retrieves the current session's chat history."""
+    return context.user_data.get('chat_history', [])
+
+def append_chat_history(context: ContextTypes.DEFAULT_TYPE, role: str, content: str):
+    """Appends a message to the current session's chat history."""
+    if 'chat_history' not in context.user_data:
+        context.user_data['chat_history'] = []
+    context.user_data['chat_history'].append({"role": role, "content": content})
 
 def get_session_timeout_job_name(user_id: int) -> str:
     """Builds a stable job name for a user's inactivity timeout."""
@@ -22,7 +37,7 @@ async def timeout_inactive_session(context: ContextTypes.DEFAULT_TYPE):
     """Closes the active session after 30 minutes without a new message."""
     chat_id = context.job.data["chat_id"]
 
-    if context.user_data.get('session_state') != 'ACTIVE':
+    if not is_session_active(context):
         logger.info(f"Inactivity timeout fired for chat {chat_id}, but no active session remained.")
         return
 
@@ -45,16 +60,17 @@ def start_session(context: ContextTypes.DEFAULT_TYPE) -> str:
     """Starts a new conversational session and logs it to the database."""
     session_id = f"sess_{uuid.uuid4().hex[:8]}"
     context.user_data['current_session_id'] = session_id
-    context.user_data['session_state'] = 'ACTIVE'
+    context.user_data['session_state'] = SessionStatus.ACTIVE
     context.user_data['chat_history'] = []
     
+    record = SessionRecord(
+        id=session_id,
+        status=SessionStatus.ACTIVE,
+        start_time=datetime.now(timezone.utc).isoformat()
+    )
+    
     db = get_db()
-    db["sessions"].insert({
-        "id": session_id,
-        "status": "ACTIVE",
-        "start_time": datetime.now(timezone.utc).isoformat(),
-        "end_time": None
-    })
+    db["sessions"].insert(record.model_dump())  # type: ignore
     logger.info(f"Started new session: {session_id}")
     return session_id
 
@@ -64,7 +80,7 @@ async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: 
     if session_id:
         db = get_db()
         db["sessions"].update(session_id, {
-            "status": "CLOSING",
+            "status": SessionStatus.CLOSING.value,
             "end_time": datetime.now(timezone.utc).isoformat()
         })
         logger.info(f"Closed session: {session_id}")
@@ -81,7 +97,7 @@ async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: 
         
     # Clear short-term memory
     context.user_data['chat_history'] = []
-    context.user_data['session_state'] = 'IDLE'
+    context.user_data['session_state'] = SessionStatus.IDLE
     context.user_data['current_session_id'] = None
     
     # Evaluate the trigger queue to see if anything was delayed

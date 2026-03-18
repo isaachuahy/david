@@ -9,8 +9,13 @@ from orchestrator.context_builder import build_context
 from reasoning.flash_client import generate_flash_response
 from orchestrator.confirmation_queue import add_pending_write, confirm_write, reject_write, get_pending_write
 from orchestrator.trigger_scheduler import setup_scheduler, queue_trigger, consume_trigger
-from orchestrator.session_manager import start_session, end_session, reset_session_timeout, cancel_session_timeout
+from orchestrator.session_manager import (
+    start_session, end_session, reset_session_timeout, cancel_session_timeout,
+    is_session_active, get_chat_history, append_chat_history,
+    set_pending_write_ui_state, get_pending_write_ui_state, clear_pending_write_ui_state
+)
 from orchestrator.review_manager import run_sunday_review, execute_weekly_state_update
+from persistence.models import CalendarWriteStatus, SessionStatus
 
 # Load environment variables from .env
 load_dotenv()
@@ -53,7 +58,7 @@ async def test_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     # Store the pending write in user data so we can cancel it if they type a text message
-    context.user_data['pending_write'] = (write_id, message.message_id)
+    set_pending_write_ui_state(context, write_id, message.message_id)
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles inline button presses for the confirmation queue."""
@@ -84,12 +89,13 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     # Clear from state so it doesn't trigger the text interruption logic later
-    if 'pending_write' in context.user_data and context.user_data['pending_write'][0] == write_id:
-        del context.user_data['pending_write']
+    pending_write = get_pending_write_ui_state(context)
+    if pending_write and pending_write[0] == write_id:
+        clear_pending_write_ui_state(context)
         
     # Ensure it hasn't timed out or been interrupted already
     record = get_pending_write(write_id)
-    if not record or record.get("status") != "pending":
+    if not record or record.status != CalendarWriteStatus.PENDING:
         await query.edit_message_text(text="❌ *This request is no longer valid or has already been processed.*", parse_mode="Markdown")
         return
 
@@ -104,7 +110,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Closes the active session and checks for pending triggers."""
-    if context.user_data.get('session_state') == 'ACTIVE':
+    if is_session_active(context):
         cancel_session_timeout(context, update.effective_user.id)
         await end_session(context, update.effective_chat.id)
     else:
@@ -113,10 +119,12 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles ad-hoc messages by passing them through the ContextBuilder and Flash model."""
     # Check if they sent a text message while a write is waiting for confirmation
-    if 'pending_write' in context.user_data:
-        write_id, message_id = context.user_data.pop('pending_write')
+    pending_write = get_pending_write_ui_state(context)
+    if pending_write:
+        write_id, message_id = pending_write
+        clear_pending_write_ui_state(context)
         record = get_pending_write(write_id)
-        if record and record.get("status") == "pending":
+        if record and record.status == CalendarWriteStatus.PENDING:
             logger.info(f"New message received. Auto-rejecting interrupted write {write_id}.")
             reject_write(write_id)
             try:
@@ -131,13 +139,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Received message: {text}")
     
     # Start a session if one isn't active
-    if context.user_data.get('session_state') != 'ACTIVE':
+    if not is_session_active(context):
         start_session(context)
     reset_session_timeout(context, update.effective_chat.id, update.effective_user.id)
     
     try:
         context_block = build_context()
-        chat_history = context.user_data.get('chat_history', [])
+        chat_history = get_chat_history(context)
         
         flash_response = generate_flash_response(user_message=text, context_block=context_block, chat_history=chat_history)
         
@@ -148,9 +156,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(flash_response.message)
         
         # Update conversation history
-        chat_history.append({"role": "user", "content": text})
-        chat_history.append({"role": "assistant", "content": flash_response.message})
-        context.user_data['chat_history'] = chat_history
+        append_chat_history(context, "user", text)
+        append_chat_history(context, "assistant", flash_response.message)
         
     except Exception as e:
         logger.error(f"Error during reasoning loop: {e}")
