@@ -48,6 +48,13 @@ async def queue_trigger(context: ContextTypes.DEFAULT_TYPE, trigger_type: str, c
         # If the queue was empty before this, prompt immediately
         if len(context.bot_data['pending_triggers']) == 1:
             await prompt_next_trigger(context, chat_id)
+            
+def consume_trigger(context: ContextTypes.DEFAULT_TYPE, trigger_type: str):
+    """Removes a trigger from the pending queue after it has been executed."""
+    queue = context.bot_data.get('pending_triggers', [])
+    if trigger_type in queue:
+        queue.remove(trigger_type)
+        logger.info(f"Consumed trigger: {trigger_type}")
 
 async def daily_cron(context: ContextTypes.DEFAULT_TYPE):
     await queue_trigger(context, "daily_checkin", context.job.chat_id)

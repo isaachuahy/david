@@ -27,11 +27,7 @@ async def timeout_inactive_session(context: ContextTypes.DEFAULT_TYPE):
         return
 
     logger.info(f"Session timed out after 30 minutes of inactivity for chat {chat_id}.")
-    await end_session(context, chat_id)
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="Session closed after 30 minutes of inactivity. Transcript ready for synthesis."
-    )
+    await end_session(context, chat_id, reason="timeout")
 
 def reset_session_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
     """Restarts the inactivity timeout countdown for the active session."""
@@ -62,7 +58,7 @@ def start_session(context: ContextTypes.DEFAULT_TYPE) -> str:
     logger.info(f"Started new session: {session_id}")
     return session_id
 
-async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: str = "done"):
     """Ends the active session, clears short-term memory, and checks for pending triggers."""
     session_id = context.user_data.get('current_session_id')
     if session_id:
@@ -72,6 +68,16 @@ async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             "end_time": datetime.now(timezone.utc).isoformat()
         })
         logger.info(f"Closed session: {session_id}")
+        
+    if reason == "timeout":
+        text = "Session closed after 30 minutes of inactivity. Transcript ready for synthesis."
+    else:
+        text = "Session closed. Transcript ready for synthesis."
+        
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+    except Exception as e:
+        logger.error(f"Failed to send session close message: {e}")
         
     # Clear short-term memory
     context.user_data['chat_history'] = []

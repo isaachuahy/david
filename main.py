@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 from orchestrator.context_builder import build_context
 from reasoning.flash_client import generate_flash_response
 from orchestrator.confirmation_queue import add_pending_write, confirm_write, reject_write, get_pending_write
-from orchestrator.trigger_scheduler import setup_scheduler, queue_trigger
+from orchestrator.trigger_scheduler import setup_scheduler, queue_trigger, consume_trigger
 from orchestrator.session_manager import start_session, end_session, reset_session_timeout, cancel_session_timeout
 from orchestrator.review_manager import run_sunday_review, execute_weekly_state_update
 
@@ -67,9 +67,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         write_id = data.split("reject_")[1]
     elif data.startswith("start_trigger_"):
         trigger_type = data.split("start_trigger_")[1]
-        queue = context.bot_data.get('pending_triggers', [])
-        if trigger_type in queue:
-            queue.remove(trigger_type)
+        consume_trigger(context, trigger_type)
         if trigger_type == "daily_checkin":
             await query.edit_message_text("🌅 *Daily Check-in Started.* What are your top priorities for today?", parse_mode="Markdown")
         elif trigger_type == "weekly_review":
@@ -109,7 +107,6 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('session_state') == 'ACTIVE':
         cancel_session_timeout(context, update.effective_user.id)
         await end_session(context, update.effective_chat.id)
-        await update.message.reply_text("Session closed. Transcript ready for synthesis.")
     else:
         await update.message.reply_text("There is no active session to close.")
 
