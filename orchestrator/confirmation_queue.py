@@ -5,6 +5,7 @@ from loguru import logger
 
 from persistence.database import get_db
 from integrations.calendar import insert_event
+from orchestrator.time_utils import parse_iso
 
 # This module manages the confirmation queue for proposed calendar writes.
 # When Gemini Flash identifies a message that requires calendar modification, it will create a pending write in the database. 
@@ -54,7 +55,7 @@ def confirm_write(write_id: str) -> bool:
         return False
         
     # Lazy Expiration: Check if the proposal is older than 2 hours
-    created_at = datetime.fromisoformat(record["created_at"])
+    created_at = parse_iso(record["created_at"])
     if datetime.now(timezone.utc) - created_at > timedelta(hours=2):
         logger.warning(f"Pending write {write_id} has expired (older than 2 hours). Auto-rejecting.")
         db["calendar_writes"].update(write_id, {"status": "expired"})  # type: ignore
@@ -63,8 +64,8 @@ def confirm_write(write_id: str) -> bool:
     logger.info(f"Confirming write {write_id}...")
     
     # Convert ISO strings back to datetime objects
-    start_dt = datetime.fromisoformat(record["start_time"])
-    end_dt = datetime.fromisoformat(record["end_time"])
+    start_dt = parse_iso(record["start_time"])
+    end_dt = parse_iso(record["end_time"])
     
     created_event = insert_event(
         summary=record["summary"],

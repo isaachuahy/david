@@ -7,11 +7,10 @@ from datetime import datetime, timezone, timedelta
 
 from orchestrator.context_builder import build_context
 from reasoning.flash_client import generate_flash_response
-from reasoning.pro_client import generate_sunday_review
-from integrations.calendar import get_past_events
 from orchestrator.confirmation_queue import add_pending_write, confirm_write, reject_write, get_pending_write
 from orchestrator.trigger_scheduler import setup_scheduler, queue_trigger
 from orchestrator.session_manager import start_session, end_session, reset_session_timeout, cancel_session_timeout
+from orchestrator.review_manager import run_sunday_review, execute_weekly_state_update
 
 # Load environment variables from .env
 load_dotenv()
@@ -75,88 +74,13 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("🌅 *Daily Check-in Started.* What are your top priorities for today?", parse_mode="Markdown")
         elif trigger_type == "weekly_review":
             await query.edit_message_text("📅 *Starting Sunday Review. Analyzing your week...*", parse_mode="Markdown")
-            
-            try:
-                context_block = build_context()
-                
-                # Fetch and format past events
-                past_events_raw = get_past_events(days=7)
-                if not past_events_raw:
-                    past_events_block = "No events found in the past week."
-                else:
-                    lines = []
-                    for event in past_events_raw:
-                        start_time = event['start'].get('dateTime', event['start'].get('date'))
-                        summary = event.get('summary', 'Busy / No Title')
-                        lines.append(f"- [{start_time}] {summary}")
-                    past_events_block = "\n".join(lines)
-                
-                review = generate_sunday_review(context_block, past_events_block)
-                
-                # Send the synthesis message
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id, 
-                    text=f"**Sunday Review Complete**\n\n{review.message}", 
-                    parse_mode="Markdown"
-                )
-                
-                # Ask for confirmation before overwriting the weekly state
-                context.user_data['proposed_weekly_state'] = review.weekly_state_content
-                state_keyboard = [[InlineKeyboardButton("Confirm Weekly State Update", callback_data="confirm_weekly_state")]]
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=f"📝 *Proposed Weekly State Changes:*\n{review.state_change_summary}\n\nDo you want to apply these changes?",
-                    reply_markup=InlineKeyboardMarkup(state_keyboard),
-                    parse_mode="Markdown"
-                )
-                
-                # Propose calendar events individually
-                for event in review.proposed_events:
-                    # Clean the 'Z' for fromisoformat compatibility
-                    start_str = event.start_time.replace('Z', '+00:00')
-                    end_str = event.end_time.replace('Z', '+00:00')
-                    start_dt = datetime.fromisoformat(start_str)
-                    end_dt = datetime.fromisoformat(end_str)
-                    
-                    write_id = add_pending_write(event.summary, start_dt, end_dt, event.description)
-                    
-                    keyboard = [
-                        [InlineKeyboardButton("Confirm", callback_data=f"confirm_{write_id}"), InlineKeyboardButton("Reject", callback_data=f"reject_{write_id}")]
-                    ]
-                    
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=f"🗓️ *Proposed Event:*\n**{event.summary}**\n_{event.description}_\n\nStart: {start_dt.strftime('%Y-%m-%d %H:%M UTC')}\nEnd: {end_dt.strftime('%Y-%m-%d %H:%M UTC')}",
-                        reply_markup=InlineKeyboardMarkup(keyboard),
-                        parse_mode="Markdown"
-                    )
-            except Exception as e:
-                logger.error(f"Error during Sunday Review: {e}")
-                await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ An error occurred during the Sunday Review.")
+            await run_sunday_review(update, context)
         return
     elif data == "delay_trigger":
         await query.edit_message_text("Got it. We will chat first. I'll hold onto this trigger until you're ready.", parse_mode="Markdown")
         return
     elif data == "confirm_weekly_state":
-        proposed_state = context.user_data.get('proposed_weekly_state')
-        if not proposed_state:
-            await query.edit_message_text("❌ *No proposed weekly state found or it has expired.*", parse_mode="Markdown")
-            return
-            
-        context_dir = os.path.join(os.path.dirname(__file__), "context")
-        weekly_state_path = os.path.join(context_dir, "weekly_state.md")
-        
-        if os.path.exists(weekly_state_path):
-            backup_filename = f"weekly_state_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-            backup_path = os.path.join(context_dir, backup_filename)
-            with open(weekly_state_path, "r", encoding="utf-8") as src, open(backup_path, "w", encoding="utf-8") as dst:
-                dst.write(src.read())
-                
-        with open(weekly_state_path, "w", encoding="utf-8") as f:
-            f.write(proposed_state)
-            
-        del context.user_data['proposed_weekly_state']
-        await query.edit_message_text("✅ *Weekly State successfully updated and backed up.*", parse_mode="Markdown")
+        await execute_weekly_state_update(update, context)
         return
     else:
         return
