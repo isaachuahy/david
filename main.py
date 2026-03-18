@@ -12,7 +12,7 @@ from orchestrator.trigger_scheduler import setup_scheduler, queue_trigger, consu
 from orchestrator.session_manager import (
     start_session, end_session, reset_session_timeout, cancel_session_timeout,
     is_session_active, get_chat_history, append_chat_history,
-    set_pending_write_ui_state, get_pending_write_ui_state, clear_pending_write_ui_state
+    add_pending_write_ui_state, get_pending_write_ui_states, remove_pending_write_ui_state, clear_pending_write_ui_states
 )
 from orchestrator.review_manager import run_sunday_review, execute_weekly_state_update
 from persistence.models import CalendarWriteStatus, SessionStatus
@@ -58,7 +58,7 @@ async def test_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     # Store the pending write in user data so we can cancel it if they type a text message
-    set_pending_write_ui_state(context, write_id, message.message_id)
+    add_pending_write_ui_state(context, write_id, message.message_id)
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles inline button presses for the confirmation queue."""
@@ -89,9 +89,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     # Clear from state so it doesn't trigger the text interruption logic later
-    pending_write = get_pending_write_ui_state(context)
-    if pending_write and pending_write[0] == write_id:
-        clear_pending_write_ui_state(context)
+    remove_pending_write_ui_state(context, write_id)
         
     # Ensure it hasn't timed out or been interrupted already
     record = get_pending_write(write_id)
@@ -119,21 +117,21 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles ad-hoc messages by passing them through the ContextBuilder and Flash model."""
     # Check if they sent a text message while a write is waiting for confirmation
-    pending_write = get_pending_write_ui_state(context)
-    if pending_write:
-        write_id, message_id = pending_write
-        clear_pending_write_ui_state(context)
-        record = get_pending_write(write_id)
-        if record and record.status == CalendarWriteStatus.PENDING:
-            logger.info(f"New message received. Auto-rejecting interrupted write {write_id}.")
-            reject_write(write_id)
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=update.effective_chat.id, message_id=message_id,
-                    text="🚫 *Event cancelled due to new incoming message.*", parse_mode="Markdown"
-                )
-            except Exception as e:
-                logger.error(f"Failed to update interrupted message UI: {e}")
+    pending_writes = get_pending_write_ui_states(context)
+    if pending_writes:
+        for write_id, message_id in pending_writes:
+            record = get_pending_write(write_id)
+            if record and record.status == CalendarWriteStatus.PENDING:
+                logger.info(f"New message received. Auto-rejecting interrupted write {write_id}.")
+                reject_write(write_id)
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=update.effective_chat.id, message_id=message_id,
+                        text="🚫 *Event cancelled due to new incoming message.*", parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to update interrupted message UI: {e}")
+        clear_pending_write_ui_states(context)
 
     text = update.message.text
     logger.info(f"Received message: {text}")

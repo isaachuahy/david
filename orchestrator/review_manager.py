@@ -9,6 +9,7 @@ from integrations.calendar import get_past_events
 from reasoning.pro_client import generate_sunday_review
 from orchestrator.confirmation_queue import add_pending_write
 from orchestrator.time_utils import parse_iso
+from orchestrator.session_manager import add_pending_write_ui_state
 
 async def run_sunday_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Executes the complete Sunday Review flow."""
@@ -57,12 +58,14 @@ async def run_sunday_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("Confirm", callback_data=f"confirm_{write_id}"), InlineKeyboardButton("Reject", callback_data=f"reject_{write_id}")]
             ]
             
-            await context.bot.send_message(
+            message = await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=f"🗓️ *Proposed Event:*\n**{event.summary}**\n_{event.description}_\n\nStart: {start_dt.strftime('%Y-%m-%d %H:%M UTC')}\nEnd: {end_dt.strftime('%Y-%m-%d %H:%M UTC')}",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode="Markdown"
             )
+            
+            add_pending_write_ui_state(context, write_id, message.message_id)
     except Exception as e:
         logger.error(f"Error during Sunday Review: {e}")
         await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ An error occurred during the Sunday Review.")
