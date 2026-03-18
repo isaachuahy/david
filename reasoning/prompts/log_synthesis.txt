@@ -7,7 +7,7 @@ You will be given the complete text of the current `decision_log.md`. It contain
 Your goal is to produce a NEW version of `decision_log.md` that:
 - Is no more than 800 words. This is a hard limit.
 - Integrates the week's "Recent Decisions" seamlessly into the "Current Rolling Context". The newest information is the most important.
-- Summarizes and condenses older entries. Retain the core of past decisions but discard verbose details that are no longer relevant.
+- Summarises and condenses older entries. Retain the core of past decisions but discard verbose details that are no longer relevant.
 - Removes obsolete or superseded decisions entirely.
 - Empties the "Recent Decisions (Appended Daily)" section, replacing its contents with: "*(New session notes will be appended here throughout the week.)*"
 - Maintains the original markdown structure with the two main headers.

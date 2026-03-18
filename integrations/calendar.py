@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import lru_cache
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -22,14 +22,18 @@ def get_calendar_service():
         logger.error(f"Failed to build Calendar service: {e}")
         raise
 
-def get_upcoming_events(max_results: int = 10) -> list:
+def get_upcoming_events(days: int = 7) -> list:
     """
     Fetches the upcoming events across all of the user's calendars.
     """
     service = get_calendar_service()
     try:
-        now = datetime.now(timezone.utc).isoformat()
-        logger.info(f"Fetching upcoming {max_results} events across all calendars...")
+        now = datetime.now(timezone.utc)
+        time_max = now + timedelta(days=days)
+        
+        now_iso = now.isoformat()
+        time_max_iso = time_max.isoformat()
+        logger.info(f"Fetching upcoming events for the next {days} days across all calendars...")
         
         calendar_list = service.calendarList().list().execute()
         calendars = calendar_list.get('items', [])
@@ -40,8 +44,8 @@ def get_upcoming_events(max_results: int = 10) -> list:
             cal_id = cal['id']
             try:
                 events_result = service.events().list(
-                    calendarId=cal_id, timeMin=now,
-                    maxResults=max_results, singleEvents=True,
+                    calendarId=cal_id, timeMin=now_iso, timeMax=time_max_iso,
+                    singleEvents=True,
                     orderBy='startTime'
                 ).execute()
                 all_events.extend(events_result.get('items', []))
@@ -51,10 +55,49 @@ def get_upcoming_events(max_results: int = 10) -> list:
         # Sort combined events by start time (handles both date and dateTime strings)
         all_events.sort(key=lambda x: x['start'].get('dateTime', x['start'].get('date')))
         
-        return all_events[:max_results]
+        return all_events
         
     except HttpError as error:
         logger.error(f"An error occurred fetching events: {error}")
+        return []
+
+def get_past_events(days: int = 7) -> list:
+    """
+    Fetches the events from the past specified number of days across all calendars.
+    """
+    service = get_calendar_service()
+    try:
+        now = datetime.now(timezone.utc)
+        past = now - timedelta(days=days)
+        
+        now_iso = now.isoformat()
+        past_iso = past.isoformat()
+        
+        logger.info(f"Fetching events from the past {days} days across all calendars...")
+        
+        calendar_list = service.calendarList().list().execute()
+        calendars = calendar_list.get('items', [])
+        
+        all_events = []
+        
+        for cal in calendars:
+            cal_id = cal['id']
+            try:
+                events_result = service.events().list(
+                    calendarId=cal_id, timeMin=past_iso, timeMax=now_iso,
+                    singleEvents=True, orderBy='startTime'
+                ).execute()
+                all_events.extend(events_result.get('items', []))
+            except HttpError as e:
+                logger.warning(f"Could not fetch past events for calendar {cal.get('summary', cal_id)}: {e}")
+                
+        # Sort combined events by start time (handles both date and dateTime strings)
+        all_events.sort(key=lambda x: x['start'].get('dateTime', x['start'].get('date')))
+        
+        return all_events
+        
+    except HttpError as error:
+        logger.error(f"An error occurred fetching past events: {error}")
         return []
 
 def insert_event(summary: str, start_time: datetime, end_time: datetime, description: str = "") -> dict:

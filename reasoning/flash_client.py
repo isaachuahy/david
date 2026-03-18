@@ -14,7 +14,7 @@ class FlashResponse(BaseModel):
         description="If should_escalate is True, briefly explain the tradeoff or proposed action to the Pro model. Otherwise, null."
     )
 
-def generate_flash_response(user_message: str, context_block: str) -> FlashResponse:
+def generate_flash_response(user_message: str, context_block: str, chat_history: Optional[list[dict]] = None) -> FlashResponse:
     """
     Sends the assembled context and user message to Gemini Flash.
     Enforces a strict Pydantic schema for the response.
@@ -33,7 +33,16 @@ def generate_flash_response(user_message: str, context_block: str) -> FlashRespo
         "priority tradeoffs against their goals, you MUST set should_escalate to True."
     )
     
-    prompt = f"{context_block}\n\n<USER_MESSAGE>\n{user_message}\n</USER_MESSAGE>"
+    prompt = f"{context_block}\n\n"
+    
+    if chat_history:
+        prompt += "<CHAT_HISTORY>\n"
+        for turn in chat_history:
+            role = "User" if turn.get("role") == "user" else "David"
+            prompt += f"{role}: {turn.get('content')}\n\n"
+        prompt += "</CHAT_HISTORY>\n\n"
+        
+    prompt += f"<USER_MESSAGE>\n{user_message}\n</USER_MESSAGE>"
     
     response = client.models.generate_content(
         model='gemini-3-flash-preview',

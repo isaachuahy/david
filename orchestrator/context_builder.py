@@ -21,9 +21,9 @@ def _read_file_safely(filename: str, fallback: str) -> str:
         logger.error(f"Error reading {filepath}: {e}")
         return fallback
 
-def _format_calendar_events(max_results: int = 15) -> str:
+def _format_calendar_events(days: int = 7) -> str:
     """Fetches and formats upcoming calendar events into a readable string."""
-    events = get_upcoming_events(max_results=max_results)
+    events = get_upcoming_events(days=days)
     if not events:
         return "No upcoming events scheduled."
         
