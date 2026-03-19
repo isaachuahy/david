@@ -7,8 +7,14 @@ from main import (
     handle_message,
     reset_session_timeout,
     timeout_inactive_session,
+    handle_confirm,
+    handle_reject,
+    handle_start_trigger,
+    handle_delay_trigger,
+    handle_confirm_weekly_state
 )
 from reasoning.flash_client import FlashResponse
+from persistence.models import CalendarWriteStatus
 
 @pytest.mark.asyncio
 @patch('main.build_context')
@@ -112,3 +118,107 @@ async def test_done_command_cancels_session_timeout_before_closing(mock_end_sess
     existing_job.schedule_removal.assert_called_once()
     mock_end_session.assert_awaited_once_with(context, 456)
     update.message.reply_text.assert_awaited_once_with("Session closed. Transcript ready for synthesis.")
+
+@pytest.mark.asyncio
+@patch('main.confirm_write')
+@patch('main.get_pending_write')
+@patch('main.remove_pending_write_ui_state')
+async def test_handle_confirm_success(mock_remove_ui, mock_get_pending, mock_confirm_write):
+    update = MagicMock()
+    update.callback_query = MagicMock()
+    update.callback_query.data = "confirm_cw_123"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.text = "Original Proposal Text"
+    
+    context = MagicMock()
+    
+    # Mock the database record
+    mock_record = MagicMock()
+    mock_record.status = CalendarWriteStatus.PENDING
+    mock_get_pending.return_value = mock_record
+    
+    # Mock successful execution
+    mock_confirm_write.return_value = True
+    
+    await handle_confirm(update, context)
+    
+    mock_remove_ui.assert_called_once_with(context, "cw_123")
+    mock_confirm_write.assert_called_once_with("cw_123")
+    update.callback_query.edit_message_text.assert_awaited_once_with(
+        text="Original Proposal Text\n\n✅ *Event Confirmed and Scheduled.*", parse_mode="Markdown"
+    )
+
+@pytest.mark.asyncio
+@patch('main.reject_write')
+@patch('main.get_pending_write')
+@patch('main.remove_pending_write_ui_state')
+async def test_handle_reject_success(mock_remove_ui, mock_get_pending, mock_reject_write):
+    update = MagicMock()
+    update.callback_query = MagicMock()
+    update.callback_query.data = "reject_cw_456"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.text = "Original Proposal Text"
+    
+    context = MagicMock()
+    
+    # Mock the database record
+    mock_record = MagicMock()
+    mock_record.status = CalendarWriteStatus.PENDING
+    mock_get_pending.return_value = mock_record
+    
+    # Mock successful rejection
+    mock_reject_write.return_value = True
+    
+    await handle_reject(update, context)
+    
+    mock_remove_ui.assert_called_once_with(context, "cw_456")
+    mock_reject_write.assert_called_once_with("cw_456")
+    update.callback_query.edit_message_text.assert_awaited_once_with(
+        text="Original Proposal Text\n\n🚫 *Event Rejected.*", parse_mode="Markdown"
+    )
+
+@pytest.mark.asyncio
+@patch('main.consume_trigger')
+async def test_handle_start_trigger_daily(mock_consume_trigger):
+    update = MagicMock()
+    update.callback_query = MagicMock()
+    update.callback_query.data = "start_trigger_daily_checkin"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    
+    context = MagicMock()
+    
+    await handle_start_trigger(update, context)
+    
+    mock_consume_trigger.assert_called_once_with(context, "daily_checkin")
+    update.callback_query.edit_message_text.assert_awaited_once_with(
+        "🌅 *Daily Check-in Started.* What are your top priorities for today?", parse_mode="Markdown"
+    )
+
+@pytest.mark.asyncio
+async def test_handle_delay_trigger():
+    update = MagicMock()
+    update.callback_query = MagicMock()
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    
+    context = MagicMock()
+    
+    await handle_delay_trigger(update, context)
+    
+    update.callback_query.edit_message_text.assert_awaited_once_with("Got it. We will chat first. I'll hold onto this trigger until you're ready.", parse_mode="Markdown")
+
+@pytest.mark.asyncio
+@patch('main.execute_weekly_state_update', new_callable=AsyncMock)
+async def test_handle_confirm_weekly_state(mock_execute):
+    update = MagicMock()
+    update.callback_query = MagicMock()
+    update.callback_query.answer = AsyncMock()
+    context = MagicMock()
+    
+    await handle_confirm_weekly_state(update, context)
+    
+    update.callback_query.answer.assert_awaited_once()
+    mock_execute.assert_awaited_once_with(update, context)
