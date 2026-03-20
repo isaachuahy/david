@@ -1,5 +1,4 @@
 from datetime import datetime, timezone, timedelta
-from functools import lru_cache
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from loguru import logger
@@ -8,11 +7,9 @@ from integrations.auth import get_calendar_credentials
 
 # Note that datetimes that get passed to the API must be in UTC ISO format, not naive datetime objects.
 
-@lru_cache(maxsize=1)
 def get_calendar_service():
     """
     Builds and returns the Google Calendar API service instance.
-    Cached to avoid re-authenticating and rebuilding on every call.
     """
     creds = get_calendar_credentials()
     try:
