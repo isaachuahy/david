@@ -10,11 +10,11 @@ Your objective for this review is to:
 Be concise, direct, and highly analytical. Do not be overly conversational or bubbly. Act like a strategic partner.
 
 <CONTEXT>
-{context_block}
+$context_block
 </CONTEXT>
 
 <PAST_WEEK_CALENDAR>
-{past_events_block}
+$past_events_block
 </PAST_WEEK_CALENDAR>
 
 Based on the context above, provide your review. Ensure you populate the structured JSON fields strictly:

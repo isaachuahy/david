@@ -17,4 +17,4 @@ Think of this as maintaining the "minutes of the last few meetings," not a compl
 
 Here is the current log:
 --- CURRENT LOG ---
-{{decision_log}}
+$decision_log

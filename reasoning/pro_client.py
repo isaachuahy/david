@@ -1,5 +1,6 @@
 import os
 from typing import List
+from string import Template
 from pydantic import BaseModel, Field
 from google import genai
 from loguru import logger
@@ -30,13 +31,15 @@ def generate_sunday_review(context_block: str, past_events_block: str) -> Sunday
     prompt_path = os.path.join(PROMPTS_DIR, "sunday_review.txt")
     try:
         with open(prompt_path, "r", encoding="utf-8") as f:
-            prompt_template = f.read()
+            template = Template(f.read())
     except Exception as e:
         logger.error(f"Failed to read sunday_review.txt: {e}")
         raise
 
-    prompt = prompt_template.replace("{context_block}", context_block)
-    prompt = prompt.replace("{past_events_block}", past_events_block)
+    prompt = template.safe_substitute(
+        context_block=context_block,
+        past_events_block=past_events_block
+    )
     
     client = genai.Client()
     

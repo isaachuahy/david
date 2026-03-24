@@ -1,7 +1,12 @@
+import os
 from typing import Optional, cast
 from pydantic import BaseModel, Field
 from google import genai
 from loguru import logger
+
+# Resolve paths for the prompt template
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROMPTS_DIR = os.path.join(BASE_DIR, "reasoning", "prompts")
 
 class FlashResponse(BaseModel):
     message: str = Field(
@@ -24,14 +29,13 @@ def generate_flash_response(user_message: str, context_block: str, chat_history:
     # Automatically picks up GEMINI_API_KEY from the environment
     client = genai.Client()
     
-    system_instruction = (
-        "You are David, a highly competent personal executive assistant for a single user (Isaac). "
-        "Your primary goal is to bridge the gap between intention and execution by holding context "
-        "across time and reducing decision fatigue. "
-        "Always consult the provided context (Goals, Weekly State, Decision Log, Calendar) before responding. "
-        "If the user asks to schedule an event, modify the calendar, or asks a complex question requiring "
-        "priority tradeoffs against their goals, you MUST set should_escalate to True."
-    )
+    prompt_path = os.path.join(PROMPTS_DIR, "system_prompt.txt")
+    try:
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            system_instruction = f.read().strip()
+    except Exception as e:
+        logger.error(f"Failed to read system_prompt.txt: {e}")
+        raise
     
     prompt = f"{context_block}\n\n"
     
