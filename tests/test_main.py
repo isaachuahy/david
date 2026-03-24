@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, ANY
-from main import (
+from bot.handlers import (
     done_command,
     handle_message,
     handle_confirm,
@@ -19,20 +19,15 @@ from reasoning.flash_client import FlashResponse
 from persistence.models import CalendarWriteStatus
 
 @pytest.mark.asyncio
-@patch('main.build_context')
-@patch('main.generate_flash_response')
-async def test_handle_message(mock_generate_flash, mock_build_context):
+@patch('bot.handlers.process_message', new_callable=AsyncMock)
+async def test_handle_message(mock_process_message):
     # 1. Arrange: Set up our mocks
-    # Mock the context builder output
-    mock_build_context.return_value = "<CONTEXT>Mocked context</CONTEXT>"
-    
-    # Mock the Gemini Flash response
     mock_flash_response = FlashResponse(
         message="This is a mocked response from David.",
         should_escalate=False,
         escalation_reason=None
     )
-    mock_generate_flash.return_value = mock_flash_response
+    mock_process_message.return_value = mock_flash_response
     
     # Mock the Telegram Update and Context objects
     update = MagicMock()
@@ -49,12 +44,7 @@ async def test_handle_message(mock_generate_flash, mock_build_context):
     await handle_message(update, context)
 
     # 3. Assert: Verify the routing logic worked correctly
-    mock_build_context.assert_called_once()
-    mock_generate_flash.assert_called_once_with(
-        user_message="Hello David", 
-        context_block="<CONTEXT>Mocked context</CONTEXT>",
-        chat_history=ANY
-    )
+    mock_process_message.assert_awaited_once_with("Hello David", context)
     update.message.reply_text.assert_called_once_with("This is a mocked response from David.")
     context.job_queue.run_once.assert_called_once_with(
         timeout_inactive_session,
@@ -65,10 +55,6 @@ async def test_handle_message(mock_generate_flash, mock_build_context):
         user_id=123,
     )
     
-    assert len(context.user_data['chat_history']) == 2
-    assert context.user_data['chat_history'][0] == {"role": "user", "content": "Hello David"}
-    assert context.user_data['chat_history'][1] == {"role": "assistant", "content": "This is a mocked response from David."}
-
 def test_reset_session_timeout_replaces_existing_job():
     context = MagicMock()
     existing_job = MagicMock()
@@ -99,7 +85,7 @@ async def test_timeout_inactive_session_closes_active_session(mock_end_session):
     mock_end_session.assert_awaited_once_with(context, 456, reason="timeout")
 
 @pytest.mark.asyncio
-@patch('main.end_session', new_callable=AsyncMock)
+@patch('bot.handlers.end_session', new_callable=AsyncMock)
 async def test_done_command_cancels_session_timeout_before_closing(mock_end_session):
     update = MagicMock()
     update.effective_user.id = 123
@@ -117,9 +103,9 @@ async def test_done_command_cancels_session_timeout_before_closing(mock_end_sess
     mock_end_session.assert_awaited_once_with(context, 456)
 
 @pytest.mark.asyncio
-@patch('main.confirm_write')
-@patch('main.get_pending_write')
-@patch('main.untrack_confirmation_message')
+@patch('bot.handlers.confirm_write')
+@patch('bot.handlers.get_pending_write')
+@patch('bot.handlers.untrack_confirmation_message')
 async def test_handle_confirm_success(mock_remove_ui, mock_get_pending, mock_confirm_write):
     update = MagicMock()
     update.callback_query = MagicMock()
@@ -147,9 +133,9 @@ async def test_handle_confirm_success(mock_remove_ui, mock_get_pending, mock_con
     )
 
 @pytest.mark.asyncio
-@patch('main.reject_write')
-@patch('main.get_pending_write')
-@patch('main.untrack_confirmation_message')
+@patch('bot.handlers.reject_write')
+@patch('bot.handlers.get_pending_write')
+@patch('bot.handlers.untrack_confirmation_message')
 async def test_handle_reject_success(mock_remove_ui, mock_get_pending, mock_reject_write):
     update = MagicMock()
     update.callback_query = MagicMock()
@@ -177,7 +163,7 @@ async def test_handle_reject_success(mock_remove_ui, mock_get_pending, mock_reje
     )
 
 @pytest.mark.asyncio
-@patch('main.consume_trigger')
+@patch('bot.handlers.consume_trigger')
 async def test_handle_start_trigger_daily(mock_consume_trigger):
     update = MagicMock()
     update.callback_query = MagicMock()
@@ -208,7 +194,7 @@ async def test_handle_delay_trigger():
     update.callback_query.edit_message_text.assert_awaited_once_with("Got it. We will chat first. I'll hold onto this trigger until you're ready.", parse_mode="Markdown")
 
 @pytest.mark.asyncio
-@patch('main.execute_weekly_state_update', new_callable=AsyncMock)
+@patch('bot.handlers.execute_weekly_state_update', new_callable=AsyncMock)
 async def test_handle_confirm_weekly_state(mock_execute):
     update = MagicMock()
     update.callback_query = MagicMock()
