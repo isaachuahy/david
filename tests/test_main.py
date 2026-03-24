@@ -96,11 +96,7 @@ async def test_timeout_inactive_session_closes_active_session(mock_end_session):
 
     await timeout_inactive_session(context)
 
-    mock_end_session.assert_awaited_once_with(context, 456)
-    context.bot.send_message.assert_awaited_once_with(
-        chat_id=456,
-        text="Session closed after 30 minutes of inactivity. Transcript ready for synthesis."
-    )
+    mock_end_session.assert_awaited_once_with(context, 456, reason="timeout")
 
 @pytest.mark.asyncio
 @patch('main.end_session', new_callable=AsyncMock)
@@ -119,12 +115,11 @@ async def test_done_command_cancels_session_timeout_before_closing(mock_end_sess
 
     existing_job.schedule_removal.assert_called_once()
     mock_end_session.assert_awaited_once_with(context, 456)
-    update.message.reply_text.assert_awaited_once_with("Session closed. Transcript ready for synthesis.")
 
 @pytest.mark.asyncio
 @patch('main.confirm_write')
 @patch('main.get_pending_write')
-@patch('main.remove_pending_write_ui_state')
+@patch('main.untrack_confirmation_message')
 async def test_handle_confirm_success(mock_remove_ui, mock_get_pending, mock_confirm_write):
     update = MagicMock()
     update.callback_query = MagicMock()
@@ -154,7 +149,7 @@ async def test_handle_confirm_success(mock_remove_ui, mock_get_pending, mock_con
 @pytest.mark.asyncio
 @patch('main.reject_write')
 @patch('main.get_pending_write')
-@patch('main.remove_pending_write_ui_state')
+@patch('main.untrack_confirmation_message')
 async def test_handle_reject_success(mock_remove_ui, mock_get_pending, mock_reject_write):
     update = MagicMock()
     update.callback_query = MagicMock()

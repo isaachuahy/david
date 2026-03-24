@@ -68,7 +68,7 @@ The core design decision is to treat context as a first-class artifact rather th
 
 The system uses two models in a tiered arrangement: a higher-cost reasoning model (Gemini Pro) and a lower-cost general driver model (Gemini Flash).
 
-Gemini Flash handles daily check-ins, operational ad hoc requests, and all turns during a brainstorming session. Flash always returns a typed `FlashResponse` object with three fields: `message` (the response text), `should_escalate` (boolean), and `escalation_reason` (optional string). The orchestrator reads `should_escalate` directly — there is no string matching or signal parsing. Using a structured response schema via the `google-generativeai` SDK enforces this at the API level; Flash cannot emit a malformed escalation signal.
+Gemini Flash handles daily check-ins, operational ad hoc requests, and all turns during a brainstorming session. Flash always returns a typed `FlashResponse` object with three fields: `message` (the response text), `should_escalate` (boolean), and `escalation_reason` (optional string). The orchestrator reads `should_escalate` directly — there is no string matching or signal parsing. Using a structured response schema via the `google-genai` SDK enforces this at the API level; Flash cannot emit a malformed escalation signal.
 
 When `should_escalate` is true, `EscalationHandler` constructs a prompt for Gemini Pro containing the full assembled context, Flash's draft message, and the structured escalation reason. Pro therefore receives *more* information than Flash had — the same goals, calendar, and decision log, plus Flash's initial assessment and the specific tradeoff or ambiguity that triggered escalation. Pro also handles every Sunday review directly, and synthesises all brainstorming sessions at close, distilling decisions made, rationale, and any calendar actions into the decision log.
 
@@ -86,7 +86,7 @@ The **interface layer** is a `python-telegram-bot` async process. It receives me
 
 The **orchestration layer** is self-built Python — no LangChain, no LangGraph. It owns six concerns: session lifecycle state (`SessionManager`), intent classification (`MessageRouter`), context assembly (`ContextBuilder`), Flash-to-Pro routing (`EscalationHandler`), confirmation-gated calendar writes (`ConfirmationQueue`), and scheduled trigger management (`TriggerScheduler`). Each is a single-responsibility class; the whole layer is approximately 400–500 lines.
 
-The **reasoning layer** is two Gemini clients — Flash and Pro — both via the `google-generativeai` SDK. Flash responses are typed via Pydantic response schema, enforcing structured output at the API level. Both models have 1M token context windows, which means the assembled context never needs to be trimmed.
+The **reasoning layer** is two Gemini clients — Flash and Pro — both via the `google-genai` SDK. Flash responses are typed via Pydantic response schema, enforcing structured output at the API level. Both models have 1M token context windows, which means the assembled context never needs to be trimmed.
 
 The **context layer** is three markdown files on disk. They are read by `ContextBuilder` on every call and written by Pro at the end of brainstorm sessions and Sunday reviews. Keeping them as flat files rather than database rows means they are human-readable, human-editable, and straightforward to debug.
 
@@ -111,7 +111,7 @@ Observability uses three tools: Langfuse (cloud free tier) for per-call LLM trac
 | Language | Python 3.12 |
 | Dependency management | `uv` |
 | Telegram interface | `python-telegram-bot` |
-| LLM — daily/ad hoc | Gemini Flash (`google-generativeai`) |
+| LLM — daily/ad hoc | Gemini Flash (`google-genai`) |
 | LLM — weekly/escalated | Gemini Pro |
 | Calendar | `google-api-python-client` + `google-auth-oauthlib` |
 | Scheduler | `APScheduler` 3.x |
@@ -141,7 +141,7 @@ Observability uses three tools: Langfuse (cloud free tier) for per-call LLM trac
 
 **Three-layer router architecture (daily layer → strategy layer → logic layer).** Considered at the suggestion of common agentic design patterns. Rejected because the complexity — additional latency, a separate routing model, more prompt engineering surface area — is not justified for a single-user, low-volume system. The two-tier Flash + conditional escalation to Pro achieves the same functional outcome with far less to debug.
 
-**`[[ESCALATE: reason]]` string signal for escalation routing.** Initially considered as a simple mechanism for Flash to signal the need for escalation. Rejected because Flash is a probabilistic system — it will sometimes emit partial matches, capitalisation variations, or omit the signal under certain generation conditions. String matching on free-text output is a fragile interface for a routing decision that affects cost, latency, and response quality. The current approach uses a Pydantic response schema enforced at the API level via `google-generativeai`'s `response_schema` parameter, making `should_escalate` a typed boolean field the orchestrator reads directly.
+**`[[ESCALATE: reason]]` string signal for escalation routing.** Initially considered as a simple mechanism for Flash to signal the need for escalation. Rejected because Flash is a probabilistic system — it will sometimes emit partial matches, capitalisation variations, or omit the signal under certain generation conditions. String matching on free-text output is a fragile interface for a routing decision that affects cost, latency, and response quality. The current approach uses a Pydantic response schema enforced at the API level via `google-genai`'s `response_schema` parameter, making `should_escalate` a typed boolean field the orchestrator reads directly.
 
 **Sending only Flash's summary to Pro during escalation.** Considered as a way to reduce token cost on Pro calls. Rejected because Pro's job during escalation is to reason about a real tradeoff involving goals, calendar commitments, and decision history — exactly the context Flash had. Stripping that context and asking Pro to judge from a summary alone would make Pro's reasoning less grounded than Flash's, which inverts the purpose of the escalation. Token cost on rare escalation calls is negligible given the 1M context window.
 

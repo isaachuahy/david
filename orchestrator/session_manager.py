@@ -29,22 +29,22 @@ def append_chat_history(context: ContextTypes.DEFAULT_TYPE, role: str, content: 
         context.user_data['chat_history'] = []
     context.user_data['chat_history'].append({"role": role, "content": content})
 
-def add_pending_write_ui_state(context: ContextTypes.DEFAULT_TYPE, write_id: str, message_id: int):
+def track_confirmation_message(context: ContextTypes.DEFAULT_TYPE, write_id: str, message_id: int):
     """Appends the UI state of a pending calendar write to the list."""
     if 'pending_writes' not in context.user_data:
         context.user_data['pending_writes'] = []
     context.user_data['pending_writes'].append((write_id, message_id))
 
-def get_pending_write_ui_states(context: ContextTypes.DEFAULT_TYPE) -> List[Tuple[str, int]]:
+def get_tracked_confirmation_messages(context: ContextTypes.DEFAULT_TYPE) -> List[Tuple[str, int]]:
     """Retrieves the list of pending calendar write UI states."""
     return context.user_data.get('pending_writes', [])
 
-def remove_pending_write_ui_state(context: ContextTypes.DEFAULT_TYPE, write_id: str):
+def untrack_confirmation_message(context: ContextTypes.DEFAULT_TYPE, write_id: str):
     """Removes a specific pending write from the UI state tracking."""
     writes = context.user_data.get('pending_writes', [])
     context.user_data['pending_writes'] = [w for w in writes if w[0] != write_id]
 
-def clear_pending_write_ui_states(context: ContextTypes.DEFAULT_TYPE):
+def clear_tracked_confirmation_messages(context: ContextTypes.DEFAULT_TYPE):
     """Clears all pending calendar write UI states."""
     context.user_data['pending_writes'] = []
 

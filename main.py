@@ -12,7 +12,7 @@ from orchestrator.trigger_scheduler import setup_scheduler, queue_trigger, consu
 from orchestrator.session_manager import (
     start_session, end_session, reset_session_timeout, cancel_session_timeout, get_session_state,
     is_session_active, get_chat_history, append_chat_history,
-    add_pending_write_ui_state, get_pending_write_ui_states, remove_pending_write_ui_state, clear_pending_write_ui_states
+    track_confirmation_message, get_tracked_confirmation_messages, untrack_confirmation_message, clear_tracked_confirmation_messages
 )
 from orchestrator.review_manager import run_sunday_review, execute_weekly_state_update
 from persistence.models import CalendarWriteStatus, SessionStatus
@@ -58,7 +58,7 @@ async def test_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     # Store the pending write in user data so we can cancel it if they type a text message
-    add_pending_write_ui_state(context, write_id, message.message_id)
+    track_confirmation_message(context, write_id, message.message_id)
 
 async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles confirmation of a proposed calendar write."""
@@ -66,7 +66,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     write_id = query.data.split("confirm_")[1]
-    remove_pending_write_ui_state(context, write_id)
+    untrack_confirmation_message(context, write_id)
         
     record = get_pending_write(write_id)
     if not record or record.status != CalendarWriteStatus.PENDING:
@@ -83,7 +83,7 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     write_id = query.data.split("reject_")[1]
-    remove_pending_write_ui_state(context, write_id)
+    untrack_confirmation_message(context, write_id)
         
     record = get_pending_write(write_id)
     if not record or record.status != CalendarWriteStatus.PENDING:
@@ -136,7 +136,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     # Check if they sent a text message while a write is waiting for confirmation
-    pending_writes = get_pending_write_ui_states(context)
+    pending_writes = get_tracked_confirmation_messages(context)
     if pending_writes:
         for write_id, message_id in pending_writes:
             record = get_pending_write(write_id)
@@ -150,7 +150,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Exception as e:
                     logger.error(f"Failed to update interrupted message UI: {e}")
-        clear_pending_write_ui_states(context)
+        clear_tracked_confirmation_messages(context)
 
     text = update.message.text
     logger.info(f"Received message: {text}")
