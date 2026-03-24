@@ -51,7 +51,7 @@ def generate_flash_response(user_message: str, context_block: str, chat_history:
             'response_mime_type': 'application/json',
             'response_schema': FlashResponse,
             'system_instruction': system_instruction,
-            'temperature': 1.0, # Keep it relatively deterministic
+            'temperature': 1.0
         }
     )
     

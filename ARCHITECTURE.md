@@ -41,47 +41,86 @@ How a message moves through the system from receipt to response, and when Flash 
 
 ```mermaid
 flowchart TD
-    A(["📨 Inbound message\n(Telegram)"])
+    A(["📨 Inbound message
+    (Telegram)"])
 
-    A --> B{SessionManager\nWhat is current state?}
+    A --> B{"SessionManager
+    What is current state?"}
 
-    B -- "IDLE or ACTIVE\noperational" --> C[MessageRouter\nClassify intent]
-    B -- "ACTIVE session\nscheduled trigger fires" --> D{Conflict resolution}
+    B -- "IDLE or ACTIVE
+    operational" --> C["MessageRouter
+    Classify intent"]
+    B -- "ACTIVE session
+    scheduled trigger fires" --> D{"Conflict resolution"}
 
-    D -- "Daily check-in" --> D1["Queue check-in\nDeliver after session close"]
-    D -- "Sunday review" --> D2["Send nudge to user\nWait for /start_review"]
+    D -- "Daily check-in" --> D1["Queue check-in
+    Deliver after session close"]
+    D -- "Sunday review" --> D2["Send nudge to user
+    Wait for /start_review"]
 
-    C -- "Mode A\noperational" --> E[ContextBuilder\nAssemble prompt]
-    C -- "Mode B\nbrainstorm" --> F[ContextBuilder\nAssemble prompt\n+ session history]
+    C -- "Mode A
+    operational" --> E["ContextBuilder
+    Assemble prompt"]
+    C -- "Mode B
+    brainstorm" --> F["ContextBuilder
+    Assemble prompt
+    + session history"]
 
-    E --> G["Gemini Flash\nReturns structured FlashResponse\n{message, should_escalate, escalation_reason}"]
-    F --> H["Gemini Flash\nReturns structured FlashResponse\n(brainstorm turn)"]
+    E --> G["Gemini Flash
+    Returns structured FlashResponse
+    {message, should_escalate, escalation_reason}"]
+    F --> H["Gemini Flash
+    Returns structured FlashResponse
+    (brainstorm turn)"]
 
-    G --> I{flash_response\n.should_escalate?}
-    H --> J{Session closing?\n/done or 30min timeout}
+    G --> I{"flash_response
+    .should_escalate?"}
+    H --> J{"Session closing?
+    /done or 30min timeout"}
 
-    I -- "False" --> K["Send response\nto Telegram"]
-    I -- "True" --> L["EscalationHandler\nBuilds escalation prompt:\nassembled_context +\nflash message +\nescalation_reason"]
+    I -- "False" --> K["Send response
+    to Telegram"]
+    I -- "True" --> L["EscalationHandler
+    Builds escalation prompt:
+    assembled_context +
+    flash message +
+    escalation_reason"]
 
-    J -- "False\nstill active" --> K
-    J -- "True\nclosing" --> M["Send full transcript\nto Gemini Pro\nfor synthesis"]
+    J -- "False
+    still active" --> K
+    J -- "True
+    closing" --> M["Send full transcript
+    to Gemini Pro
+    for synthesis"]
 
-    L --> N["Gemini Pro\n(escalated reasoning)\nReceives full context +\nFlash draft + reason"]
+    L --> N["Gemini Pro
+    (escalated reasoning)
+    Receives full context +
+    Flash draft + reason"]
     M --> N
 
-    N --> O["Pro response\nor synthesis output"]
+    N --> O["Pro response
+    or synthesis output"]
 
-    O --> P{Contains calendar\nactions?}
+    O --> P{"Contains calendar
+    actions?"}
 
     P -- "No" --> K
-    P -- "Yes" --> Q["ConfirmationQueue\nWrite pending row to\ncalendar_writes table"]
+    P -- "Yes" --> Q["ConfirmationQueue
+    Write pending row to
+    calendar_writes table"]
 
-    Q --> R["Send proposal\nto Telegram\nwith confirm buttons"]
+    Q --> R["Send proposal
+    to Telegram
+    with confirm buttons"]
 
-    R --> S{User response}
+    R --> S{"User response"}
 
-    S -- "Confirmed" --> T["Execute write\nGoogle Calendar API\nUpdate row: confirmed"]
-    S -- "Rejected / adjusted" --> U["Discard or re-propose\nLog outcome"]
+    S -- "Confirmed" --> T["Execute write
+    Google Calendar API
+    Update row: confirmed"]
+    S -- "Rejected / adjusted" --> U["Discard or re-propose
+    Log outcome"]
 
     T --> K
     U --> K
@@ -111,89 +150,125 @@ Full internal architecture showing all components, data stores, and external ser
 
 ```mermaid
 flowchart TD
-    %% ─────────────────────────────────────────
-    %% EXTERNAL
-    %% ─────────────────────────────────────────
-    USER(["👤 Isaac\n(Telegram)"])
-    GCAL[("📅 Google Calendar\nAll Calendars")]
-    LANGFUSE["📊 Langfuse\nLLM Traces + Cost"]
-    SENTRY["🚨 Sentry\nError Alerting"]
+%% ─────────────────────────────────────────
+%% EXTERNAL
+%% ─────────────────────────────────────────
+USER(["👤 Isaac
+(Telegram)"])
+GCAL[("📅 Google Calendar
+All Calendars")]
+LANGFUSE["📊 Langfuse
+LLM Traces + Cost"]
+SENTRY["🚨 Sentry
+Error Alerting"]
 
-    subgraph INTERFACE["📱 Telegram Interface"]
-        TG["python-telegram-bot\nasync message + button handlers"]
-    end
+subgraph INTERFACE["📱 Telegram Interface"]
+    TG["python-telegram-bot
+    async message + button handlers"]
+end
 
-    subgraph ORCH["⚙️ Orchestration Layer"]
-        SM["SessionManager\nIDLE → ACTIVE → CLOSING → IDLE"]
-        MR["MessageRouter\nMode A: Operational\nMode B: Brainstorm"]
-        CB["ContextBuilder\ngoals + weekly_state +\ndecision_log + calendar"]
-        EH["EscalationHandler\nReads flash_response.should_escalate\nBuilds escalation prompt for Pro\nLogs to escalations table"]
-        CQ["ConfirmationQueue\npending calendar writes\nstatus: pending → confirmed"]
-        TS["TriggerScheduler\nAPScheduler\ndaily 7–9am + Sunday 10am\nconflict resolution"]
-    end
+subgraph ORCH["⚙️ Orchestration Layer"]
+    SM["SessionManager
+    IDLE → ACTIVE → CLOSING → IDLE"]
+    MR["MessageRouter
+    Mode A: Operational
+    Mode B: Brainstorm"]
+    CB["ContextBuilder
+    goals + weekly_state +
+    decision_log + calendar"]
+    EH["EscalationHandler
+    Reads flash_response.should_escalate
+    Builds escalation prompt for Pro
+    Logs to escalations table"]
+    CQ["ConfirmationQueue
+    pending calendar writes
+    status: pending → confirmed"]
+    TS["TriggerScheduler
+    APScheduler
+    daily 7–9am + Sunday 10am
+    conflict resolution"]
+end
 
-    subgraph REASONING["🧠 Reasoning Layer"]
-        FLASH["Gemini Flash\n\nDaily check-ins\nAd hoc operational\nBrainstorm turns\nReturns typed FlashResponse\n~$0.50/$3 per 1M tokens"]
-        PRO["Gemini Pro\n\nSunday review\nEscalated decisions\nSession synthesis\nReceives full context + Flash draft\n~$2/$12 per 1M tokens"]
-    end
+subgraph REASONING["🧠 Reasoning Layer"]
+    FLASH["Gemini Flash
 
-    subgraph CONTEXT["📄 Context Layer"]
-        GOALS["goals.md\nlong / medium / short term\nhuman-edited"]
-        WEEKLY["weekly_state.md\ncurrent week priorities\noverwritten every Sunday"]
-        DLOG["decision_log.md\nrationale trail\nappended daily, synthesised weekly"]
-    end
+    Daily check-ins
+    Ad hoc operational
+    Brainstorm turns
+    Returns typed FlashResponse
+    ~$0.50/$3 per 1M tokens"]
+    PRO["Gemini Pro
 
-    subgraph PERSIST["🗄️ Persistence — SQLite"]
-        T_SESS["sessions"]
-        T_DEC["decisions"]
-        T_CAL["calendar_writes"]
-        T_ESC["escalations"]
-        T_SNAP["weekly_snapshots"]
-    end
+    Sunday review
+    Escalated decisions
+    Session synthesis
+    Receives full context + Flash draft
+    ~$2/$12 per 1M tokens"]
+end
 
-    subgraph OBS["🔍 Observability"]
-        LOGURU["loguru / app.log"]
-    end
+subgraph CONTEXT["📄 Context Layer"]
+    GOALS["goals.md
+    long / medium / short term
+    human-edited"]
+    WEEKLY["weekly_state.md
+    current week priorities
+    overwritten every Sunday"]
+    DLOG["decision_log.md
+    rationale trail
+    appended daily, synthesised weekly"]
+end
 
-    subgraph INFRA["🖥️ AWS Lightsail"]
-        SYSTEMD["systemd — auto-restart"]
-        BACKUP["rclone → Backblaze B2"]
-    end
+subgraph PERSIST["🗄️ Persistence — SQLite"]
+    T_SESS["sessions"]
+    T_DEC["decisions"]
+    T_CAL["calendar_writes"]
+    T_ESC["escalations"]
+    T_SNAP["weekly_snapshots"]
+end
 
-    USER -- "message / button" --> TG
-    TG --> SM --> MR
-    MR -- "Mode A" --> CB
-    MR -- "Mode B" --> CB
+subgraph OBS["🔍 Observability"]
+    LOGURU["loguru / app.log"]
+end
 
-    CB --> GOALS & WEEKLY & DLOG & GCAL
-    CB --> FLASH
+subgraph INFRA["🖥️ AWS Lightsail"]
+    SYSTEMD["systemd — auto-restart"]
+    BACKUP["rclone → Backblaze B2"]
+end
 
-    FLASH -- "should_escalate: true" --> EH
-    FLASH -- "should_escalate: false" --> TG
-    EH -- "full context + Flash draft + reason" --> PRO
-    PRO --> TG
-    PRO --> DLOG & WEEKLY
+USER -- "message / button" --> TG
+TG --> SM --> MR
+MR -- "Mode A" --> CB
+MR -- "Mode B" --> CB
 
-    FLASH & PRO --> CQ
-    CQ -- "proposal" --> TG
-    TG -- "confirm" --> CQ
-    CQ -- "write" --> GCAL
+CB --> GOALS & WEEKLY & DLOG & GCAL
+CB --> FLASH
 
-    TS -- "daily" --> CB
-    TS -- "Sunday" --> PRO
-    TS -- "conflict" --> SM
+FLASH -- "should_escalate: true" --> EH
+FLASH -- "should_escalate: false" --> TG
+EH -- "full context + Flash draft + reason" --> PRO
+PRO --> TG
+PRO --> DLOG & WEEKLY
 
-    SM --> T_SESS
-    CQ --> T_CAL
-    EH --> T_ESC
-    CB --> T_DEC
-    PRO --> T_SNAP
+FLASH & PRO --> CQ
+CQ -- "proposal" --> TG
+TG -- "confirm" --> CQ
+CQ -- "write" --> GCAL
 
-    FLASH & PRO --> LANGFUSE
-    SM --> LOGURU
-    CQ --> LOGURU
+TS -- "daily" --> CB
+TS -- "Sunday" --> PRO
+TS -- "conflict" --> SM
 
-    SYSTEMD -.-> ORCH
-    BACKUP -.-> PERSIST & CONTEXT
-    SENTRY -.-> ORCH & REASONING
+SM --> T_SESS
+CQ --> T_CAL
+EH --> T_ESC
+CB --> T_DEC
+PRO --> T_SNAP
+
+FLASH & PRO --> LANGFUSE
+SM --> LOGURU
+CQ --> LOGURU
+
+SYSTEMD -.-> ORCH
+BACKUP -.-> PERSIST & CONTEXT
+SENTRY -.-> ORCH & REASONING
 ```

@@ -1,17 +1,19 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, ANY
 from main import (
-    SESSION_INACTIVITY_TIMEOUT,
     done_command,
-    get_session_timeout_job_name,
     handle_message,
-    reset_session_timeout,
-    timeout_inactive_session,
     handle_confirm,
     handle_reject,
     handle_start_trigger,
     handle_delay_trigger,
     handle_confirm_weekly_state
+)
+from orchestrator.session_manager import (
+    SESSION_INACTIVITY_TIMEOUT,
+    get_session_timeout_job_name,
+    timeout_inactive_session,
+    reset_session_timeout
 )
 from reasoning.flash_client import FlashResponse
 from persistence.models import CalendarWriteStatus
@@ -85,7 +87,7 @@ def test_reset_session_timeout_replaces_existing_job():
     )
 
 @pytest.mark.asyncio
-@patch('main.end_session', new_callable=AsyncMock)
+@patch('orchestrator.session_manager.end_session', new_callable=AsyncMock)
 async def test_timeout_inactive_session_closes_active_session(mock_end_session):
     context = MagicMock()
     context.user_data = {"session_state": "ACTIVE"}
