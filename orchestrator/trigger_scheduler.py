@@ -1,8 +1,8 @@
 import datetime
 import pytz
 from loguru import logger
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, ContextTypes
+from bot.keyboards import build_trigger_keyboard
 
 # Default timezone for scheduled triggers.
 # Change this if you want to run on a different local timezone.
@@ -22,12 +22,9 @@ async def prompt_next_trigger(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         text = "📅 *Sunday Review.* Are you ready to synthesize the week?"
     else:
         return
-        
-    keyboard = [
-        [InlineKeyboardButton("Start", callback_data=f"start_trigger_{next_trigger}")],
-        [InlineKeyboardButton("Not Now / Chat First", callback_data="delay_trigger")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Using keyboards.py to build the trigger confirmation keyboard for standardisation and easy testing
+    reply_markup = build_trigger_keyboard(next_trigger)
     
     await context.bot.send_message(
         chat_id=chat_id,

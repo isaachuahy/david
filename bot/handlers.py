@@ -107,6 +107,16 @@ async def handle_confirm_weekly_state(update: Update, context: ContextTypes.DEFA
     await query.answer()
     await execute_weekly_state_update(update, context)
 
+async def handle_reject_weekly_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles rejection of the weekly state update."""
+    query = update.callback_query
+    await query.answer()
+    
+    if 'proposed_weekly_state' in context.user_data:
+        del context.user_data['proposed_weekly_state']
+        
+    await query.edit_message_text("🚫 *Weekly state update rejected.*", parse_mode="Markdown")
+
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Closes the active session and checks for pending triggers."""
     if is_session_active(context):

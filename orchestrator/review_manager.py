@@ -1,7 +1,7 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from loguru import logger
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import ContextTypes
 
 from orchestrator.context_builder import build_context
@@ -10,6 +10,7 @@ from reasoning.pro_client import generate_sunday_review
 from orchestrator.confirmation_queue import add_pending_write
 from orchestrator.time_utils import parse_iso
 from orchestrator.session_manager import track_confirmation_message
+from bot.keyboards import build_weekly_state_keyboard, build_calendar_confirmation_keyboard
 
 async def run_sunday_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Executes the complete Sunday Review flow."""
@@ -37,13 +38,15 @@ async def run_sunday_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         
-        # Ask for confirmation before overwriting the weekly state
-        context.user_data['proposed_weekly_state'] = review.weekly_state_content
-        state_keyboard = [[InlineKeyboardButton("Confirm Weekly State Update", callback_data="confirm_weekly_state")]]
+        # Ask for confirmation before overwriting the weekly state (with timestamp for expiration)
+        context.user_data['proposed_weekly_state'] = {
+            "content": review.weekly_state_content,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=f"📝 *Proposed Weekly State Changes:*\n{review.state_change_summary}\n\nDo you want to apply these changes?",
-            reply_markup=InlineKeyboardMarkup(state_keyboard),
+            reply_markup=build_weekly_state_keyboard(),
             parse_mode="Markdown"
         )
         
@@ -54,14 +57,10 @@ async def run_sunday_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             write_id = add_pending_write(event.summary, start_dt, end_dt, event.description)
             
-            keyboard = [
-                [InlineKeyboardButton("Confirm", callback_data=f"confirm_{write_id}"), InlineKeyboardButton("Reject", callback_data=f"reject_{write_id}")]
-            ]
-            
             message = await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=f"🗓️ *Proposed Event:*\n**{event.summary}**\n_{event.description}_\n\nStart: {start_dt.strftime('%Y-%m-%d %H:%M UTC')}\nEnd: {end_dt.strftime('%Y-%m-%d %H:%M UTC')}",
-                reply_markup=InlineKeyboardMarkup(keyboard),
+                reply_markup=build_calendar_confirmation_keyboard(write_id),
                 parse_mode="Markdown"
             )
             
@@ -74,10 +73,17 @@ async def execute_weekly_state_update(update: Update, context: ContextTypes.DEFA
     """Backs up and overwrites the weekly state file."""
     query = update.callback_query
     proposed_state = context.user_data.get('proposed_weekly_state')
-    if not proposed_state:
-        await query.edit_message_text("❌ *No proposed weekly state found or it has expired.*", parse_mode="Markdown")
+    if not proposed_state or not isinstance(proposed_state, dict):
+        await query.edit_message_text("❌ *No proposed weekly state found.*", parse_mode="Markdown")
         return
         
+    # Lazy Expiration: Check if the proposal is older than 2 hours
+    proposal_time = parse_iso(proposed_state["timestamp"])
+    if datetime.now(timezone.utc) - proposal_time > timedelta(hours=2):
+        del context.user_data['proposed_weekly_state']
+        await query.edit_message_text("❌ *This weekly state proposal has expired (older than 2 hours).*", parse_mode="Markdown")
+        return
+
     # Resolve context directory relative to the current file
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     context_dir = os.path.join(base_dir, "context")
@@ -90,7 +96,7 @@ async def execute_weekly_state_update(update: Update, context: ContextTypes.DEFA
             dst.write(src.read())
             
     with open(weekly_state_path, "w", encoding="utf-8") as f:
-        f.write(proposed_state)
+        f.write(proposed_state["content"])
         
     del context.user_data['proposed_weekly_state']
     await query.edit_message_text("✅ *Weekly State successfully updated and backed up.*", parse_mode="Markdown")

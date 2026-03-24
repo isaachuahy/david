@@ -7,7 +7,8 @@ from bot.handlers import (
     handle_reject,
     handle_start_trigger,
     handle_delay_trigger,
-    handle_confirm_weekly_state
+    handle_confirm_weekly_state,
+    handle_reject_weekly_state
 )
 from orchestrator.session_manager import (
     SESSION_INACTIVITY_TIMEOUT,
@@ -205,3 +206,21 @@ async def test_handle_confirm_weekly_state(mock_execute):
     
     update.callback_query.answer.assert_awaited_once()
     mock_execute.assert_awaited_once_with(update, context)
+
+@pytest.mark.asyncio
+async def test_handle_reject_weekly_state():
+    update = MagicMock()
+    update.callback_query = MagicMock()
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    
+    context = MagicMock()
+    context.user_data = {'proposed_weekly_state': {'content': 'test', 'timestamp': '2026-03-22T10:00:00Z'}}
+    
+    await handle_reject_weekly_state(update, context)
+    
+    update.callback_query.answer.assert_awaited_once()
+    assert 'proposed_weekly_state' not in context.user_data
+    update.callback_query.edit_message_text.assert_awaited_once_with(
+        "🚫 *Weekly state update rejected.*", parse_mode="Markdown"
+    )
