@@ -1,8 +1,10 @@
 import os
-from typing import Optional, cast
+from typing import Optional
 from pydantic import BaseModel, Field
 from google import genai
 from loguru import logger
+
+from reasoning.parser import parse_model_response
 
 # Resolve paths for the prompt template
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -59,4 +61,4 @@ def generate_flash_response(user_message: str, context_block: str, chat_history:
         }
     )
     
-    return cast(FlashResponse, response.parsed)
+    return parse_model_response(response, FlashResponse)

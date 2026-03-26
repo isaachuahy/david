@@ -5,6 +5,8 @@ from pydantic import BaseModel, Field
 from google import genai
 from loguru import logger
 
+from reasoning.parser import parse_model_response
+
 # Resolve paths for the prompt template
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROMPTS_DIR = os.path.join(BASE_DIR, "reasoning", "prompts")
@@ -53,4 +55,4 @@ def generate_sunday_review(context_block: str, past_events_block: str) -> Sunday
         }
     )
     
-    return response.parsed
+    return parse_model_response(response, SundayReviewResponse)
