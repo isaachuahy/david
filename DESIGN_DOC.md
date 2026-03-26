@@ -66,13 +66,11 @@ Isaac is the only user. Daily interaction volume is low — on the order of 5–
 
 The core design decision is to treat context as a first-class artifact rather than relying on conversation history. Every LLM call is assembled by a `ContextBuilder` that reads three flat files — `goals.md`, `weekly_state.md`, `decision_log.md` — along with a live read of the Google Calendar. This means the reasoning model always has the full picture, regardless of whether the current exchange is a 1-turn reschedule request or a 30-turn brainstorm.
 
-The system uses two models in a tiered arrangement: a higher-cost reasoning model (Gemini Pro) and a lower-cost general driver model (Gemini Flash).
+Instead of model routing, David uses **thinking budget routing**. The system uses a single general driver model (Gemini Flash) for all daily and ad hoc interactions, allocating inference compute dynamically per message. Gemini Pro is reserved exclusively for the Sunday weekly review and session synthesis.
 
-Gemini Flash handles daily check-ins, operational ad hoc requests, and all turns during a brainstorming session. Flash always returns a typed `FlashResponse` object with three fields: `message` (the response text), `should_escalate` (boolean), and `escalation_reason` (optional string). The orchestrator reads `should_escalate` directly — there is no string matching or signal parsing. Using a structured response schema via the `google-genai` SDK enforces this at the API level; Flash cannot emit a malformed escalation signal.
+The `MessageRouter` evaluates incoming messages using heuristic classification to determine the user's intent: `OPERATIONAL` (reschedule, retrieve, simple queries — no thinking budget), `BRAINSTORM` (open-ended discussion — low-medium thinking budget), or `GOAL_REVIEW` (direction, priorities, what should I do — high thinking budget). Flash is then called with the assembled context and the corresponding thinking budget passed through to the API config.
 
-When `should_escalate` is true, `EscalationHandler` constructs a prompt for Gemini Pro containing the full assembled context, Flash's draft message, and the structured escalation reason. Pro therefore receives *more* information than Flash had — the same goals, calendar, and decision log, plus Flash's initial assessment and the specific tradeoff or ambiguity that triggered escalation. Pro also handles every Sunday review directly, and synthesises all brainstorming sessions at close, distilling decisions made, rationale, and any calendar actions into the decision log.
-
-This two-tier arrangement keeps the majority of API cost on Flash (~$0.50/$3 per 1M tokens) while reserving Pro (~$2/$12 per 1M tokens) for the moments that actually require its reasoning depth. At expected usage, total LLM cost is forecasted to be under $3/month.
+Gemini Flash always returns a typed `FlashResponse` object with two fields: `message` (the response text) and an optional `proposed_calendar_action` (a structured event proposal). If a calendar action is proposed, the orchestrator queues it for confirmation. Using a structured response schema via the `google-genai` SDK enforces this at the API level.
 
 Brainstorming sessions run on Flash throughout and close when the user presses a `/done` button or after 30 minutes of inactivity. At close, the full session transcript is sent to Pro for synthesis. This avoids the cost of Pro for every brainstorm turn while ensuring the output benefits from stronger reasoning.
 
@@ -84,13 +82,13 @@ The system has five layers.
 
 The **interface layer** is a `python-telegram-bot` async process. It receives messages and button presses, routes them to the orchestration layer, and sends responses back. Inline buttons handle confirmation flows and session close actions.
 
-The **orchestration layer** is self-built Python — no LangChain, no LangGraph. It owns six concerns: session lifecycle state (`SessionManager`), intent classification (`MessageRouter`), context assembly (`ContextBuilder`), Flash-to-Pro routing (`EscalationHandler`), confirmation-gated calendar writes (`ConfirmationQueue`), and scheduled trigger management (`TriggerScheduler`). Each is a single-responsibility class; the whole layer is approximately 400–500 lines.
+The **orchestration layer** is self-built Python — no LangChain, no LangGraph. It owns five concerns: session lifecycle state (`SessionManager`), intent classification and budget routing (`MessageRouter`), context assembly (`ContextBuilder`), confirmation-gated calendar writes (`ConfirmationQueue`), and scheduled trigger management (`TriggerScheduler`). Each is a single-responsibility module; the whole layer is approximately 400 lines.
 
-The **reasoning layer** is two Gemini clients — Flash and Pro — both via the `google-genai` SDK. Flash responses are typed via Pydantic response schema, enforcing structured output at the API level. Both models have 1M token context windows, which means the assembled context never needs to be trimmed.
+The **reasoning layer** is two Gemini clients — Flash and Pro — both via the `google-genai` SDK. Flash receives dynamic thinking budgets based on intent. Flash responses are typed via Pydantic response schema, enforcing structured output at the API level. Both models have 1M token context windows, which means the assembled context never needs to be trimmed.
 
 The **context layer** is three markdown files on disk. They are read by `ContextBuilder` on every call and written by Pro at the end of brainstorm sessions and Sunday reviews. Keeping them as flat files rather than database rows means they are human-readable, human-editable, and straightforward to debug.
 
-The **persistence layer** is SQLite with five tables: `sessions`, `decisions`, `calendar_writes`, `escalations`, and `weekly_snapshots`. This is the structured audit trail — not the LLM's working memory, which lives in the context files. `EscalationHandler` writes to the `escalations` table before the Pro call fires, so there is a record even if Pro fails. The `decision_log.md` is synthesised weekly to maintain a rolling window of recent decisions, preventing indefinite growth.
+The **persistence layer** is SQLite with four tables: `sessions`, `decisions`, `calendar_writes`, and `weekly_snapshots`. This is the structured audit trail — not the LLM's working memory, which lives in the context files. The `decision_log.md` is synthesised weekly to maintain a rolling window of recent decisions, preventing indefinite growth.
 
 ### Conversation Lifecycle
 
@@ -139,9 +137,10 @@ Observability uses three tools: Langfuse (cloud free tier) for per-call LLM trac
 
 **LangChain / LangGraph as the orchestration framework.** Both were considered and rejected. LangChain adds abstraction over APIs that are already mature and easy to use directly; the abstraction makes debugging harder without meaningful benefit at this scale. LangGraph is well-suited for complex agent graphs with parallel branches and many nodes — the orchestration here is sequential with a single escalation path, which is better served by 400 lines of clean Python than by a graph framework.
 
-**Three-layer router architecture (daily layer → strategy layer → logic layer).** Considered at the suggestion of common agentic design patterns. Rejected because the complexity — additional latency, a separate routing model, more prompt engineering surface area — is not justified for a single-user, low-volume system. The two-tier Flash + conditional escalation to Pro achieves the same functional outcome with far less to debug.
+**Two-tier model escalation (Flash drafting for Pro).** Initially considered as a way to reserve reasoning costs. Rejected because dynamically adjusting the "thinking budget" on a single model (Flash) is architecturally simpler, faster, and achieves the same reasoning depth without maintaining an `EscalationHandler`, `escalations` database table, or complex inter-model state handoffs.
 
 **`[[ESCALATE: reason]]` string signal for escalation routing.** Initially considered as a simple mechanism for Flash to signal the need for escalation. Rejected because Flash is a probabilistic system — it will sometimes emit partial matches, capitalisation variations, or omit the signal under certain generation conditions. String matching on free-text output is a fragile interface for a routing decision that affects cost, latency, and response quality. The current approach uses a Pydantic response schema enforced at the API level via `google-genai`'s `response_schema` parameter, making `should_escalate` a typed boolean field the orchestrator reads directly.
+**Three-layer router architecture (daily layer → strategy layer → logic layer).** Considered at the suggestion of common agentic design patterns. Rejected because the complexity — additional latency, a separate routing model, more prompt engineering surface area — is not justified for a single-user, low-volume system. Heuristic classification of thinking budgets in a single router achieves the same functional outcome with far less to debug.
 
 **Sending only Flash's summary to Pro during escalation.** Considered as a way to reduce token cost on Pro calls. Rejected because Pro's job during escalation is to reason about a real tradeoff involving goals, calendar commitments, and decision history — exactly the context Flash had. Stripping that context and asking Pro to judge from a summary alone would make Pro's reasoning less grounded than Flash's, which inverts the purpose of the escalation. Token cost on rare escalation calls is negligible given the 1M context window.
 
@@ -176,7 +175,6 @@ david/
 │   ├── session_manager.py
 │   ├── message_router.py
 │   ├── context_builder.py
-│   ├── escalation_handler.py
 │   ├── confirmation_queue.py
 │   └── trigger_scheduler.py
 │
@@ -225,6 +223,5 @@ david/
 7. APScheduler daily trigger
 8. Session lifecycle (`SessionManager` + `/done` button)
 9. Sunday review flow (Pro)
-10. Escalation handler
-11. Langfuse + Sentry wiring
-12. Backup script
+10. Langfuse + Sentry wiring
+11. Backup script

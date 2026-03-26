@@ -18,7 +18,7 @@ C4Context
 
     System_Ext(telegram, "Telegram", "Message interface. Delivers check-ins, receives commands, surfaces confirmation buttons.")
     System_Ext(gcal, "Google Calendar", "Source of truth for scheduled time. David reads all calendars and writes confirmed blocks.")
-    System_Ext(gemini, "Gemini API (Google)", "Reasoning layer. Flash for daily/ad hoc. Pro for weekly review, escalations, session synthesis.")
+    System_Ext(gemini, "Gemini API (Google)", "Reasoning layer. Flash for daily/ad hoc with dynamic budgets. Pro for weekly review and session synthesis.")
     System_Ext(langfuse, "Langfuse", "LLM observability. Traces every call with token counts and cost.")
     System_Ext(sentry, "Sentry", "Error alerting. Catches unhandled exceptions.")
     System_Ext(b2, "Backblaze B2", "Off-site backup. Daily snapshot of SQLite + context files.")
@@ -35,9 +35,9 @@ C4Context
 
 ---
 
-## 2. Reasoning & Escalation Data Flow
+## 2. Reasoning & Message Data Flow
 
-How a message moves through the system from receipt to response, and when Flash hands off to Pro.
+How a message moves through the system from receipt to response, using thinking budget routing.
 
 ```mermaid
 flowchart TD
@@ -47,9 +47,8 @@ flowchart TD
     A --> B{"SessionManager
     What is current state?"}
 
-    B -- "IDLE or ACTIVE
-    operational" --> C["MessageRouter
-    Classify intent"]
+    B -- "IDLE or ACTIVE" --> C["MessageRouter
+    Classify intent & assign budget"]
     B -- "ACTIVE session
     scheduled trigger fires" --> D{"Conflict resolution"}
 
@@ -58,54 +57,34 @@ flowchart TD
     D -- "Sunday review" --> D2["Send nudge to user
     Wait for /start_review"]
 
-    C -- "Mode A
-    operational" --> E["ContextBuilder
-    Assemble prompt"]
-    C -- "Mode B
-    brainstorm" --> F["ContextBuilder
+    C -- "OPERATIONAL (No budget)" --> E
+    C -- "BRAINSTORM (Low budget)" --> E
+    C -- "GOAL_REVIEW (High budget)" --> E
+
+    E["ContextBuilder
     Assemble prompt
-    + session history"]
-
-    E --> G["Gemini Flash
+    + session history (always)"] --> G["Gemini Flash
     Returns structured FlashResponse
-    {message, should_escalate, escalation_reason}"]
-    F --> H["Gemini Flash
-    Returns structured FlashResponse
-    (brainstorm turn)"]
+    {message, proposed_calendar_action}"]
 
-    G --> I{"flash_response
-    .should_escalate?"}
-    H --> J{"Session closing?
+    G --> J{"Session closing?
     /done or 30min timeout"}
 
-    I -- "False" --> K["Send response
-    to Telegram"]
-    I -- "True" --> L["EscalationHandler
-    Builds escalation prompt:
-    assembled_context +
-    flash message +
-    escalation_reason"]
-
     J -- "False
-    still active" --> K
+    still active" --> P{"Contains calendar
+    actions?"}
     J -- "True
     closing" --> M["Send full transcript
     to Gemini Pro
     for synthesis"]
 
-    L --> N["Gemini Pro
-    (escalated reasoning)
-    Receives full context +
-    Flash draft + reason"]
-    M --> N
+    M --> N["Gemini Pro
+    (Session synthesis)"]
 
-    N --> O["Pro response
-    or synthesis output"]
+    N --> O["Update decision_log.md"]
 
-    O --> P{"Contains calendar
-    actions?"}
-
-    P -- "No" --> K
+    P -- "No" --> K["Send response
+    to Telegram"]
     P -- "Yes" --> Q["ConfirmationQueue
     Write pending row to
     calendar_writes table"]
@@ -128,7 +107,6 @@ flowchart TD
     K --> V(["📤 Response delivered"])
 
     style N fill:#c8e6c9
-    style H fill:#fff9c4
     style G fill:#fff9c4
     style Q fill:#ffe0b2
     style T fill:#c8e6c9
@@ -138,7 +116,7 @@ flowchart TD
 
 Every calendar write passes through `ConfirmationQueue` — there is no path from a model response to a Google Calendar write that bypasses user confirmation.
 
-Flash always returns a typed `FlashResponse` object with a `should_escalate: bool` field. The orchestrator reads this field directly — there is no string matching or signal parsing. When escalation fires, `EscalationHandler` constructs a prompt containing the full assembled context, Flash's draft message, and the structured escalation reason. Pro therefore receives *more* information than Flash had, not less — it sees the full picture plus Flash's initial assessment.
+Flash always returns a typed `FlashResponse` object. The `MessageRouter` assigns a thinking budget based on intent classification (`OPERATIONAL`, `BRAINSTORM`, `GOAL_REVIEW`) via keyword heuristics. Because an operational query can seamlessly evolve into a brainstorm, chat history is maintained and injected into the context for all modes. This simplifies the architecture by keeping all ad hoc reasoning on a single model while scaling compute dynamically.
 
 Session synthesis always goes to Pro regardless of whether the session was escalated mid-way.
 
@@ -171,15 +149,12 @@ subgraph ORCH["⚙️ Orchestration Layer"]
     SM["SessionManager
     IDLE → ACTIVE → CLOSING → IDLE"]
     MR["MessageRouter
-    Mode A: Operational
-    Mode B: Brainstorm"]
+        Intent: Operational, Brainstorm, Goal Review
+        Assigns thinking budget"]
     CB["ContextBuilder
     goals + weekly_state +
-    decision_log + calendar"]
-    EH["EscalationHandler
-    Reads flash_response.should_escalate
-    Builds escalation prompt for Pro
-    Logs to escalations table"]
+        decision_log + calendar
+        + session history"]
     CQ["ConfirmationQueue
     pending calendar writes
     status: pending → confirmed"]
@@ -222,7 +197,6 @@ subgraph PERSIST["🗄️ Persistence — SQLite"]
     T_SESS["sessions"]
     T_DEC["decisions"]
     T_CAL["calendar_writes"]
-    T_ESC["escalations"]
     T_SNAP["weekly_snapshots"]
 end
 
@@ -237,15 +211,12 @@ end
 
 USER -- "message / button" --> TG
 TG --> SM --> MR
-MR -- "Mode A" --> CB
-MR -- "Mode B" --> CB
+    MR --> CB
 
 CB --> GOALS & WEEKLY & DLOG & GCAL
 CB --> FLASH
 
-FLASH -- "should_escalate: true" --> EH
-FLASH -- "should_escalate: false" --> TG
-EH -- "full context + Flash draft + reason" --> PRO
+    FLASH --> TG
 PRO --> TG
 PRO --> DLOG & WEEKLY
 
@@ -260,7 +231,6 @@ TS -- "conflict" --> SM
 
 SM --> T_SESS
 CQ --> T_CAL
-EH --> T_ESC
 CB --> T_DEC
 PRO --> T_SNAP
 
