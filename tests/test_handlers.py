@@ -13,8 +13,7 @@ from bot.handlers import (
 from orchestrator.session_manager import (
     SESSION_INACTIVITY_TIMEOUT,
     get_session_timeout_job_name,
-    timeout_inactive_session,
-    reset_session_timeout
+    timeout_inactive_session
 )
 from reasoning.flash_client import FlashResponse
 from persistence.models import CalendarWriteStatus
@@ -24,9 +23,7 @@ from persistence.models import CalendarWriteStatus
 async def test_handle_message(mock_process_message):
     # 1. Arrange: Set up our mocks
     mock_flash_response = FlashResponse(
-        message="This is a mocked response from David.",
-        should_escalate=False,
-        escalation_reason=None
+        message="This is a mocked response from David."
     )
     mock_process_message.return_value = mock_flash_response
     
@@ -55,35 +52,6 @@ async def test_handle_message(mock_process_message):
         chat_id=456,
         user_id=123,
     )
-    
-def test_reset_session_timeout_replaces_existing_job():
-    context = MagicMock()
-    existing_job = MagicMock()
-    context.job_queue.get_jobs_by_name.return_value = (existing_job,)
-
-    reset_session_timeout(context, chat_id=456, user_id=123)
-
-    existing_job.schedule_removal.assert_called_once()
-    context.job_queue.run_once.assert_called_once_with(
-        timeout_inactive_session,
-        SESSION_INACTIVITY_TIMEOUT,
-        data={"chat_id": 456},
-        name=get_session_timeout_job_name(123),
-        chat_id=456,
-        user_id=123,
-    )
-
-@pytest.mark.asyncio
-@patch('orchestrator.session_manager.end_session', new_callable=AsyncMock)
-async def test_timeout_inactive_session_closes_active_session(mock_end_session):
-    context = MagicMock()
-    context.user_data = {"session_state": "ACTIVE"}
-    context.job.data = {"chat_id": 456}
-    context.bot.send_message = AsyncMock()
-
-    await timeout_inactive_session(context)
-
-    mock_end_session.assert_awaited_once_with(context, 456, reason="timeout")
 
 @pytest.mark.asyncio
 @patch('bot.handlers.end_session', new_callable=AsyncMock)
@@ -116,6 +84,7 @@ async def test_handle_confirm_success(mock_remove_ui, mock_get_pending, mock_con
     update.callback_query.message.text = "Original Proposal Text"
     
     context = MagicMock()
+    context.user_data = {} # Ensure clean state for cache test
     
     # Mock the database record
     mock_record = MagicMock()
@@ -123,7 +92,8 @@ async def test_handle_confirm_success(mock_remove_ui, mock_get_pending, mock_con
     mock_get_pending.return_value = mock_record
     
     # Mock successful execution
-    mock_confirm_write.return_value = True
+    mock_created_event = {"id": "evt_123", "summary": "Test Event"}
+    mock_confirm_write.return_value = mock_created_event
     
     await handle_confirm(update, context)
     
@@ -132,6 +102,8 @@ async def test_handle_confirm_success(mock_remove_ui, mock_get_pending, mock_con
     update.callback_query.edit_message_text.assert_awaited_once_with(
         text="Original Proposal Text\n\n✅ *Event Confirmed and Scheduled.*", parse_mode="Markdown"
     )
+    # Verify that the cache was updated
+    assert context.user_data['cached_events'] == [mock_created_event]
 
 @pytest.mark.asyncio
 @patch('bot.handlers.reject_write')

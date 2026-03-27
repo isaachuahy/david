@@ -1,6 +1,7 @@
 import os
 from loguru import logger
 from integrations.calendar import get_upcoming_events
+from telegram.ext import ContextTypes
 
 # Resolve the absolute path to the context directory
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -21,9 +22,21 @@ def _read_file_safely(filename: str, fallback: str) -> str:
         logger.error(f"Error reading {filepath}: {e}")
         return fallback
 
-def _format_calendar_events(days: int = 7) -> str:
-    """Fetches and formats upcoming calendar events into a readable string."""
-    events = get_upcoming_events(days=days)
+def _format_calendar_events(tg_context: ContextTypes.DEFAULT_TYPE = None, days: int = 7) -> str:
+    """Fetches and formats upcoming calendar events, utilizing a session cache if available."""
+    events = None
+
+    # tg_context is a cache for calendar events to avoid hitting the API on every message. 
+    # This is for each user session, and needs to be maintained within the same session.
+    if tg_context is not None:
+        events = tg_context.user_data.get('cached_events')
+        
+    if events is None:
+        logger.info("Calendar cache miss. Fetching fresh events from API...")
+        events = get_upcoming_events(days=days)
+        if tg_context is not None:
+            tg_context.user_data['cached_events'] = events
+
     if not events:
         return "No upcoming events scheduled."
         
@@ -35,7 +48,7 @@ def _format_calendar_events(days: int = 7) -> str:
         
     return "\n".join(lines)
 
-def build_context() -> str:
+def build_context(tg_context: ContextTypes.DEFAULT_TYPE = None) -> str:
     """
     Assembles the full context block to be injected into LLM calls.
     Includes goals, weekly state, decision log, and live calendar.
@@ -45,7 +58,7 @@ def build_context() -> str:
     goals = _read_file_safely("goals.md", "No goals defined.")
     weekly = _read_file_safely("weekly_state.md", "No weekly state defined.")
     decisions = _read_file_safely("decision_log.md", "No recent decisions.")
-    calendar = _format_calendar_events()
+    calendar = _format_calendar_events(tg_context)
 
     return (f"<CONTEXT>\n<GOALS>\n{goals}\n</GOALS>\n\n"
             f"<WEEKLY_STATE>\n{weekly}\n</WEEKLY_STATE>\n\n"

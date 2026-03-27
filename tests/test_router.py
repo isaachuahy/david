@@ -38,7 +38,7 @@ async def test_process_message_orchestration(
     result = await process_message("reschedule my 2pm", context)
     
     assert result == mock_response
-    mock_build_context.assert_called_once()
+    mock_build_context.assert_called_once_with(context)
     mock_get_chat_history.assert_called_once_with(context)
     
     mock_generate_flash.assert_called_once_with(
@@ -92,3 +92,4 @@ async def test_process_message_error(mock_build_context):
     context = MagicMock()
     with pytest.raises(Exception, match="Mocked error"):
         await process_message("Any user message", context)
+    mock_build_context.assert_called_once_with(context)

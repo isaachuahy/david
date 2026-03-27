@@ -2,7 +2,7 @@ import os
 import pytest
 from unittest.mock import patch, mock_open, MagicMock
 
-from reasoning.flash_client import generate_flash_response, PROMPTS_DIR
+from reasoning.flash_client import generate_flash_response, PROMPTS_DIR, FlashResponse
 
 @patch("reasoning.flash_client.genai.Client")
 @patch("builtins.open", new_callable=mock_open, read_data="Mocked system prompt.")
@@ -12,7 +12,7 @@ def test_generate_flash_response_reads_system_prompt(mock_file, mock_client_clas
     mock_client_class.return_value = mock_client_instance
     
     mock_response = MagicMock()
-    mock_response.parsed = MagicMock()
+    mock_response.parsed = FlashResponse(message="Mocked flash response.")
     mock_client_instance.models.generate_content.return_value = mock_response
 
     # Call the function

@@ -39,7 +39,7 @@ def classify_intent(text: str) -> MessageIntent:
 async def process_message(text: str, context: ContextTypes.DEFAULT_TYPE) -> FlashResponse:
     """Processes an incoming text message, handles model routing, and updates history."""
     try:
-        context_block = build_context()
+        context_block = build_context(context)
         chat_history = get_chat_history(context)
         
         # Classify intent and determine thinking level

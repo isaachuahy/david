@@ -2,7 +2,7 @@ import os
 import pytest
 from unittest.mock import patch, mock_open, MagicMock
 
-from reasoning.pro_client import generate_sunday_review, PROMPTS_DIR
+from reasoning.pro_client import generate_sunday_review, PROMPTS_DIR, SundayReviewResponse
 
 @patch("reasoning.pro_client.genai.Client")
 @patch("builtins.open", new_callable=mock_open, read_data="Context: $context_block\nPast: $past_events_block")
@@ -12,7 +12,12 @@ def test_generate_sunday_review_success(mock_file, mock_client_class):
     mock_client_class.return_value = mock_client_instance
     
     mock_response = MagicMock()
-    mock_response.parsed = MagicMock()
+    mock_response.parsed = SundayReviewResponse(
+        message="Mocked Sunday Review",
+        state_change_summary="Mocked changes",
+        weekly_state_content="Mocked weekly state",
+        proposed_events=[]
+    )
     mock_client_instance.models.generate_content.return_value = mock_response
 
     # Call the function

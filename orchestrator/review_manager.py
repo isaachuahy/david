@@ -15,7 +15,7 @@ from bot.keyboards import build_weekly_state_keyboard, build_calendar_confirmati
 async def run_sunday_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Executes the complete Sunday Review flow."""
     try:
-        context_block = build_context()
+        context_block = build_context(context)
         
         # Fetch and format past events
         past_events_raw = get_past_events(days=7)

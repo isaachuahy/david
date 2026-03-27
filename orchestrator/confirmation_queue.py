@@ -45,23 +45,25 @@ def get_pending_write(write_id: str) -> Optional[CalendarWriteRecord]:
         logger.error(f"Failed to retrieve pending write {write_id}: {e}")
         return None
 
-def confirm_write(write_id: str) -> bool:
+def confirm_write(write_id: str) -> Optional[dict]:
     """
     Executes a pending write by pushing it to Google Calendar, then marks it executed.
+    Returns the created event dictionary on success, otherwise None.
     """
+
     db = get_db()
     record = get_pending_write(write_id)
     
     if not record or record.status != CalendarWriteStatus.PENDING:
         logger.warning(f"Cannot confirm write {write_id}: not found or not pending.")
-        return False
+        return None
         
     # Lazy Expiration: Check if the proposal is older than 2 hours
     created_at = parse_iso(record.created_at)
     if datetime.now(timezone.utc) - created_at > timedelta(hours=2):
         logger.warning(f"Pending write {write_id} has expired (older than 2 hours). Auto-rejecting.")
         db["calendar_writes"].update(write_id, {"status": CalendarWriteStatus.EXPIRED.value})  # type: ignore
-        return False
+        return None
         
     logger.info(f"Confirming write {write_id}...")
     
@@ -79,10 +81,11 @@ def confirm_write(write_id: str) -> bool:
     if created_event:
         db["calendar_writes"].update(write_id, {"status": CalendarWriteStatus.EXECUTED.value})  # type: ignore
         logger.success(f"Successfully executed write {write_id} to Google Calendar.")
-        return True
+        # Return created_event for caching within same session
+        return created_event
     else:
         logger.error(f"Failed to insert event for write {write_id} via API.")
-        return False
+        return None
 
 def reject_write(write_id: str) -> bool:
     """Marks a pending write as rejected."""

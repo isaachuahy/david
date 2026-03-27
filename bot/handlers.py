@@ -13,7 +13,10 @@ from orchestrator.session_manager import (
 )
 from orchestrator.review_manager import run_sunday_review, execute_weekly_state_update
 from persistence.models import CalendarWriteStatus, SessionStatus
-from bot.keyboards import build_confirmation_keyboard
+
+# Handlers for Telegram bot commands and messages. 
+# These are the entry points for all user interactions, and they delegate to the Router and other orchestrator components to handle the logic and state management. 
+# The handlers also manage session state and ensure that the user experience is smooth and responsive, even when waiting for LLM responses or handling confirmations.
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /start command."""
@@ -60,8 +63,16 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text="❌ *This request is no longer valid or has already been processed.*", parse_mode="Markdown")
         return
 
-    success = confirm_write(write_id)
-    text = f"{query.message.text}\n\n✅ *Event Confirmed and Scheduled.*" if success else f"{query.message.text}\n\n❌ *Failed to schedule event.*"
+    created_event = confirm_write(write_id)
+    if created_event:
+        text = f"{query.message.text}\n\n✅ *Event Confirmed and Scheduled.*"
+        # Immediately update the local cache so the LLM knows about this new event
+        if 'cached_events' not in context.user_data:
+            context.user_data['cached_events'] = []
+        context.user_data['cached_events'].append(created_event)
+    else:
+        text = f"{query.message.text}\n\n❌ *Failed to schedule event.*"
+        
     await query.edit_message_text(text=text, parse_mode="Markdown")
 
 async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
