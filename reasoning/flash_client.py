@@ -5,6 +5,7 @@ from google import genai
 from loguru import logger
 
 from reasoning.parser import parse_model_response
+from reasoning.pro_client import ProposedEvent
 
 # Resolve paths for the prompt template
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -14,14 +15,13 @@ class FlashResponse(BaseModel):
     message: str = Field(
         description="The text response to send directly back to the user."
     )
-    should_escalate: bool = Field(
-        description="True if the request requires deeper reasoning, priority tradeoffs, or proposes writing to the calendar. False for standard chat, retrieving context, or simple operational queries."
-    )
-    escalation_reason: Optional[str] = Field(
-        description="If should_escalate is True, briefly explain the tradeoff or proposed action to the Pro model. Otherwise, null."
+    proposed_calendar_action: Optional[ProposedEvent] = Field(
+        default=None,
+        description="If the user's request implies a calendar action (scheduling, modifying, or deleting an event), populate this field. Otherwise, leave it null."
     )
 
-def generate_flash_response(user_message: str, context_block: str, chat_history: Optional[list[dict]] = None) -> FlashResponse:
+def generate_flash_response(user_message: str, context_block: str, chat_history: Optional[list[dict]] = None,
+                            thinking_level: Optional[str] = None) -> FlashResponse:
     """
     Sends the assembled context and user message to Gemini Flash.
     Enforces a strict Pydantic schema for the response.
@@ -50,15 +50,21 @@ def generate_flash_response(user_message: str, context_block: str, chat_history:
         
     prompt += f"<USER_MESSAGE>\n{user_message}\n</USER_MESSAGE>"
     
+    # Base configuration
+    generation_config = {
+        'response_mime_type': 'application/json',
+        'response_schema': FlashResponse,
+        'system_instruction': system_instruction,
+        'temperature': 1.0
+    }
+    
+    if thinking_level:
+        generation_config['thinking_config'] = {'thinking_level': thinking_level}
+
     response = client.models.generate_content(
         model='gemini-3-flash-preview',
         contents=prompt,
-        config={
-            'response_mime_type': 'application/json',
-            'response_schema': FlashResponse,
-            'system_instruction': system_instruction,
-            'temperature': 1.0
-        }
-    )
+        config=generation_config
+)
     
     return parse_model_response(response, FlashResponse)

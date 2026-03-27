@@ -11,6 +11,7 @@ from reasoning.parser import parse_model_response
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROMPTS_DIR = os.path.join(BASE_DIR, "reasoning", "prompts")
 
+# Formats proposed calendar write events
 class ProposedEvent(BaseModel):
     summary: str = Field(description="The title of the calendar event.")
     start_time: str = Field(description="The start time in ISO 8601 format (UTC), e.g., 2026-03-22T09:00:00Z")
@@ -38,6 +39,8 @@ def generate_sunday_review(context_block: str, past_events_block: str) -> Sunday
         logger.error(f"Failed to read sunday_review.txt: {e}")
         raise
 
+    # Template is designed with placeholders $context_block and $past_events_block for dynamic content injection
+    # safe_substitute will raise an error if placeholders are missing, ensuring we catch template issues earlymes
     prompt = template.safe_substitute(
         context_block=context_block,
         past_events_block=past_events_block

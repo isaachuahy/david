@@ -8,18 +8,25 @@ from loguru import logger
 
 load_dotenv()
 
+# Define BASE_DIR relative to this file's location to anchor all path lookups
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 # We need full access to read and write events
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
-def get_calendar_credentials() -> Any:
+def get_calendar_credentials() -> Credentials:
     """
     Gets valid user credentials from storage or initiates the OAuth2 flow.
     Returns a Credentials object suitable for building Google API clients.
     """
     creds = None
     
-    token_path = os.getenv('GOOGLE_TOKEN_PATH', 'token.json')
-    credentials_path = os.getenv('GOOGLE_CREDENTIALS_PATH', 'credentials.json')
+    # Anchor paths to the project root for consistency
+    default_token_path = os.path.join(BASE_DIR, 'token.json')
+    default_creds_path = os.path.join(BASE_DIR, 'credentials.json')
+    
+    token_path = os.getenv('GOOGLE_TOKEN_PATH', default_token_path)
+    credentials_path = os.getenv('GOOGLE_CREDENTIALS_PATH', default_creds_path)
 
     # Load existing token if available
     if os.path.exists(token_path):
