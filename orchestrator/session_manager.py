@@ -1,3 +1,4 @@
+import os
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import List, Tuple
@@ -7,9 +8,14 @@ from telegram.ext import ContextTypes
 from persistence.database import get_db
 from orchestrator.trigger_scheduler import prompt_next_trigger
 from persistence.models import SessionRecord, SessionStatus
+from reasoning.flash_client import generate_session_synthesis
 
 SESSION_INACTIVITY_TIMEOUT = timedelta(minutes=30)
 SESSION_TIMEOUT_JOB_PREFIX = "session_inactivity_timeout"
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONTEXT_DIR = os.path.join(BASE_DIR, "context")
+DECISION_LOG_PATH = os.path.join(CONTEXT_DIR, "decision_log.md")
 
 def is_session_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Checks if the user currently has an active session."""
@@ -98,22 +104,44 @@ def start_session(context: ContextTypes.DEFAULT_TYPE) -> str:
     logger.info(f"Started new session: {session_id}")
     return session_id
 
+def append_to_decision_log(content: str):
+    """Appends synthesized session notes to the decision log."""
+    with open(DECISION_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(f"\n\n{content.strip()}\n")
+
 async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
     """Background job to synthesize the session transcript and finalize closing."""
     job_data = context.job.data
     chat_id = job_data["chat_id"]
     session_id = job_data.get("session_id")
+    chat_history = list(get_chat_history(context))
+    session_date = datetime.now(timezone.utc).date().isoformat()
     
     logger.info(f"Running background synthesis for session {session_id}...")
-    # TODO: Execute Gemini Pro log synthesis here
-    
-    # Finalize transition to IDLE
-    context.user_data['chat_history'] = []
-    context.user_data['session_state'] = SessionStatus.IDLE
-    context.user_data['current_session_id'] = None
-    
-    # Evaluate the trigger queue
-    await prompt_next_trigger(context, chat_id)
+    try:
+        if chat_history:
+            synthesis = generate_session_synthesis(chat_history, session_date=session_date)
+            append_to_decision_log(synthesis.content)
+            logger.success(f"Appended session synthesis to decision log for session {session_id}.")
+        else:
+            logger.info(f"Skipping synthesis for session {session_id}: no chat history found.")
+    except Exception as e:
+        logger.error(f"Failed to synthesize session {session_id}: {e}")
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ I closed the session, but failed to update the decision log. Please check the logs."
+            )
+        except Exception as notify_error:
+            logger.error(f"Failed to send synthesis failure message: {notify_error}")
+    finally:
+        # Finalize transition to IDLE even if synthesis fails
+        context.user_data['chat_history'] = []
+        context.user_data['session_state'] = SessionStatus.IDLE
+        context.user_data['current_session_id'] = None
+        
+        # Evaluate the trigger queue
+        await prompt_next_trigger(context, chat_id)
 
 async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: str = "done"):
     """Ends the active session, clears short-term memory, and checks for pending triggers."""

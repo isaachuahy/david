@@ -6,17 +6,11 @@ from google import genai
 from loguru import logger
 
 from reasoning.parser import parse_model_response
+from reasoning.schemas import ProposedEvent
 
 # Resolve paths for the prompt template
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROMPTS_DIR = os.path.join(BASE_DIR, "reasoning", "prompts")
-
-# Formats proposed calendar write events
-class ProposedEvent(BaseModel):
-    summary: str = Field(description="The title of the calendar event.")
-    start_time: str = Field(description="The start time in ISO 8601 format (UTC), e.g., 2026-03-22T09:00:00Z")
-    end_time: str = Field(description="The end time in ISO 8601 format (UTC), e.g., 2026-03-22T11:00:00Z")
-    description: str = Field(description="A brief description of the event's purpose.")
 
 class SundayReviewResponse(BaseModel):
     message: str = Field(description="A direct message to the user summarising the analysis.")

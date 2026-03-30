@@ -1,4 +1,5 @@
 import pytest
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch, ANY
 from bot.handlers import (
     done_command,
@@ -8,7 +9,8 @@ from bot.handlers import (
     handle_start_trigger,
     handle_delay_trigger,
     handle_confirm_weekly_state,
-    handle_reject_weekly_state
+    handle_reject_weekly_state,
+    test_schedule as handler_test_schedule,
 )
 from orchestrator.session_manager import (
     SESSION_INACTIVITY_TIMEOUT,
@@ -164,20 +166,53 @@ async def test_handle_delay_trigger():
     
     await handle_delay_trigger(update, context)
     
-    update.callback_query.edit_message_text.assert_awaited_once_with("Got it. We will chat first. I'll hold onto this trigger until you're ready.", parse_mode="Markdown")
+    update.callback_query.edit_message_text.assert_awaited_once_with(
+        "Got it - let's chat first. I'll hold onto this trigger until you're ready.",
+        parse_mode="Markdown"
+    )
 
 @pytest.mark.asyncio
-@patch('bot.handlers.execute_weekly_state_update', new_callable=AsyncMock)
+@patch('bot.handlers.execute_weekly_state_update')
 async def test_handle_confirm_weekly_state(mock_execute):
     update = MagicMock()
     update.callback_query = MagicMock()
     update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
     context = MagicMock()
+    context.user_data = {
+        'proposed_weekly_state': {
+            'content': '# Updated Weekly State',
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        }
+    }
+    mock_execute.return_value = True
     
     await handle_confirm_weekly_state(update, context)
     
     update.callback_query.answer.assert_awaited_once()
-    mock_execute.assert_awaited_once_with(update, context)
+    mock_execute.assert_called_once_with('# Updated Weekly State')
+    assert 'proposed_weekly_state' not in context.user_data
+    update.callback_query.edit_message_text.assert_awaited_once_with(
+        "✅ *Weekly State successfully updated and backed up.*",
+        parse_mode="Markdown"
+    )
+
+@pytest.mark.asyncio
+@patch('bot.handlers.send_calendar_proposal', new_callable=AsyncMock)
+async def test_test_schedule_uses_calendar_proposal_helper(mock_send_calendar_proposal):
+    update = MagicMock()
+    update.effective_chat.id = 456
+    context = MagicMock()
+
+    await handler_test_schedule(update, context)
+
+    mock_send_calendar_proposal.assert_awaited_once()
+    kwargs = mock_send_calendar_proposal.await_args.kwargs
+    assert kwargs["context"] is context
+    assert kwargs["chat_id"] == 456
+    assert kwargs["action"].summary == "David UI Test Event"
+    assert kwargs["action"].description == "Testing the Telegram inline buttons."
+    assert kwargs["prefix_text"] == "I propose scheduling 'David UI Test Event' for the next 15 minutes. Does this look good?"
 
 @pytest.mark.asyncio
 async def test_handle_reject_weekly_state():

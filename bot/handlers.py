@@ -12,9 +12,32 @@ from orchestrator.session_manager import (
     untrack_confirmation_message, clear_tracked_confirmation_messages
 )
 from orchestrator.review_manager import run_sunday_review, execute_weekly_state_update
+from orchestrator.time_utils import parse_iso
 from persistence.models import CalendarWriteStatus, SessionStatus
+from reasoning.schemas import ProposedEvent
+from bot.keyboards import build_calendar_confirmation_keyboard, build_weekly_state_keyboard
 
-# Handlers for Telegram bot commands and messages. 
+async def send_calendar_proposal(context: ContextTypes.DEFAULT_TYPE, chat_id: int, action, prefix_text: str = ""):
+    """Helper to process a calendar action, queue it, and send the Telegram confirmation UI."""
+    # Used both for ad-hoc calendar proposals from the LLM and for proposed events generated during the Sunday Review process.
+    start_dt = parse_iso(action.start_time)
+    end_dt = parse_iso(action.end_time)
+    
+    write_id = add_pending_write(action.summary, start_dt, end_dt, action.description)
+    reply_markup = build_calendar_confirmation_keyboard(write_id)
+    
+    full_text = f"{prefix_text}\n\n" if prefix_text else ""
+    full_text += f"🗓️ *Proposed Event:*\n*{action.summary}*\n_{action.description}_\n\nStart: {start_dt.strftime('%Y-%m-%d %H:%M UTC')}\nEnd: {end_dt.strftime('%Y-%m-%d %H:%M UTC')}"
+    
+    message = await context.bot.send_message(
+        chat_id=chat_id,
+        text=full_text.strip(),
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+    track_confirmation_message(context, write_id, message.message_id)
+
+# Handlers for Telegram bot commands and messages.
 # These are the entry points for all user interactions, and they delegate to the Router and other orchestrator components to handle the logic and state management. 
 # The handlers also manage session state and ensure that the user experience is smooth and responsive, even when waiting for LLM responses or handling confirmations.
 
@@ -33,22 +56,17 @@ async def test_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Temporary command to test the confirmation UI."""
     now = datetime.now(timezone.utc)
     end = now + timedelta(minutes=15)
-    write_id = add_pending_write(
-        summary="David UI Test Event",
-        start_time=now,
-        end_time=end,
-        description="Testing the Telegram inline buttons."
+    await send_calendar_proposal(
+        context=context,
+        chat_id=update.effective_chat.id,
+        action=ProposedEvent(
+            summary="David UI Test Event",
+            start_time=now.isoformat().replace("+00:00", "Z"),
+            end_time=end.isoformat().replace("+00:00", "Z"),
+            description="Testing the Telegram inline buttons."
+        ),
+        prefix_text="I propose scheduling 'David UI Test Event' for the next 15 minutes. Does this look good?"
     )
-    
-    reply_markup = build_confirmation_keyboard(write_id)
-    
-    message = await update.message.reply_text(
-        "I propose scheduling 'David UI Test Event' for the next 15 minutes. Does this look good?",
-        reply_markup=reply_markup
-    )
-    
-    # Store the pending write in user data so we can cancel it if they type a text message
-    track_confirmation_message(context, write_id, message.message_id)
 
 async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles confirmation of a proposed calendar write."""
@@ -67,6 +85,14 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if created_event:
         text = f"{query.message.text}\n\n✅ *Event Confirmed and Scheduled.*"
         # Immediately update the local cache so the LLM knows about this new event
+        # Note: This cache is only for the current session and will not persist across sessions.
+        # This is a workaround to ensure that if the user schedules an event and then immediately asks David about their schedule, 
+        # the new event will be included in the context without needing to wait for the next API fetch cycle.
+
+        # Initialize the in-memory calendar cache if it hasn't been populated yet,
+        # then append the newly created event so subsequent context builds see it
+        # without waiting for another Calendar API fetch.
+
         if 'cached_events' not in context.user_data:
             context.user_data['cached_events'] = []
         context.user_data['cached_events'].append(created_event)
@@ -103,20 +129,71 @@ async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
     if trigger_type == "daily_checkin":
         await query.edit_message_text("🌅 *Daily Check-in Started.* What are your top priorities for today?", parse_mode="Markdown")
     elif trigger_type == "weekly_review":
-        await query.edit_message_text("📅 *Starting Sunday Review. Analyzing your week...*", parse_mode="Markdown")
-        await run_sunday_review(update, context)
+        await query.edit_message_text("📅 *Starting Sunday Review. Analysing your week...*", parse_mode="Markdown")
+        try:
+            review = run_sunday_review(context)
+            
+            # Send the synthesis message
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id, 
+                text=f"**Sunday Review Complete**\n\n{review.message}", 
+                parse_mode="Markdown"
+            )
+            
+            # Ask for confirmation before overwriting the weekly state
+            context.user_data['proposed_weekly_state'] = {
+                "content": review.weekly_state_content,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"📝 *Proposed Weekly State Changes:*\n{review.state_change_summary}\n\nDo you want to apply these changes?",
+                reply_markup=build_weekly_state_keyboard(),
+                parse_mode="Markdown"
+            )
+            
+            # Propose calendar events individually
+            for event in review.proposed_events:
+                await send_calendar_proposal(
+                    context,
+                    update.effective_chat.id,
+                    event
+                )
+        except Exception as e:
+            logger.error(f"Error during Sunday Review: {e}")
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ An error occurred during the Sunday Review.")
 
 async def handle_delay_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles delaying a scheduled trigger."""
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Got it. We will chat first. I'll hold onto this trigger until you're ready.", parse_mode="Markdown")
+    await query.edit_message_text("Got it - let's chat first. I'll hold onto this trigger until you're ready.", parse_mode="Markdown")
 
 async def handle_confirm_weekly_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles confirmation to overwrite the weekly state."""
     query = update.callback_query
     await query.answer()
-    await execute_weekly_state_update(update, context)
+    
+    proposed_state = context.user_data.get('proposed_weekly_state')
+    if not proposed_state or not isinstance(proposed_state, dict):
+        await query.edit_message_text("❌ *No proposed weekly state found.*", parse_mode="Markdown")
+        return
+        
+    # Lazy Expiration: Check if the proposal is older than 2 hours
+    proposal_time = parse_iso(proposed_state["timestamp"])
+    if datetime.now(timezone.utc) - proposal_time > timedelta(hours=2):
+        del context.user_data['proposed_weekly_state']
+        await query.edit_message_text("❌ *This weekly state proposal has expired (older than 2 hours).*", parse_mode="Markdown")
+        return
+
+    success = execute_weekly_state_update(proposed_state["content"])
+    
+    del context.user_data['proposed_weekly_state']
+    
+    if success:
+        await query.edit_message_text("✅ *Weekly State successfully updated and backed up.*", parse_mode="Markdown")
+    else:
+        await query.edit_message_text("❌ *Failed to update weekly state. Please check the logs.*", parse_mode="Markdown")
 
 async def handle_reject_weekly_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles rejection of the weekly state update."""
@@ -166,7 +243,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         response = await process_message(text, context)
-        await update.message.reply_text(response.message)
+        
+        if response.proposed_calendar_action:
+            await send_calendar_proposal(
+                context=context,
+                chat_id=update.effective_chat.id,
+                action=response.proposed_calendar_action,
+                prefix_text=response.message
+            )
+        else:
+            await update.message.reply_text(response.message)
     except Exception as e:
         logger.error(f"Error handling message: {e}")
         await update.message.reply_text("Sorry, I encountered an error. Please check the logs.")

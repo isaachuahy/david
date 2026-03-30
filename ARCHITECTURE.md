@@ -18,7 +18,7 @@ C4Context
 
     System_Ext(telegram, "Telegram", "Message interface. Delivers check-ins, receives commands, surfaces confirmation buttons.")
     System_Ext(gcal, "Google Calendar", "Source of truth for scheduled time. David reads all calendars and writes confirmed blocks.")
-    System_Ext(gemini, "Gemini API (Google)", "Reasoning layer. Flash for daily/ad hoc with dynamic budgets. Pro for weekly review and session synthesis.")
+    System_Ext(gemini, "Gemini API (Google)", "Reasoning layer. Flash for daily/ad hoc, and session synthesis. Pro for weekly review.")
     System_Ext(langfuse, "Langfuse", "LLM observability. Traces every call with token counts and cost.")
     System_Ext(sentry, "Sentry", "Error alerting. Catches unhandled exceptions.")
     System_Ext(b2, "Backblaze B2", "Off-site backup. Daily snapshot of SQLite + context files.")
@@ -75,10 +75,10 @@ flowchart TD
     actions?"}
     J -- "True
     closing" --> M["Send full transcript
-    to Gemini Pro
+    to Gemini Flash (High Budget)
     for synthesis"]
 
-    M --> N["Gemini Pro
+    M --> N["Gemini Flash
     (Session synthesis)"]
 
     N --> O["Update decision_log.md"]
@@ -170,14 +170,13 @@ subgraph REASONING["🧠 Reasoning Layer"]
     Daily check-ins
     Ad hoc operational
     Brainstorm turns
+    Session synthesis
     Returns typed FlashResponse
     ~$0.50/$3 per 1M tokens"]
     PRO["Gemini Pro
 
     Sunday review
-    Escalated decisions
-    Session synthesis
-    Receives full context + Flash draft
+    Receives full context
     ~$2/$12 per 1M tokens"]
 end
 
@@ -217,6 +216,7 @@ CB --> GOALS & WEEKLY & DLOG & GCAL
 CB --> FLASH
 
     FLASH --> TG
+    FLASH --> DLOG
 PRO --> TG
 PRO --> DLOG & WEEKLY
 

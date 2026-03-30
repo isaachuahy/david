@@ -66,13 +66,13 @@ Isaac is the only user. Daily interaction volume is low — on the order of 5–
 
 The core design decision is to treat context as a first-class artifact rather than relying on conversation history. Every LLM call is assembled by a `ContextBuilder` that reads three flat files — `goals.md`, `weekly_state.md`, `decision_log.md` — along with a live read of the Google Calendar. This means the reasoning model always has the full picture, regardless of whether the current exchange is a 1-turn reschedule request or a 30-turn brainstorm.
 
-Instead of model routing, David uses **thinking budget routing**. The system uses a single general driver model (Gemini Flash) for all daily and ad hoc interactions, allocating inference compute dynamically per message. Gemini Pro is reserved exclusively for the Sunday weekly review and session synthesis.
+Instead of model routing, David uses **thinking budget routing**. The system uses a single general driver model (Gemini Flash) for all daily interactions, ad hoc reasoning, and session synthesis, allocating inference compute dynamically. Gemini Pro is reserved exclusively for the Sunday weekly review.
 
 The `MessageRouter` evaluates incoming messages using heuristic classification to determine the user's intent: `OPERATIONAL` (reschedule, retrieve, simple queries — no thinking budget), `BRAINSTORM` (open-ended discussion — low-medium thinking budget), or `GOAL_REVIEW` (direction, priorities, what should I do — high thinking budget). Flash is then called with the assembled context and the corresponding thinking budget passed through to the API config.
 
 Gemini Flash always returns a typed `FlashResponse` object with two fields: `message` (the response text) and an optional `proposed_calendar_action` (a structured event proposal). If a calendar action is proposed, the orchestrator queues it for confirmation. Using a structured response schema via the `google-genai` SDK enforces this at the API level.
 
-Brainstorming sessions run on Flash throughout and close when the user presses a `/done` button or after 30 minutes of inactivity. At close, the full session transcript is sent to Pro for synthesis. This avoids the cost of Pro for every brainstorm turn while ensuring the output benefits from stronger reasoning.
+Brainstorming sessions run on Flash throughout and close when the user presses a `/done` button or after 30 minutes of inactivity. At close, the full session transcript is synthesised by Flash using a high thinking budget. This avoids the cost of Pro entirely for daily operations while maintaining a high-quality distillation of the decision log.
 
 For system diagrams, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
@@ -86,13 +86,13 @@ The **orchestration layer** is self-built Python — no LangChain, no LangGraph.
 
 The **reasoning layer** is two Gemini clients — Flash and Pro — both via the `google-genai` SDK. Flash receives dynamic thinking budgets based on intent. Flash responses are typed via Pydantic response schema, enforcing structured output at the API level. Both models have 1M token context windows, which means the assembled context never needs to be trimmed.
 
-The **context layer** is three markdown files on disk. They are read by `ContextBuilder` on every call and written by Pro at the end of brainstorm sessions and Sunday reviews. Keeping them as flat files rather than database rows means they are human-readable, human-editable, and straightforward to debug.
+The **context layer** is three markdown files on disk. They are read by `ContextBuilder` on every call and written by Flash at the end of brainstorm sessions, and by Pro during Sunday reviews. Keeping them as flat files rather than database rows means they are human-readable, human-editable, and straightforward to debug.
 
 The **persistence layer** is SQLite with four tables: `sessions`, `decisions`, `calendar_writes`, and `weekly_snapshots`. This is the structured audit trail — not the LLM's working memory, which lives in the context files. The `decision_log.md` is synthesised weekly to maintain a rolling window of recent decisions, preventing indefinite growth.
 
 ### Conversation Lifecycle
 
-Every conversation has an explicit lifecycle: `IDLE → ACTIVE → CLOSING → IDLE`. The transition from `ACTIVE` to `CLOSING` is triggered either by the user pressing a `/done` button on Telegram (which surfaces two options — close without calendar actions, or close and propose calendar changes) or by a 30-minute inactivity timeout. At `CLOSING`, the session transcript is sent to Pro to distil decisions, rationale, and calendar actions, which are then appended to the current `decision_log.md`. The full log is only synthesised and compacted into a rolling window once a week during the Sunday review.
+Every conversation has an explicit lifecycle: `IDLE → ACTIVE → CLOSING → IDLE`. The transition from `ACTIVE` to `CLOSING` is triggered either by the user pressing a `/done` button on Telegram (which surfaces two options — close without calendar actions, or close and propose calendar changes) or by a 30-minute inactivity timeout. At `CLOSING`, the session transcript is sent to Flash (with a high thinking budget) to distill decisions, rationale, and calendar actions, which are then appended to the current `decision_log.md`. The full log is only synthesised and compacted into a rolling window once a week during the Sunday review.
 
 Scheduled triggers respect active sessions. If the daily check-in fires during an active brainstorm, it is queued and delivered immediately after the session closes. If the Sunday review fires during an active session, a non-intrusive nudge is sent and the review waits for manual initiation or fires automatically one hour after the session closes.
 
@@ -126,10 +126,10 @@ Observability uses three tools: Langfuse (cloud free tier) for per-call LLM trac
 | Item | Monthly |
 |---|---|
 | AWS Lightsail | ~$5 USD |
-| Gemini Flash (daily + ad hoc) | ~$1 |
-| Gemini Pro (weekly + escalations + synthesis) | ~$1.50 |
+| Gemini Flash (daily, ad hoc, synthesis) | ~$1.50 |
+| Gemini Pro (weekly) | ~$0.50 |
 | Langfuse, Sentry, Backblaze B2 | $0 |
-| **Total** | **~$8.50** |
+| **Total** | **~$7.00** |
 
 ---
 
@@ -152,7 +152,9 @@ Observability uses three tools: Langfuse (cloud free tier) for per-call LLM trac
 
 **Fly.io or Render for deployment.** Both considered. Fly.io has usage-based pricing that is hard to predict and risks cold starts. Render's free tier sleeps on inactivity — fatal for an always-on bot. The paid Render tier that avoids sleep costs $19/month before compute. AWS Lightsail provides full control, predictable cost, and no cold start behaviour.
 
-**Offloading brainstorming to an external chatbot (Claude.ai, ChatGPT).** Considered as a way to leverage better UX for long reasoning sessions and avoid LLM costs during multi-turn exchanges. Rejected because it breaks the integrated workflow: an external chatbot has no awareness of the goals poster, decision log, or calendar state, so it cannot make grounded recommendations. The Flash-drafts-Pro-synthesises approach achieves low cost during exploration and high-quality output at session close, without leaving the integrated system.
+**Offloading brainstorming to an external chatbot (Claude.ai, ChatGPT).** Considered as a way to leverage better UX for long reasoning sessions and avoid LLM costs during multi-turn exchanges. Rejected because it breaks the integrated workflow: an external chatbot has no awareness of the goals poster, decision log, or calendar state, so it cannot make grounded recommendations. Using Flash for both exploration and synthesis achieves low cost and high-quality output at session close, without leaving the integrated system.
+
+**Using Gemini Pro for session synthesis** Original thought was to use the heavy reasoning power of Gemini Pro to be able to succinctly synthesise conversations while maintaining important context. However, seeing that each API call would quickly explode the cost especially with how long multi-turn conversations could get, opt for Flash with high thinking budget. A well-steered prompt + Flash should be adequate for session synthesis.
 
 ---
 

@@ -5,7 +5,8 @@ from orchestrator.session_manager import (
     SESSION_INACTIVITY_TIMEOUT,
     get_session_timeout_job_name,
     timeout_inactive_session,
-    reset_session_timeout
+    reset_session_timeout,
+    execute_synthesis_task,
 )
 from persistence.models import SessionStatus
 
@@ -36,3 +37,68 @@ async def test_timeout_inactive_session_closes_active_session(mock_end_session):
     await timeout_inactive_session(context)
 
     mock_end_session.assert_awaited_once_with(context, 456, reason="timeout")
+
+@pytest.mark.asyncio
+@patch('orchestrator.session_manager.prompt_next_trigger', new_callable=AsyncMock)
+@patch('orchestrator.session_manager.append_to_decision_log')
+@patch('orchestrator.session_manager.generate_session_synthesis')
+async def test_execute_synthesis_task_appends_and_finalizes_state(
+    mock_generate_session_synthesis,
+    mock_append_to_decision_log,
+    mock_prompt_next_trigger,
+):
+    context = MagicMock()
+    context.user_data = {
+        "chat_history": [{"role": "user", "content": "We decided to focus on sales."}],
+        "session_state": SessionStatus.CLOSING,
+        "current_session_id": "sess_123",
+    }
+    context.job.data = {"chat_id": 456, "session_id": "sess_123"}
+    context.bot.send_message = AsyncMock()
+
+    mock_generate_session_synthesis.return_value = MagicMock(content="### Session - 2026-03-30\n- Focused on sales.")
+
+    await execute_synthesis_task(context)
+
+    mock_generate_session_synthesis.assert_called_once()
+    args = mock_generate_session_synthesis.call_args.args
+    kwargs = mock_generate_session_synthesis.call_args.kwargs
+    assert args[0] == [{"role": "user", "content": "We decided to focus on sales."}]
+    assert kwargs["session_date"]
+    mock_append_to_decision_log.assert_called_once_with("### Session - 2026-03-30\n- Focused on sales.")
+    assert context.user_data["chat_history"] == []
+    assert context.user_data["session_state"] == SessionStatus.IDLE
+    assert context.user_data["current_session_id"] is None
+    mock_prompt_next_trigger.assert_awaited_once_with(context, 456)
+    context.bot.send_message.assert_not_awaited()
+
+@pytest.mark.asyncio
+@patch('orchestrator.session_manager.prompt_next_trigger', new_callable=AsyncMock)
+@patch('orchestrator.session_manager.append_to_decision_log')
+@patch('orchestrator.session_manager.generate_session_synthesis', side_effect=Exception("boom"))
+async def test_execute_synthesis_task_notifies_on_failure_and_finalizes_state(
+    mock_generate_session_synthesis,
+    mock_append_to_decision_log,
+    mock_prompt_next_trigger,
+):
+    context = MagicMock()
+    context.user_data = {
+        "chat_history": [{"role": "user", "content": "Important decision"}],
+        "session_state": SessionStatus.CLOSING,
+        "current_session_id": "sess_456",
+    }
+    context.job.data = {"chat_id": 789, "session_id": "sess_456"}
+    context.bot.send_message = AsyncMock()
+
+    await execute_synthesis_task(context)
+
+    mock_generate_session_synthesis.assert_called_once()
+    mock_append_to_decision_log.assert_not_called()
+    context.bot.send_message.assert_awaited_once_with(
+        chat_id=789,
+        text="⚠️ I closed the session, but failed to update the decision log. Please check the logs."
+    )
+    assert context.user_data["chat_history"] == []
+    assert context.user_data["session_state"] == SessionStatus.IDLE
+    assert context.user_data["current_session_id"] is None
+    mock_prompt_next_trigger.assert_awaited_once_with(context, 789)
