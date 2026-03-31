@@ -30,16 +30,20 @@ def test_reset_session_timeout_replaces_existing_job():
     )
 
 @patch("orchestrator.session_manager.get_db")
-def test_reconcile_orphaned_sessions_marks_active_rows_interrupted(mock_get_db):
+def test_reconcile_orphaned_sessions_marks_active_and_closing_rows_interrupted(mock_get_db):
     mock_get_db.return_value["sessions"].rows_where.return_value = [
-        {"id": "sess_one"},
-        {"id": "sess_two"},
+        {"id": "sess_one", "status": SessionStatus.ACTIVE.value},
+        {"id": "sess_two", "status": SessionStatus.CLOSING.value},
     ]
 
     reconciled = reconcile_orphaned_sessions()
 
     assert reconciled == 2
     assert mock_get_db.return_value["sessions"].update.call_count == 2
+    mock_get_db.return_value["sessions"].rows_where.assert_called_once_with(
+        "status IN (?, ?)",
+        [SessionStatus.ACTIVE.value, SessionStatus.CLOSING.value],
+    )
     first_call = mock_get_db.return_value["sessions"].update.call_args_list[0]
     assert first_call.args[0] == "sess_one"
     assert first_call.args[1]["status"] == SessionStatus.INTERRUPTED.value
@@ -68,6 +72,7 @@ async def test_timeout_inactive_session_closes_active_session(mock_end_session):
 
 @pytest.mark.asyncio
 @patch('orchestrator.session_manager.prompt_next_trigger', new_callable=AsyncMock)
+@patch('orchestrator.session_manager.get_db')
 @patch('orchestrator.session_manager.persist_decision')
 @patch('orchestrator.session_manager.append_to_decision_log')
 @patch('orchestrator.session_manager.generate_session_synthesis')
@@ -75,6 +80,7 @@ async def test_execute_synthesis_task_appends_and_finalizes_state(
     mock_generate_session_synthesis,
     mock_append_to_decision_log,
     mock_persist_decision,
+    mock_get_db,
     mock_prompt_next_trigger,
 ):
     context = MagicMock()
@@ -102,6 +108,10 @@ async def test_execute_synthesis_task_appends_and_finalizes_state(
     assert kwargs["session_date"]
     mock_persist_decision.assert_called_once_with("sess_123", "### Session - 2026-03-30\n- Focused on sales.")
     mock_append_to_decision_log.assert_called_once_with("### Session - 2026-03-30\n- Focused on sales.")
+    mock_get_db.return_value["sessions"].update.assert_called_once_with(
+        "sess_123",
+        {"status": SessionStatus.COMPLETED.value},
+    )
     assert context.user_data["chat_history"] == []
     assert "cached_events" not in context.user_data
     assert context.user_data["session_state"] == SessionStatus.IDLE
@@ -111,6 +121,7 @@ async def test_execute_synthesis_task_appends_and_finalizes_state(
 
 @pytest.mark.asyncio
 @patch('orchestrator.session_manager.prompt_next_trigger', new_callable=AsyncMock)
+@patch('orchestrator.session_manager.get_db')
 @patch('orchestrator.session_manager.persist_decision')
 @patch('orchestrator.session_manager.append_to_decision_log')
 @patch('orchestrator.session_manager.generate_session_synthesis', side_effect=Exception("boom"))
@@ -118,6 +129,7 @@ async def test_execute_synthesis_task_notifies_on_failure_and_finalizes_state(
     mock_generate_session_synthesis,
     mock_append_to_decision_log,
     mock_persist_decision,
+    mock_get_db,
     mock_prompt_next_trigger,
 ):
     context = MagicMock()
@@ -139,6 +151,10 @@ async def test_execute_synthesis_task_notifies_on_failure_and_finalizes_state(
     mock_generate_session_synthesis.assert_called_once()
     mock_persist_decision.assert_not_called()
     mock_append_to_decision_log.assert_not_called()
+    mock_get_db.return_value["sessions"].update.assert_called_once_with(
+        "sess_456",
+        {"status": SessionStatus.COMPLETED.value},
+    )
     context.bot.send_message.assert_awaited_once_with(
         chat_id=789,
         text="⚠️ I closed the session, but failed to update the decision log. Please check the logs."

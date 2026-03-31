@@ -117,13 +117,18 @@ def start_session(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 def reconcile_orphaned_sessions() -> int:
     """
-    Marks any sessions left in ACTIVE state as INTERRUPTED.
+    Marks any sessions left in ACTIVE or CLOSING state as INTERRUPTED.
     This is used at startup to recover from VPS or process restarts.
     """
     db = get_db()
-    orphaned_sessions = list(db["sessions"].rows_where("status = ?", [SessionStatus.ACTIVE.value]))  # type: ignore
+    orphaned_sessions = list(  # type: ignore
+        db["sessions"].rows_where(
+            "status IN (?, ?)",
+            [SessionStatus.ACTIVE.value, SessionStatus.CLOSING.value],
+        )
+    )
     if not orphaned_sessions:
-        logger.info("No orphaned ACTIVE sessions found during startup reconciliation.")
+        logger.info("No orphaned ACTIVE/CLOSING sessions found during startup reconciliation.")
         return 0
 
     interrupted_at = datetime.now(timezone.utc).isoformat()
@@ -133,9 +138,11 @@ def reconcile_orphaned_sessions() -> int:
             "status": SessionStatus.INTERRUPTED.value,
             "end_time": interrupted_at,
         })
-        logger.warning(f"Marked orphaned session {session_id} as INTERRUPTED during startup reconciliation.")
+        logger.warning(
+            f"Marked orphaned session {session_id} ({session['status']}) as INTERRUPTED during startup reconciliation."
+        )
 
-    logger.info(f"Reconciled {len(orphaned_sessions)} orphaned ACTIVE session(s).")
+    logger.info(f"Reconciled {len(orphaned_sessions)} orphaned ACTIVE/CLOSING session(s).")
     return len(orphaned_sessions)
 
 def append_to_decision_log(content: str):
@@ -209,6 +216,15 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
         # Finalise transition to IDLE even if synthesis fails.
         # Clear both short-term chat state and the per-session calendar cache
         # so the next session always starts from a fresh local view.
+        if session_id:
+            try:
+                get_db()["sessions"].update(session_id, {  # type: ignore
+                    "status": SessionStatus.COMPLETED.value,
+                })
+                logger.info(f"Marked session {session_id} as COMPLETED after synthesis finalization.")
+            except Exception as e:
+                logger.error(f"Failed to mark session {session_id} as COMPLETED: {e}")
+
         user_data = _user_data(context)
         user_data['chat_history'] = []
         user_data.pop('cached_events', None)

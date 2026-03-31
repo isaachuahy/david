@@ -6,6 +6,7 @@ class SessionStatus(str, Enum):
     IDLE = "IDLE"
     ACTIVE = "ACTIVE"
     CLOSING = "CLOSING"
+    COMPLETED = "COMPLETED"
     INTERRUPTED = "INTERRUPTED"
 
 class CalendarWriteStatus(str, Enum):
