@@ -19,6 +19,7 @@ from orchestrator.session_manager import (
     timeout_inactive_session
 )
 from reasoning.flash_client import FlashResponse
+from reasoning.pro_client import SundayReviewResponse
 from reasoning.schemas import ProposedEvent
 from persistence.models import CalendarWriteStatus
 
@@ -156,6 +157,158 @@ async def test_handle_start_trigger_daily(mock_consume_trigger):
     update.callback_query.edit_message_text.assert_awaited_once_with(
         "🌅 *Daily Check-in Started.* What are your top priorities for today?", parse_mode="Markdown"
     )
+
+@pytest.mark.asyncio
+@patch('bot.handlers.send_calendar_proposal', new_callable=AsyncMock)
+@patch('bot.handlers.run_sunday_review')
+@patch('bot.handlers.consume_trigger')
+async def test_handle_start_trigger_weekly_queues_one_event_at_a_time(
+    mock_consume_trigger,
+    mock_run_sunday_review,
+    mock_send_calendar_proposal,
+):
+    update = MagicMock()
+    update.effective_chat.id = 456
+    update.callback_query = MagicMock()
+    update.callback_query.data = "start_trigger_weekly_review"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {}
+    context.bot.send_message = AsyncMock()
+
+    first_event = ProposedEvent(
+        summary="Deep Work Block",
+        start_time="2026-03-31T09:00:00-04:00",
+        end_time="2026-03-31T11:00:00-04:00",
+        description="Focus on strategy.",
+    )
+    second_event = ProposedEvent(
+        summary="Workout",
+        start_time="2026-03-31T18:00:00-04:00",
+        end_time="2026-03-31T19:00:00-04:00",
+        description="Strength training.",
+    )
+    mock_run_sunday_review.return_value = SundayReviewResponse(
+        message="Strong week overall.",
+        state_change_summary="Updated priorities for next week.",
+        weekly_state_content="# Weekly State",
+        proposed_events=[first_event, second_event],
+    )
+    mock_send_calendar_proposal.return_value = "cw_first"
+
+    await handle_start_trigger(update, context)
+
+    mock_consume_trigger.assert_called_once_with(context, "weekly_review")
+    assert context.user_data["weekly_review_event_queue"] == [second_event]
+    assert context.user_data["weekly_review_total_events"] == 2
+    assert context.user_data["weekly_review_processed_events"] == 0
+    assert context.user_data["weekly_review_current_write_id"] == "cw_first"
+    mock_send_calendar_proposal.assert_awaited_once_with(
+        context=context,
+        chat_id=456,
+        action=first_event,
+        prefix_text="📅 *Weekly Review Proposal 1 of 2*\nPlease confirm or reject this event before I move to the next one."
+    )
+
+@pytest.mark.asyncio
+@patch('bot.handlers.send_calendar_proposal', new_callable=AsyncMock)
+@patch('bot.handlers.confirm_write')
+@patch('bot.handlers.get_pending_write')
+@patch('bot.handlers.untrack_confirmation_message')
+async def test_handle_confirm_advances_weekly_review_queue(
+    mock_remove_ui,
+    mock_get_pending,
+    mock_confirm_write,
+    mock_send_calendar_proposal,
+):
+    update = MagicMock()
+    update.callback_query = MagicMock()
+    update.callback_query.data = "confirm_cw_123"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.text = "Original Proposal Text"
+    update.callback_query.message.chat_id = 456
+
+    next_event = ProposedEvent(
+        summary="Follow-up Block",
+        start_time="2026-03-31T13:00:00-04:00",
+        end_time="2026-03-31T14:00:00-04:00",
+        description="Continue planning.",
+    )
+    context = MagicMock()
+    context.user_data = {
+        "weekly_review_event_queue": [next_event],
+        "weekly_review_total_events": 2,
+        "weekly_review_processed_events": 0,
+        "weekly_review_current_write_id": "cw_123",
+    }
+    context.bot.send_message = AsyncMock()
+
+    mock_record = MagicMock()
+    mock_record.status = CalendarWriteStatus.PENDING
+    mock_get_pending.return_value = mock_record
+    mock_confirm_write.return_value = {"id": "evt_123", "summary": "Test Event"}
+    mock_send_calendar_proposal.return_value = "cw_456"
+
+    await handle_confirm(update, context)
+
+    assert context.user_data["weekly_review_processed_events"] == 1
+    assert context.user_data["weekly_review_current_write_id"] == "cw_456"
+    assert context.user_data["weekly_review_event_queue"] == []
+    context.bot.send_message.assert_awaited_once_with(
+        chat_id=456,
+        text="Confirmed weekly review proposal 1 of 2. Sending the next proposal now.",
+    )
+    mock_send_calendar_proposal.assert_awaited_once_with(
+        context=context,
+        chat_id=456,
+        action=next_event,
+        prefix_text="📅 *Weekly Review Proposal 2 of 2*\nPlease confirm or reject this event before I move to the next one."
+    )
+
+@pytest.mark.asyncio
+@patch('bot.handlers.reject_write')
+@patch('bot.handlers.get_pending_write')
+@patch('bot.handlers.untrack_confirmation_message')
+async def test_handle_reject_completes_weekly_review_queue(
+    mock_remove_ui,
+    mock_get_pending,
+    mock_reject_write,
+):
+    update = MagicMock()
+    update.callback_query = MagicMock()
+    update.callback_query.data = "reject_cw_456"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.text = "Original Proposal Text"
+    update.callback_query.message.chat_id = 456
+
+    context = MagicMock()
+    context.user_data = {
+        "weekly_review_event_queue": [],
+        "weekly_review_total_events": 1,
+        "weekly_review_processed_events": 0,
+        "weekly_review_current_write_id": "cw_456",
+    }
+    context.bot.send_message = AsyncMock()
+
+    mock_record = MagicMock()
+    mock_record.status = CalendarWriteStatus.PENDING
+    mock_get_pending.return_value = mock_record
+    mock_reject_write.return_value = True
+
+    await handle_reject(update, context)
+
+    context.bot.send_message.assert_awaited_once_with(
+        chat_id=456,
+        text="Rejected weekly review proposal 1 of 1. Weekly review calendar proposals are complete.",
+    )
+    assert "weekly_review_event_queue" not in context.user_data
+    assert "weekly_review_total_events" not in context.user_data
+    assert "weekly_review_processed_events" not in context.user_data
+    assert "weekly_review_current_write_id" not in context.user_data
 
 @pytest.mark.asyncio
 async def test_handle_delay_trigger():

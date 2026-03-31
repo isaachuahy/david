@@ -17,7 +17,21 @@ from persistence.models import CalendarWriteStatus, SessionStatus
 from reasoning.schemas import ProposedEvent
 from bot.keyboards import build_calendar_confirmation_keyboard, build_weekly_state_keyboard
 
-async def send_calendar_proposal(context: ContextTypes.DEFAULT_TYPE, chat_id: int, action, prefix_text: str = ""):
+WEEKLY_REVIEW_EVENT_QUEUE_KEY = "weekly_review_event_queue"
+WEEKLY_REVIEW_TOTAL_EVENTS_KEY = "weekly_review_total_events"
+WEEKLY_REVIEW_PROCESSED_EVENTS_KEY = "weekly_review_processed_events"
+WEEKLY_REVIEW_CURRENT_WRITE_ID_KEY = "weekly_review_current_write_id"
+
+
+def clear_weekly_review_event_queue(context: ContextTypes.DEFAULT_TYPE):
+    """Clears the in-memory weekly review event queue state."""
+    context.user_data.pop(WEEKLY_REVIEW_EVENT_QUEUE_KEY, None)
+    context.user_data.pop(WEEKLY_REVIEW_TOTAL_EVENTS_KEY, None)
+    context.user_data.pop(WEEKLY_REVIEW_PROCESSED_EVENTS_KEY, None)
+    context.user_data.pop(WEEKLY_REVIEW_CURRENT_WRITE_ID_KEY, None)
+
+
+async def send_calendar_proposal(context: ContextTypes.DEFAULT_TYPE, chat_id: int, action, prefix_text: str = "") -> str:
     """Helper to process a calendar action, queue it, and send the Telegram confirmation UI."""
     # Used both for ad-hoc calendar proposals from the LLM and for proposed events generated during the Sunday Review process.
     start_dt = parse_user_datetime(action.start_time)
@@ -36,6 +50,65 @@ async def send_calendar_proposal(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         parse_mode="Markdown"
     )
     track_confirmation_message(context, write_id, message.message_id)
+    return write_id
+
+
+async def send_next_weekly_review_event(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Sends the next queued weekly review proposal, if one remains."""
+    queue = context.user_data.get(WEEKLY_REVIEW_EVENT_QUEUE_KEY)
+    if not queue:
+        clear_weekly_review_event_queue(context)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Weekly review calendar proposals are complete.",
+        )
+        return
+
+    total = context.user_data.get(WEEKLY_REVIEW_TOTAL_EVENTS_KEY, len(queue))
+    processed = context.user_data.get(WEEKLY_REVIEW_PROCESSED_EVENTS_KEY, 0)
+    next_position = processed + 1
+    next_event = queue.pop(0)
+    write_id = await send_calendar_proposal(
+        context=context,
+        chat_id=chat_id,
+        action=next_event,
+        prefix_text=(
+            f"📅 *Weekly Review Proposal {next_position} of {total}*\n"
+            "Please confirm or reject this event before I move to the next one."
+        ),
+    )
+    context.user_data[WEEKLY_REVIEW_CURRENT_WRITE_ID_KEY] = write_id
+
+
+async def advance_weekly_review_event_queue(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    write_id: str,
+    outcome_text: str,
+):
+    """Advances the queued weekly review proposals after the current one is resolved."""
+    current_write_id = context.user_data.get(WEEKLY_REVIEW_CURRENT_WRITE_ID_KEY)
+    if current_write_id != write_id:
+        return
+
+    total = context.user_data.get(WEEKLY_REVIEW_TOTAL_EVENTS_KEY, 0)
+    processed = context.user_data.get(WEEKLY_REVIEW_PROCESSED_EVENTS_KEY, 0) + 1
+    context.user_data[WEEKLY_REVIEW_PROCESSED_EVENTS_KEY] = processed
+    remaining_queue = context.user_data.get(WEEKLY_REVIEW_EVENT_QUEUE_KEY, [])
+
+    if remaining_queue:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"{outcome_text} weekly review proposal {processed} of {total}. Sending the next proposal now.",
+        )
+        await send_next_weekly_review_event(context, chat_id)
+        return
+
+    clear_weekly_review_event_queue(context)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"{outcome_text} weekly review proposal {processed} of {total}. Weekly review calendar proposals are complete.",
+    )
 
 # Handlers for Telegram bot commands and messages.
 # These are the entry points for all user interactions, and they delegate to the Router and other orchestrator components to handle the logic and state management. 
@@ -100,6 +173,13 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"{query.message.text}\n\n❌ *Failed to schedule event.*"
         
     await query.edit_message_text(text=text, parse_mode="Markdown")
+    if created_event:
+        await advance_weekly_review_event_queue(
+            context=context,
+            chat_id=query.message.chat_id,
+            write_id=write_id,
+            outcome_text="Confirmed",
+        )
 
 async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles rejection of a proposed calendar write."""
@@ -117,6 +197,13 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success = reject_write(write_id)
     text = f"{query.message.text}\n\n🚫 *Event Rejected.*" if success else f"{query.message.text}\n\n❌ *Failed to reject event.*"
     await query.edit_message_text(text=text, parse_mode="Markdown")
+    if success:
+        await advance_weekly_review_event_queue(
+            context=context,
+            chat_id=query.message.chat_id,
+            write_id=write_id,
+            outcome_text="Rejected",
+        )
 
 async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles starting a scheduled trigger."""
@@ -152,12 +239,16 @@ async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
                 parse_mode="Markdown"
             )
             
-            # Propose calendar events individually
-            for event in review.proposed_events:
-                await send_calendar_proposal(
-                    context,
-                    update.effective_chat.id,
-                    event
+            clear_weekly_review_event_queue(context)
+            if review.proposed_events:
+                context.user_data[WEEKLY_REVIEW_EVENT_QUEUE_KEY] = list(review.proposed_events)
+                context.user_data[WEEKLY_REVIEW_TOTAL_EVENTS_KEY] = len(review.proposed_events)
+                context.user_data[WEEKLY_REVIEW_PROCESSED_EVENTS_KEY] = 0
+                await send_next_weekly_review_event(context, update.effective_chat.id)
+            else:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="No calendar events were proposed in this weekly review.",
                 )
         except Exception as e:
             logger.error(f"Error during Sunday Review: {e}")
