@@ -114,6 +114,29 @@ def start_session(context: ContextTypes.DEFAULT_TYPE) -> str:
     logger.info(f"Started new session: {session_id}")
     return session_id
 
+def reconcile_orphaned_sessions() -> int:
+    """
+    Marks any sessions left in ACTIVE state as INTERRUPTED.
+    This is used at startup to recover from VPS or process restarts.
+    """
+    db = get_db()
+    orphaned_sessions = list(db["sessions"].rows_where("status = ?", [SessionStatus.ACTIVE.value]))  # type: ignore
+    if not orphaned_sessions:
+        logger.info("No orphaned ACTIVE sessions found during startup reconciliation.")
+        return 0
+
+    interrupted_at = datetime.now(timezone.utc).isoformat()
+    for session in orphaned_sessions:
+        session_id = session["id"]
+        db["sessions"].update(session_id, {  # type: ignore
+            "status": SessionStatus.INTERRUPTED.value,
+            "end_time": interrupted_at,
+        })
+        logger.warning(f"Marked orphaned session {session_id} as INTERRUPTED during startup reconciliation.")
+
+    logger.info(f"Reconciled {len(orphaned_sessions)} orphaned ACTIVE session(s).")
+    return len(orphaned_sessions)
+
 def append_to_decision_log(content: str):
     """Appends synthesized session notes to the decision log."""
     with open(DECISION_LOG_PATH, "a", encoding="utf-8") as f:

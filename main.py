@@ -4,6 +4,8 @@ from loguru import logger
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 
 from orchestrator.trigger_scheduler import setup_scheduler
+from orchestrator.session_manager import reconcile_orphaned_sessions
+from persistence.database import init_db
 from bot.handlers import (
     start, done_command, test_trigger, test_schedule,
     handle_confirm, handle_reject, handle_start_trigger,
@@ -29,6 +31,8 @@ def main():
         return
 
     logger.info("Initializing David's Telegram interface...")
+    init_db()
+    reconcile_orphaned_sessions()
     app = ApplicationBuilder().token(token).build()
 
     # Restrict the bot to only respond to a specific user for security reasons

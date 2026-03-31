@@ -8,6 +8,7 @@ from orchestrator.session_manager import (
     reset_session_timeout,
     execute_synthesis_task,
     end_session,
+    reconcile_orphaned_sessions,
 )
 from persistence.models import SessionStatus
 
@@ -27,6 +28,31 @@ def test_reset_session_timeout_replaces_existing_job():
         chat_id=456,
         user_id=123,
     )
+
+@patch("orchestrator.session_manager.get_db")
+def test_reconcile_orphaned_sessions_marks_active_rows_interrupted(mock_get_db):
+    mock_get_db.return_value["sessions"].rows_where.return_value = [
+        {"id": "sess_one"},
+        {"id": "sess_two"},
+    ]
+
+    reconciled = reconcile_orphaned_sessions()
+
+    assert reconciled == 2
+    assert mock_get_db.return_value["sessions"].update.call_count == 2
+    first_call = mock_get_db.return_value["sessions"].update.call_args_list[0]
+    assert first_call.args[0] == "sess_one"
+    assert first_call.args[1]["status"] == SessionStatus.INTERRUPTED.value
+    assert first_call.args[1]["end_time"]
+
+@patch("orchestrator.session_manager.get_db")
+def test_reconcile_orphaned_sessions_noops_when_none_active(mock_get_db):
+    mock_get_db.return_value["sessions"].rows_where.return_value = []
+
+    reconciled = reconcile_orphaned_sessions()
+
+    assert reconciled == 0
+    mock_get_db.return_value["sessions"].update.assert_not_called()
 
 @pytest.mark.asyncio
 @patch('orchestrator.session_manager.end_session', new_callable=AsyncMock)
