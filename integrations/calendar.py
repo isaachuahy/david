@@ -4,6 +4,7 @@ from googleapiclient.errors import HttpError
 from loguru import logger
 
 from integrations.auth import get_calendar_credentials
+from orchestrator.time_utils import USER_TIMEZONE
 
 # Note that datetimes that get passed to the API must be in UTC ISO format, not naive datetime objects.
 
@@ -104,16 +105,21 @@ def insert_event(summary: str, start_time: datetime, end_time: datetime, descrip
     if start_time.tzinfo is None or end_time.tzinfo is None:
         raise ValueError("start_time and end_time must be timezone-aware datetime objects.")
 
+    start_local = start_time.astimezone(USER_TIMEZONE)
+    end_local = end_time.astimezone(USER_TIMEZONE)
+
     service = get_calendar_service()
     try:
         event_body = {
             'summary': summary,
             'description': description,
             'start': {
-                'dateTime': start_time.isoformat(),
+                'dateTime': start_local.isoformat(),
+                'timeZone': 'America/Toronto',
             },
             'end': {
-                'dateTime': end_time.isoformat(),
+                'dateTime': end_local.isoformat(),
+                'timeZone': 'America/Toronto',
             },
         }
         logger.info(f"Inserting event: '{summary}'...")

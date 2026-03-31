@@ -12,7 +12,7 @@ from orchestrator.session_manager import (
     untrack_confirmation_message, clear_tracked_confirmation_messages
 )
 from orchestrator.review_manager import run_sunday_review, execute_weekly_state_update
-from orchestrator.time_utils import parse_iso
+from orchestrator.time_utils import USER_TIMEZONE, parse_iso, parse_user_datetime, format_user_datetime
 from persistence.models import CalendarWriteStatus, SessionStatus
 from reasoning.schemas import ProposedEvent
 from bot.keyboards import build_calendar_confirmation_keyboard, build_weekly_state_keyboard
@@ -20,14 +20,14 @@ from bot.keyboards import build_calendar_confirmation_keyboard, build_weekly_sta
 async def send_calendar_proposal(context: ContextTypes.DEFAULT_TYPE, chat_id: int, action, prefix_text: str = ""):
     """Helper to process a calendar action, queue it, and send the Telegram confirmation UI."""
     # Used both for ad-hoc calendar proposals from the LLM and for proposed events generated during the Sunday Review process.
-    start_dt = parse_iso(action.start_time)
-    end_dt = parse_iso(action.end_time)
+    start_dt = parse_user_datetime(action.start_time)
+    end_dt = parse_user_datetime(action.end_time)
     
     write_id = add_pending_write(action.summary, start_dt, end_dt, action.description)
     reply_markup = build_calendar_confirmation_keyboard(write_id)
     
     full_text = f"{prefix_text}\n\n" if prefix_text else ""
-    full_text += f"🗓️ *Proposed Event:*\n*{action.summary}*\n_{action.description}_\n\nStart: {start_dt.strftime('%Y-%m-%d %H:%M UTC')}\nEnd: {end_dt.strftime('%Y-%m-%d %H:%M UTC')}"
+    full_text += f"🗓️ *Proposed Event:*\n*{action.summary}*\n_{action.description}_\n\nStart: {format_user_datetime(start_dt)}\nEnd: {format_user_datetime(end_dt)}"
     
     message = await context.bot.send_message(
         chat_id=chat_id,
@@ -54,15 +54,15 @@ async def test_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def test_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Temporary command to test the confirmation UI."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(USER_TIMEZONE)
     end = now + timedelta(minutes=15)
     await send_calendar_proposal(
         context=context,
         chat_id=update.effective_chat.id,
         action=ProposedEvent(
             summary="David UI Test Event",
-            start_time=now.isoformat().replace("+00:00", "Z"),
-            end_time=end.isoformat().replace("+00:00", "Z"),
+            start_time=now.isoformat(),
+            end_time=end.isoformat(),
             description="Testing the Telegram inline buttons."
         ),
         prefix_text="I propose scheduling 'David UI Test Event' for the next 15 minutes. Does this look good?"

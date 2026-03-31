@@ -10,6 +10,7 @@ from bot.handlers import (
     handle_delay_trigger,
     handle_confirm_weekly_state,
     handle_reject_weekly_state,
+    send_calendar_proposal,
     test_schedule as handler_test_schedule,
 )
 from orchestrator.session_manager import (
@@ -18,6 +19,7 @@ from orchestrator.session_manager import (
     timeout_inactive_session
 )
 from reasoning.flash_client import FlashResponse
+from reasoning.schemas import ProposedEvent
 from persistence.models import CalendarWriteStatus
 
 @pytest.mark.asyncio
@@ -213,6 +215,41 @@ async def test_test_schedule_uses_calendar_proposal_helper(mock_send_calendar_pr
     assert kwargs["action"].summary == "David UI Test Event"
     assert kwargs["action"].description == "Testing the Telegram inline buttons."
     assert kwargs["prefix_text"] == "I propose scheduling 'David UI Test Event' for the next 15 minutes. Does this look good?"
+
+@pytest.mark.asyncio
+@patch('bot.handlers.track_confirmation_message')
+@patch('bot.handlers.build_calendar_confirmation_keyboard')
+@patch('bot.handlers.add_pending_write')
+async def test_send_calendar_proposal_displays_toronto_time(
+    mock_add_pending_write,
+    mock_build_keyboard,
+    mock_track_confirmation_message,
+):
+    mock_add_pending_write.return_value = "cw_123"
+    mock_build_keyboard.return_value = "keyboard"
+
+    context = MagicMock()
+    context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=999))
+
+    await send_calendar_proposal(
+        context=context,
+        chat_id=456,
+        action=ProposedEvent(
+            summary="Coffee Chat",
+            start_time="2026-03-31T09:00:00-04:00",
+            end_time="2026-03-31T09:30:00-04:00",
+            description="Catch-up downtown."
+        ),
+        prefix_text="Want me to schedule this?"
+    )
+
+    context.bot.send_message.assert_awaited_once()
+    kwargs = context.bot.send_message.await_args.kwargs
+    assert kwargs["chat_id"] == 456
+    assert "Start: 2026-03-31 09:00 EDT" in kwargs["text"]
+    assert "End: 2026-03-31 09:30 EDT" in kwargs["text"]
+    assert "UTC" not in kwargs["text"]
+    mock_track_confirmation_message.assert_called_once_with(context, "cw_123", 999)
 
 @pytest.mark.asyncio
 async def test_handle_reject_weekly_state():
