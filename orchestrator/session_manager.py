@@ -13,6 +13,7 @@ from reasoning.flash_client import generate_session_synthesis
 
 SESSION_INACTIVITY_TIMEOUT = timedelta(minutes=30)
 SESSION_TIMEOUT_JOB_PREFIX = "session_inactivity_timeout"
+SESSION_READY_MESSAGE = "Session synthesis is done. I'm ready for your next message."
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONTEXT_DIR = os.path.join(BASE_DIR, "context")
@@ -230,9 +231,20 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
         user_data.pop('cached_events', None)
         user_data['session_state'] = SessionStatus.IDLE
         user_data['current_session_id'] = None
-        
-        # Evaluate the trigger queue
-        await prompt_next_trigger(context, chat_id)
+
+        try:
+            await prompt_next_trigger(context, chat_id)
+        except Exception as e:
+            logger.error(f"Failed to evaluate the trigger queue after session {session_id}: {e}")
+
+        logger.info(f"Session {session_id} synthesis finalization complete. Ready for new messages.")
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=SESSION_READY_MESSAGE,
+            )
+        except Exception as e:
+            logger.error(f"Failed to send ready-for-next-message prompt for session {session_id}: {e}")
 
 async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: str = "done", user_id: Optional[int] = None):
     """Ends the active session, clears short-term memory, and checks for pending triggers."""

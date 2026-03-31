@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from orchestrator.session_manager import (
     SESSION_INACTIVITY_TIMEOUT,
+    SESSION_READY_MESSAGE,
     get_session_timeout_job_name,
     timeout_inactive_session,
     reset_session_timeout,
@@ -117,7 +118,10 @@ async def test_execute_synthesis_task_appends_and_finalizes_state(
     assert context.user_data["session_state"] == SessionStatus.IDLE
     assert context.user_data["current_session_id"] is None
     mock_prompt_next_trigger.assert_awaited_once_with(context, 456)
-    context.bot.send_message.assert_not_awaited()
+    context.bot.send_message.assert_awaited_once_with(
+        chat_id=456,
+        text=SESSION_READY_MESSAGE,
+    )
 
 @pytest.mark.asyncio
 @patch('orchestrator.session_manager.prompt_next_trigger', new_callable=AsyncMock)
@@ -155,10 +159,17 @@ async def test_execute_synthesis_task_notifies_on_failure_and_finalizes_state(
         "sess_456",
         {"status": SessionStatus.COMPLETED.value},
     )
-    context.bot.send_message.assert_awaited_once_with(
-        chat_id=789,
-        text="⚠️ I closed the session, but failed to update the decision log. Please check the logs."
-    )
+    assert context.bot.send_message.await_count == 2
+    first_call = context.bot.send_message.await_args_list[0]
+    second_call = context.bot.send_message.await_args_list[1]
+    assert first_call.kwargs == {
+        "chat_id": 789,
+        "text": "⚠️ I closed the session, but failed to update the decision log. Please check the logs."
+    }
+    assert second_call.kwargs == {
+        "chat_id": 789,
+        "text": SESSION_READY_MESSAGE,
+    }
     assert context.user_data["chat_history"] == []
     assert "cached_events" not in context.user_data
     assert context.user_data["session_state"] == SessionStatus.IDLE
