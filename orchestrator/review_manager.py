@@ -1,10 +1,12 @@
 import os
+import uuid
 from datetime import datetime
 from loguru import logger
 from telegram.ext import ContextTypes
 
 from orchestrator.context_builder import build_context
 from integrations.calendar import get_past_events
+from persistence.database import get_db
 from reasoning.pro_client import generate_sunday_review, SundayReviewResponse
 
 def run_sunday_review(tg_context: ContextTypes.DEFAULT_TYPE = None) -> SundayReviewResponse:
@@ -51,6 +53,16 @@ def execute_weekly_state_update(content: str) -> bool:
                 
         with open(weekly_state_path, "w", encoding="utf-8") as f:
             f.write(content)
+
+        snapshot_id = f"wsnap_{uuid.uuid4().hex[:8]}"
+        logger.info(f"Persisting weekly snapshot {snapshot_id}...")
+        db = get_db()
+        db["weekly_snapshots"].insert({  # type: ignore
+            "id": snapshot_id,
+            "timestamp": datetime.now().isoformat(),
+            "weekly_state_content": content,
+        })
+        logger.success(f"Persisted weekly snapshot {snapshot_id}.")
         
         logger.success("Successfully updated weekly_state.md")
         return True

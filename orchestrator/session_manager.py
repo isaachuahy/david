@@ -119,6 +119,23 @@ def append_to_decision_log(content: str):
     with open(DECISION_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(f"\n\n{content.strip()}\n")
 
+def persist_decision(session_id: str, content: str):
+    """Persists a synthesized session decision block to SQLite."""
+    decision_id = f"dec_{uuid.uuid4().hex[:8]}"
+    logger.info(f"Persisting decision {decision_id} for session {session_id}...")
+    try:
+        db = get_db()
+        db["decisions"].insert({  # type: ignore
+            "id": decision_id,
+            "session_id": session_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "content": content,
+        })
+        logger.success(f"Persisted decision {decision_id} for session {session_id}.")
+    except Exception as e:
+        logger.error(f"Failed to persist decision for session {session_id}: {e}")
+        raise
+
 async def cancel_pending_writes(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """Rejects any pending calendar confirmations when a session closes."""
     for write_id, message_id in get_tracked_confirmation_messages(context):
@@ -149,6 +166,8 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
     try:
         if chat_history:
             synthesis = generate_session_synthesis(chat_history, session_date=session_date)
+            if session_id:
+                persist_decision(session_id, synthesis.content)
             append_to_decision_log(synthesis.content)
             logger.success(f"Appended session synthesis to decision log for session {session_id}.")
         else:

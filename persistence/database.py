@@ -40,9 +40,25 @@ def init_db():
             "end_time": str
         }, pk="id")
         logger.info("Created table: sessions")
-        
-    # Tables for decisions and weekly_snapshots can be scaffolded similarly here in the future
-    # as we build out the weekly review and brainstorming features.
+
+    # 3. Decisions
+    if "decisions" not in db.table_names():
+        db["decisions"].create({
+            "id": str,
+            "session_id": str,
+            "timestamp": str,
+            "content": str,
+        }, pk="id")
+        logger.info("Created table: decisions")
+
+    # 4. Weekly Snapshots
+    if "weekly_snapshots" not in db.table_names():
+        db["weekly_snapshots"].create({
+            "id": str,
+            "timestamp": str,
+            "weekly_state_content": str,
+        }, pk="id")
+        logger.info("Created table: weekly_snapshots")
 
     logger.info("Database initialization complete.")
 

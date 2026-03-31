@@ -27,3 +27,16 @@ class SessionRecord(BaseModel):
     status: SessionStatus
     start_time: str
     end_time: Optional[str] = None
+
+
+class DecisionRecord(BaseModel):
+    id: str
+    session_id: str
+    timestamp: str
+    content: str
+
+
+class WeeklySnapshotRecord(BaseModel):
+    id: str
+    timestamp: str
+    weekly_state_content: str

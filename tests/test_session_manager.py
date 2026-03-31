@@ -41,11 +41,13 @@ async def test_timeout_inactive_session_closes_active_session(mock_end_session):
 
 @pytest.mark.asyncio
 @patch('orchestrator.session_manager.prompt_next_trigger', new_callable=AsyncMock)
+@patch('orchestrator.session_manager.persist_decision')
 @patch('orchestrator.session_manager.append_to_decision_log')
 @patch('orchestrator.session_manager.generate_session_synthesis')
 async def test_execute_synthesis_task_appends_and_finalizes_state(
     mock_generate_session_synthesis,
     mock_append_to_decision_log,
+    mock_persist_decision,
     mock_prompt_next_trigger,
 ):
     context = MagicMock()
@@ -71,6 +73,7 @@ async def test_execute_synthesis_task_appends_and_finalizes_state(
     kwargs = mock_generate_session_synthesis.call_args.kwargs
     assert args[0] == [{"role": "user", "content": "We decided to focus on sales."}]
     assert kwargs["session_date"]
+    mock_persist_decision.assert_called_once_with("sess_123", "### Session - 2026-03-30\n- Focused on sales.")
     mock_append_to_decision_log.assert_called_once_with("### Session - 2026-03-30\n- Focused on sales.")
     assert context.user_data["chat_history"] == []
     assert "cached_events" not in context.user_data
@@ -81,11 +84,13 @@ async def test_execute_synthesis_task_appends_and_finalizes_state(
 
 @pytest.mark.asyncio
 @patch('orchestrator.session_manager.prompt_next_trigger', new_callable=AsyncMock)
+@patch('orchestrator.session_manager.persist_decision')
 @patch('orchestrator.session_manager.append_to_decision_log')
 @patch('orchestrator.session_manager.generate_session_synthesis', side_effect=Exception("boom"))
 async def test_execute_synthesis_task_notifies_on_failure_and_finalizes_state(
     mock_generate_session_synthesis,
     mock_append_to_decision_log,
+    mock_persist_decision,
     mock_prompt_next_trigger,
 ):
     context = MagicMock()
@@ -105,6 +110,7 @@ async def test_execute_synthesis_task_notifies_on_failure_and_finalizes_state(
     await execute_synthesis_task(context)
 
     mock_generate_session_synthesis.assert_called_once()
+    mock_persist_decision.assert_not_called()
     mock_append_to_decision_log.assert_not_called()
     context.bot.send_message.assert_awaited_once_with(
         chat_id=789,
