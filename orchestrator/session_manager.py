@@ -1,3 +1,4 @@
+import asyncio
 import os
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -197,7 +198,11 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Running background synthesis for session {session_id}...")
     try:
         if chat_history:
-            synthesis = generate_session_synthesis(chat_history, session_date=session_date)
+            synthesis = await asyncio.to_thread(
+                generate_session_synthesis,
+                chat_history,
+                session_date=session_date,
+            )
             if session_id:
                 persist_decision(session_id, synthesis.content)
             append_to_decision_log(synthesis.content)

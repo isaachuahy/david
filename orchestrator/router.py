@@ -1,3 +1,4 @@
+import asyncio
 from enum import Enum
 from loguru import logger
 from telegram.ext import ContextTypes
@@ -39,7 +40,7 @@ def classify_intent(text: str) -> MessageIntent:
 async def process_message(text: str, context: ContextTypes.DEFAULT_TYPE) -> FlashResponse:
     """Processes an incoming text message, handles model routing, and updates history."""
     try:
-        context_block = build_context(context)
+        context_block = await asyncio.to_thread(build_context, context)
         chat_history = get_chat_history(context)
         
         # Classify intent and determine thinking level
@@ -47,11 +48,12 @@ async def process_message(text: str, context: ContextTypes.DEFAULT_TYPE) -> Flas
         thinking_level = THINKING_LEVELS.get(intent)
         logger.info(f"Classified intent as {intent.value} with level: {thinking_level}")
         
-        flash_response = generate_flash_response(
-            user_message=text, 
-            context_block=context_block, 
+        flash_response = await asyncio.to_thread(
+            generate_flash_response,
+            user_message=text,
+            context_block=context_block,
             chat_history=chat_history,
-            thinking_level=thinking_level
+            thinking_level=thinking_level,
         )
             
         append_chat_history(context, "user", text)

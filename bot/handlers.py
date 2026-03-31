@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone, timedelta
 from loguru import logger
 from telegram import Update
@@ -154,7 +155,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text="❌ *This request is no longer valid or has already been processed.*", parse_mode="Markdown")
         return
 
-    created_event = confirm_write(write_id)
+    created_event = await asyncio.to_thread(confirm_write, write_id)
     if created_event:
         text = f"{query.message.text}\n\n✅ *Event Confirmed and Scheduled.*"
         # Immediately update the local cache so the LLM knows about this new event
@@ -219,7 +220,7 @@ async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
     elif trigger_type == "weekly_review":
         await query.edit_message_text("📅 *Starting Sunday Review. Analysing your week...*", parse_mode="Markdown")
         try:
-            review = run_sunday_review(context)
+            review = await asyncio.to_thread(run_sunday_review, context)
             
             # Send the synthesis message
             await context.bot.send_message(
