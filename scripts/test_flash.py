@@ -30,14 +30,13 @@ def main():
         response = generate_flash_response(user_message=test_message, context_block=dummy_context, chat_history=dummy_history)
         print("\n--- Response Received ---")
         print(f"Message: {response.message}")
-        print(f"Should Escalate: {response.should_escalate}")
-        print(f"Escalation Reason: {response.escalation_reason}")
+        print(f"Proposed Calendar Action: {response.proposed_calendar_action}")
         print("-------------------------")
         
-        if response.should_escalate:
-            print("\nSuccess! The model correctly identified a scheduling request and triggered the escalation flag.")
+        if response.proposed_calendar_action:
+            print("\nSuccess! The model returned a structured calendar proposal.")
         else:
-            print("\nWarning: The model failed to trigger the escalation flag for a scheduling request.")
+            print("\nWarning: The model did not return a structured calendar proposal for this scheduling request.")
             
     except Exception as e:
         print(f"\nAn error occurred: {e}")

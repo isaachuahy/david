@@ -203,6 +203,10 @@ token.json
 data/*.db
 data/*.db-journal
 
+# David Context Files
+context/*.md
+!context/*.example.md
+
 .DS_Store
 google_genai_reference.md
 Next Steps.md

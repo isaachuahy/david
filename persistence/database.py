@@ -41,17 +41,6 @@ def init_db():
         }, pk="id")
         logger.info("Created table: sessions")
         
-    # 3. Escalations
-    if "escalations" not in db.table_names():
-        db["escalations"].create({
-            "id": str,
-            "timestamp": str,
-            "flash_message": str,
-            "escalation_reason": str,
-            "status": str
-        }, pk="id")
-        logger.info("Created table: escalations")
-
     # Tables for decisions and weekly_snapshots can be scaffolded similarly here in the future
     # as we build out the weekly review and brainstorming features.
 

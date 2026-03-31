@@ -110,7 +110,7 @@ Observability uses three tools: Langfuse (cloud free tier) for per-call LLM trac
 | Dependency management | `uv` |
 | Telegram interface | `python-telegram-bot` |
 | LLM — daily/ad hoc | Gemini Flash (`google-genai`) |
-| LLM — weekly/escalated | Gemini Pro |
+| LLM — weekly review | Gemini Pro |
 | Calendar | `google-api-python-client` + `google-auth-oauthlib` |
 | Scheduler | `APScheduler` 3.x |
 | Database | SQLite + `sqlite-utils` |
@@ -135,14 +135,14 @@ Observability uses three tools: Langfuse (cloud free tier) for per-call LLM trac
 
 ## Alternatives Considered and Rejected
 
-**LangChain / LangGraph as the orchestration framework.** Both were considered and rejected. LangChain adds abstraction over APIs that are already mature and easy to use directly; the abstraction makes debugging harder without meaningful benefit at this scale. LangGraph is well-suited for complex agent graphs with parallel branches and many nodes — the orchestration here is sequential with a single escalation path, which is better served by 400 lines of clean Python than by a graph framework.
+**LangChain / LangGraph as the orchestration framework.** Both were considered and rejected. LangChain adds abstraction over APIs that are already mature and easy to use directly; the abstraction makes debugging harder without meaningful benefit at this scale. LangGraph is well-suited for complex agent graphs with parallel branches and many nodes — the orchestration here is sequential and is better served by 400 lines of clean Python than by a graph framework.
 
-**Two-tier model escalation (Flash drafting for Pro).** Initially considered as a way to reserve reasoning costs. Rejected because dynamically adjusting the "thinking budget" on a single model (Flash) is architecturally simpler, faster, and achieves the same reasoning depth without maintaining an `EscalationHandler`, `escalations` database table, or complex inter-model state handoffs.
+**Two-tier model escalation (Flash drafting for Pro).** Initially considered as a way to reserve reasoning costs. Rejected because dynamically adjusting the "thinking budget" on a single model (Flash) is architecturally simpler, faster, and achieves the same reasoning depth without maintaining an `EscalationHandler`, an `escalations` database table, or complex inter-model state handoffs.
 
-**`[[ESCALATE: reason]]` string signal for escalation routing.** Initially considered as a simple mechanism for Flash to signal the need for escalation. Rejected because Flash is a probabilistic system — it will sometimes emit partial matches, capitalisation variations, or omit the signal under certain generation conditions. String matching on free-text output is a fragile interface for a routing decision that affects cost, latency, and response quality. The current approach uses a Pydantic response schema enforced at the API level via `google-genai`'s `response_schema` parameter, making `should_escalate` a typed boolean field the orchestrator reads directly.
+**`[[ESCALATE: reason]]` string signal for escalation routing.** Initially considered as a simple mechanism for Flash to signal the need for escalation. Rejected because Flash is a probabilistic system — it will sometimes emit partial matches, capitalisation variations, or omit the signal under certain generation conditions. String matching on free-text output is a fragile interface for a routing decision that affects cost, latency, and response quality. The current approach avoids escalation routing entirely: Flash handles daily interactions directly and returns a typed `FlashResponse` via the `response_schema` parameter.
 **Three-layer router architecture (daily layer → strategy layer → logic layer).** Considered at the suggestion of common agentic design patterns. Rejected because the complexity — additional latency, a separate routing model, more prompt engineering surface area — is not justified for a single-user, low-volume system. Heuristic classification of thinking budgets in a single router achieves the same functional outcome with far less to debug.
 
-**Sending only Flash's summary to Pro during escalation.** Considered as a way to reduce token cost on Pro calls. Rejected because Pro's job during escalation is to reason about a real tradeoff involving goals, calendar commitments, and decision history — exactly the context Flash had. Stripping that context and asking Pro to judge from a summary alone would make Pro's reasoning less grounded than Flash's, which inverts the purpose of the escalation. Token cost on rare escalation calls is negligible given the 1M context window.
+**Sending only Flash's summary to Pro during a handoff.** Considered as a way to reduce token cost on the Sunday review path. Rejected because Pro's job there is to reason about the full weekly picture involving goals, calendar commitments, and decision history. Stripping that context and asking Pro to judge from a summary alone would make Pro's reasoning less grounded than Flash's daily context. Token cost on the weekly review call is negligible given the 1M context window.
 
 **Claude Sonnet 4.6 as the reasoning model.** Strong instruction-following and structured output reliability. Rejected primarily on cost ($3/$15 per 1M tokens vs. $2/$12 for Gemini Pro) and context window (200k vs. 1M). The 1M context window eliminates an entire class of engineering problems — no need to trim the context document as the decision log grows.
 

@@ -5,10 +5,10 @@
 ## Current Week (Draft)
 
 ### Top Priorities
-- [ ] Complete MVP for David.
+- [ ] Example priority
 
 ### Carryover from Last Week
-- [ ] None.
+- [ ] Example carryover item
 
 ### Known Constraints
-- None currently.
+- Example constraint

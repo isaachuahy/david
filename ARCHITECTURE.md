@@ -118,7 +118,7 @@ Every calendar write passes through `ConfirmationQueue` — there is no path fro
 
 Flash always returns a typed `FlashResponse` object. The `MessageRouter` assigns a thinking budget based on intent classification (`OPERATIONAL`, `BRAINSTORM`, `GOAL_REVIEW`) via keyword heuristics. Because an operational query can seamlessly evolve into a brainstorm, chat history is maintained and injected into the context for all modes. This simplifies the architecture by keeping all ad hoc reasoning on a single model while scaling compute dynamically.
 
-Session synthesis always goes to Pro regardless of whether the session was escalated mid-way.
+Session synthesis goes to Flash with a high thinking budget. Pro is reserved for the Sunday weekly review.
 
 ---
 
