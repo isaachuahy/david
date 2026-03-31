@@ -1,7 +1,7 @@
 import os
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from loguru import logger
 from telegram.ext import ContextTypes
 
@@ -75,13 +75,14 @@ def cancel_session_timeout(context: ContextTypes.DEFAULT_TYPE, user_id: int):
 async def timeout_inactive_session(context: ContextTypes.DEFAULT_TYPE):
     """Closes the active session after 30 minutes without a new message."""
     chat_id = context.job.data["chat_id"]
+    user_id = context.job.user_id
 
     if not is_session_active(context):
         logger.info(f"Inactivity timeout fired for chat {chat_id}, but no active session remained.")
         return
 
     logger.info(f"Session timed out after 30 minutes of inactivity for chat {chat_id}.")
-    await end_session(context, chat_id, reason="timeout")
+    await end_session(context, chat_id, reason="timeout", user_id=user_id)
 
 def reset_session_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
     """Restarts the inactivity timeout countdown for the active session."""
@@ -217,7 +218,7 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
         # Evaluate the trigger queue
         await prompt_next_trigger(context, chat_id)
 
-async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: str = "done"):
+async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: str = "done", user_id: Optional[int] = None):
     """Ends the active session, clears short-term memory, and checks for pending triggers."""
     user_data = _user_data(context)
     session_id = user_data.get('current_session_id')
@@ -243,10 +244,19 @@ async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: 
         logger.error(f"Failed to send session close message: {e}")
 
     await cancel_pending_writes(context, chat_id)
-        
-    # Schedule the synthesis task to run immediately without blocking the UI
-    context.job_queue.run_once(
-        execute_synthesis_task,
-        0,
-        data={"chat_id": chat_id, "session_id": session_id, "chat_history": chat_history_snapshot}
-    )
+
+    # Schedule the synthesis task to run immediately without blocking the UI.
+    # Passing user_id ensures PTB binds the same user_data into the job callback
+    # so the finalizer can clear the real session state instead of a detached context.
+    job_kwargs = {
+        "data": {
+            "chat_id": chat_id,
+            "session_id": session_id,
+            "chat_history": chat_history_snapshot,
+        },
+        "chat_id": chat_id,
+    }
+    if user_id is not None:
+        job_kwargs["user_id"] = user_id
+
+    context.job_queue.run_once(execute_synthesis_task, 0, **job_kwargs)

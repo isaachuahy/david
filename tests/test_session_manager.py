@@ -60,10 +60,11 @@ async def test_timeout_inactive_session_closes_active_session(mock_end_session):
     context = MagicMock()
     context.user_data = {"session_state": SessionStatus.ACTIVE}
     context.job.data = {"chat_id": 456}
+    context.job.user_id = 123
 
     await timeout_inactive_session(context)
 
-    mock_end_session.assert_awaited_once_with(context, 456, reason="timeout")
+    mock_end_session.assert_awaited_once_with(context, 456, reason="timeout", user_id=123)
 
 @pytest.mark.asyncio
 @patch('orchestrator.session_manager.prompt_next_trigger', new_callable=AsyncMock)
@@ -163,7 +164,7 @@ async def test_end_session_schedules_synthesis_with_chat_history_snapshot(
     }
     context.bot.send_message = AsyncMock()
 
-    await end_session(context, chat_id=456, reason="done")
+    await end_session(context, chat_id=456, reason="done", user_id=123)
 
     mock_get_db.return_value["sessions"].update.assert_called_once()
     context.bot.send_message.assert_awaited_once_with(
@@ -179,6 +180,8 @@ async def test_end_session_schedules_synthesis_with_chat_history_snapshot(
             "session_id": "sess_abc123",
             "chat_history": [{"role": "user", "content": "Need to prioritize hiring."}],
         },
+        chat_id=456,
+        user_id=123,
     )
     assert context.user_data["session_state"] == SessionStatus.CLOSING
 

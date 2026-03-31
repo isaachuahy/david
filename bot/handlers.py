@@ -209,7 +209,11 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Closes the active session and checks for pending triggers."""
     if is_session_active(context):
         cancel_session_timeout(context, update.effective_user.id)
-        await end_session(context, update.effective_chat.id)
+        await end_session(
+            context,
+            update.effective_chat.id,
+            user_id=update.effective_user.id,
+        )
     else:
         await update.message.reply_text("There is no active session to close.")
 

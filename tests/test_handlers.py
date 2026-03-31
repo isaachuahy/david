@@ -73,7 +73,7 @@ async def test_done_command_cancels_session_timeout_before_closing(mock_end_sess
     await done_command(update, context)
 
     existing_job.schedule_removal.assert_called_once()
-    mock_end_session.assert_awaited_once_with(context, 456)
+    mock_end_session.assert_awaited_once_with(context, 456, user_id=123)
 
 @pytest.mark.asyncio
 @patch('bot.handlers.confirm_write')
