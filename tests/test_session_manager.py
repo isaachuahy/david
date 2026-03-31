@@ -50,6 +50,7 @@ async def test_execute_synthesis_task_appends_and_finalizes_state(
     context = MagicMock()
     context.user_data = {
         "chat_history": [{"role": "user", "content": "We decided to focus on sales."}],
+        "cached_events": [{"summary": "Stale cached event"}],
         "session_state": SessionStatus.CLOSING,
         "current_session_id": "sess_123",
     }
@@ -67,6 +68,7 @@ async def test_execute_synthesis_task_appends_and_finalizes_state(
     assert kwargs["session_date"]
     mock_append_to_decision_log.assert_called_once_with("### Session - 2026-03-30\n- Focused on sales.")
     assert context.user_data["chat_history"] == []
+    assert "cached_events" not in context.user_data
     assert context.user_data["session_state"] == SessionStatus.IDLE
     assert context.user_data["current_session_id"] is None
     mock_prompt_next_trigger.assert_awaited_once_with(context, 456)
@@ -84,6 +86,7 @@ async def test_execute_synthesis_task_notifies_on_failure_and_finalizes_state(
     context = MagicMock()
     context.user_data = {
         "chat_history": [{"role": "user", "content": "Important decision"}],
+        "cached_events": [{"summary": "Stale cached event"}],
         "session_state": SessionStatus.CLOSING,
         "current_session_id": "sess_456",
     }
@@ -99,6 +102,7 @@ async def test_execute_synthesis_task_notifies_on_failure_and_finalizes_state(
         text="⚠️ I closed the session, but failed to update the decision log. Please check the logs."
     )
     assert context.user_data["chat_history"] == []
+    assert "cached_events" not in context.user_data
     assert context.user_data["session_state"] == SessionStatus.IDLE
     assert context.user_data["current_session_id"] is None
     mock_prompt_next_trigger.assert_awaited_once_with(context, 789)

@@ -135,8 +135,11 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
         except Exception as notify_error:
             logger.error(f"Failed to send synthesis failure message: {notify_error}")
     finally:
-        # Finalize transition to IDLE even if synthesis fails
+        # Finalise transition to IDLE even if synthesis fails.
+        # Clear both short-term chat state and the per-session calendar cache
+        # so the next session always starts from a fresh local view.
         context.user_data['chat_history'] = []
+        context.user_data.pop('cached_events', None)
         context.user_data['session_state'] = SessionStatus.IDLE
         context.user_data['current_session_id'] = None
         
