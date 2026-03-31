@@ -4,7 +4,7 @@ from googleapiclient.errors import HttpError
 from loguru import logger
 
 from integrations.auth import get_calendar_credentials
-from orchestrator.time_utils import USER_TIMEZONE
+from orchestrator.time_utils import USER_TIMEZONE, calendar_event_sort_key
 
 # Note that datetimes that get passed to the API must be in UTC ISO format, not naive datetime objects.
 
@@ -50,8 +50,8 @@ def get_upcoming_events(days: int = 7) -> list:
             except HttpError as e:
                 logger.warning(f"Could not fetch events for calendar {cal.get('summary', cal_id)}: {e}")
                 
-        # Sort combined events by start time (handles both date and dateTime strings)
-        all_events.sort(key=lambda x: x['start'].get('dateTime', x['start'].get('date')))
+        # Sort combined events by their normalized local start time.
+        all_events.sort(key=calendar_event_sort_key)
         
         return all_events
         
@@ -89,8 +89,8 @@ def get_past_events(days: int = 7) -> list:
             except HttpError as e:
                 logger.warning(f"Could not fetch past events for calendar {cal.get('summary', cal_id)}: {e}")
                 
-        # Sort combined events by start time (handles both date and dateTime strings)
-        all_events.sort(key=lambda x: x['start'].get('dateTime', x['start'].get('date')))
+        # Sort combined events by their normalized local start time.
+        all_events.sort(key=calendar_event_sort_key)
         
         return all_events
         

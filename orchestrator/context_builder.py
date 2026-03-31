@@ -1,6 +1,7 @@
 import os
 from loguru import logger
 from integrations.calendar import get_upcoming_events
+from orchestrator.time_utils import calendar_event_sort_key
 from telegram.ext import ContextTypes
 
 # Resolve the absolute path to the context directory
@@ -36,6 +37,10 @@ def _format_calendar_events(tg_context: ContextTypes.DEFAULT_TYPE = None, days: 
         events = get_upcoming_events(days=days)
         if tg_context is not None:
             tg_context.user_data['cached_events'] = events
+
+    events = sorted(events, key=calendar_event_sort_key)
+    if tg_context is not None:
+        tg_context.user_data['cached_events'] = events
 
     if not events:
         return "No upcoming events scheduled."

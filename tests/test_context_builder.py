@@ -32,7 +32,10 @@ def test_format_calendar_events_cache_hit(mock_get_events):
     cached data and not hit the API.
     """
     # Arrange
-    cached_events = [{"summary": "Cached Event", "start": {"dateTime": "2023-01-01T11:00:00Z"}}]
+    cached_events = [
+        {"summary": "Later Event", "start": {"dateTime": "2023-01-01T11:00:00Z"}},
+        {"summary": "Earlier Event", "start": {"dateTime": "2023-01-01T09:00:00Z"}},
+    ]
     
     tg_context = MagicMock()
     tg_context.user_data = {'cached_events': cached_events}
@@ -42,7 +45,8 @@ def test_format_calendar_events_cache_hit(mock_get_events):
 
     # Assert
     mock_get_events.assert_not_called()
-    assert "Cached Event" in result
+    assert result.index("Earlier Event") < result.index("Later Event")
+    assert tg_context.user_data["cached_events"][0]["summary"] == "Earlier Event"
 
 def test_format_calendar_events_no_events():
     """Tests that the function returns the correct fallback string when there are no events."""

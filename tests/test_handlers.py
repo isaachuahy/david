@@ -97,7 +97,11 @@ async def test_handle_confirm_success(mock_remove_ui, mock_get_pending, mock_con
     mock_get_pending.return_value = mock_record
     
     # Mock successful execution
-    mock_created_event = {"id": "evt_123", "summary": "Test Event"}
+    mock_created_event = {
+        "id": "evt_123",
+        "summary": "Test Event",
+        "start": {"dateTime": "2026-03-31T11:00:00Z"},
+    }
     mock_confirm_write.return_value = mock_created_event
     
     await handle_confirm(update, context)
@@ -194,7 +198,7 @@ async def test_handle_start_trigger_weekly_queues_one_event_at_a_time(
         message="Strong week overall.",
         state_change_summary="Updated priorities for next week.",
         weekly_state_content="# Weekly State",
-        proposed_events=[first_event, second_event],
+        proposed_events=[second_event, first_event],
     )
     mock_send_calendar_proposal.return_value = "cw_first"
 
@@ -211,6 +215,46 @@ async def test_handle_start_trigger_weekly_queues_one_event_at_a_time(
         action=first_event,
         prefix_text="📅 *Weekly Review Proposal 1 of 2*\nPlease confirm or reject this event before I move to the next one."
     )
+
+@pytest.mark.asyncio
+@patch('bot.handlers.confirm_write')
+@patch('bot.handlers.get_pending_write')
+@patch('bot.handlers.untrack_confirmation_message')
+async def test_handle_confirm_keeps_cached_events_in_chronological_order(
+    mock_remove_ui,
+    mock_get_pending,
+    mock_confirm_write,
+):
+    update = MagicMock()
+    update.callback_query = MagicMock()
+    update.callback_query.data = "confirm_cw_123"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.text = "Original Proposal Text"
+    update.callback_query.message.chat_id = 456
+
+    context = MagicMock()
+    context.user_data = {
+        "cached_events": [
+            {"id": "evt_later", "summary": "Later Event", "start": {"dateTime": "2026-03-31T15:00:00Z"}},
+        ]
+    }
+
+    mock_record = MagicMock()
+    mock_record.status = CalendarWriteStatus.PENDING
+    mock_get_pending.return_value = mock_record
+    mock_confirm_write.return_value = {
+        "id": "evt_earlier",
+        "summary": "Earlier Event",
+        "start": {"dateTime": "2026-03-31T13:00:00Z"},
+    }
+
+    await handle_confirm(update, context)
+
+    assert [event["summary"] for event in context.user_data["cached_events"]] == [
+        "Earlier Event",
+        "Later Event",
+    ]
 
 @pytest.mark.asyncio
 @patch('bot.handlers.send_calendar_proposal', new_callable=AsyncMock)
@@ -249,7 +293,11 @@ async def test_handle_confirm_advances_weekly_review_queue(
     mock_record = MagicMock()
     mock_record.status = CalendarWriteStatus.PENDING
     mock_get_pending.return_value = mock_record
-    mock_confirm_write.return_value = {"id": "evt_123", "summary": "Test Event"}
+    mock_confirm_write.return_value = {
+        "id": "evt_123",
+        "summary": "Test Event",
+        "start": {"dateTime": "2026-03-31T15:00:00Z"},
+    }
     mock_send_calendar_proposal.return_value = "cw_456"
 
     await handle_confirm(update, context)

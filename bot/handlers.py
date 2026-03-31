@@ -12,7 +12,7 @@ from orchestrator.session_manager import (
     untrack_confirmation_message, clear_tracked_confirmation_messages
 )
 from orchestrator.review_manager import run_sunday_review, execute_weekly_state_update
-from orchestrator.time_utils import USER_TIMEZONE, parse_iso, parse_user_datetime, format_user_datetime
+from orchestrator.time_utils import USER_TIMEZONE, calendar_event_sort_key, parse_iso, parse_user_datetime, format_user_datetime
 from persistence.models import CalendarWriteStatus, SessionStatus
 from reasoning.schemas import ProposedEvent
 from bot.keyboards import build_calendar_confirmation_keyboard, build_weekly_state_keyboard
@@ -169,6 +169,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if 'cached_events' not in context.user_data:
             context.user_data['cached_events'] = []
         context.user_data['cached_events'].append(created_event)
+        context.user_data['cached_events'].sort(key=calendar_event_sort_key)
     else:
         text = f"{query.message.text}\n\n❌ *Failed to schedule event.*"
         
@@ -241,7 +242,11 @@ async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
             
             clear_weekly_review_event_queue(context)
             if review.proposed_events:
-                context.user_data[WEEKLY_REVIEW_EVENT_QUEUE_KEY] = list(review.proposed_events)
+                sorted_events = sorted(
+                    review.proposed_events,
+                    key=lambda event: parse_user_datetime(event.start_time),
+                )
+                context.user_data[WEEKLY_REVIEW_EVENT_QUEUE_KEY] = sorted_events
                 context.user_data[WEEKLY_REVIEW_TOTAL_EVENTS_KEY] = len(review.proposed_events)
                 context.user_data[WEEKLY_REVIEW_PROCESSED_EVENTS_KEY] = 0
                 await send_next_weekly_review_event(context, update.effective_chat.id)
