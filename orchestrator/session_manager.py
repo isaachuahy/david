@@ -6,8 +6,9 @@ from loguru import logger
 from telegram.ext import ContextTypes
 
 from persistence.database import get_db
+from orchestrator.confirmation_queue import get_pending_write, reject_write
 from orchestrator.trigger_scheduler import prompt_next_trigger
-from persistence.models import SessionRecord, SessionStatus
+from persistence.models import CalendarWriteStatus, SessionRecord, SessionStatus
 from reasoning.flash_client import generate_session_synthesis
 
 SESSION_INACTIVITY_TIMEOUT = timedelta(minutes=30)
@@ -17,42 +18,50 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONTEXT_DIR = os.path.join(BASE_DIR, "context")
 DECISION_LOG_PATH = os.path.join(CONTEXT_DIR, "decision_log.md")
 
+def _user_data(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """Returns user_data when available, otherwise a safe empty dict."""
+    data = getattr(context, "user_data", None)
+    return data if isinstance(data, dict) else {}
+
 def is_session_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Checks if the user currently has an active session."""
-    return context.user_data.get('session_state') == SessionStatus.ACTIVE
+    return _user_data(context).get('session_state') == SessionStatus.ACTIVE
 
 def get_session_state(context: ContextTypes.DEFAULT_TYPE) -> SessionStatus:
     """Retrieves the current session state."""
-    return context.user_data.get('session_state', SessionStatus.IDLE)
+    return _user_data(context).get('session_state', SessionStatus.IDLE)
 
 def get_chat_history(context: ContextTypes.DEFAULT_TYPE) -> list:
     """Retrieves the current session's chat history."""
-    return context.user_data.get('chat_history', [])
+    return _user_data(context).get('chat_history', [])
 
 def append_chat_history(context: ContextTypes.DEFAULT_TYPE, role: str, content: str):
     """Appends a message to the current session's chat history."""
-    if 'chat_history' not in context.user_data:
-        context.user_data['chat_history'] = []
-    context.user_data['chat_history'].append({"role": role, "content": content})
+    user_data = _user_data(context)
+    if 'chat_history' not in user_data:
+        user_data['chat_history'] = []
+    user_data['chat_history'].append({"role": role, "content": content})
 
 def track_confirmation_message(context: ContextTypes.DEFAULT_TYPE, write_id: str, message_id: int):
     """Appends the UI state of a pending calendar write to the list."""
-    if 'pending_writes' not in context.user_data:
-        context.user_data['pending_writes'] = []
-    context.user_data['pending_writes'].append((write_id, message_id))
+    user_data = _user_data(context)
+    if 'pending_writes' not in user_data:
+        user_data['pending_writes'] = []
+    user_data['pending_writes'].append((write_id, message_id))
 
 def get_tracked_confirmation_messages(context: ContextTypes.DEFAULT_TYPE) -> List[Tuple[str, int]]:
     """Retrieves the list of pending calendar write UI states."""
-    return context.user_data.get('pending_writes', [])
+    return _user_data(context).get('pending_writes', [])
 
 def untrack_confirmation_message(context: ContextTypes.DEFAULT_TYPE, write_id: str):
     """Removes a specific pending write from the UI state tracking."""
-    writes = context.user_data.get('pending_writes', [])
-    context.user_data['pending_writes'] = [w for w in writes if w[0] != write_id]
+    user_data = _user_data(context)
+    writes = user_data.get('pending_writes', [])
+    user_data['pending_writes'] = [w for w in writes if w[0] != write_id]
 
 def clear_tracked_confirmation_messages(context: ContextTypes.DEFAULT_TYPE):
     """Clears all pending calendar write UI states."""
-    context.user_data['pending_writes'] = []
+    _user_data(context)['pending_writes'] = []
 
 def get_session_timeout_job_name(user_id: int) -> str:
     """Builds a stable job name for a user's inactivity timeout."""
@@ -89,9 +98,10 @@ def reset_session_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user
 def start_session(context: ContextTypes.DEFAULT_TYPE) -> str:
     """Starts a new conversational session and logs it to the database."""
     session_id = f"sess_{uuid.uuid4().hex[:8]}"
-    context.user_data['current_session_id'] = session_id
-    context.user_data['session_state'] = SessionStatus.ACTIVE
-    context.user_data['chat_history'] = []
+    user_data = _user_data(context)
+    user_data['current_session_id'] = session_id
+    user_data['session_state'] = SessionStatus.ACTIVE
+    user_data['chat_history'] = []
     
     record = SessionRecord(
         id=session_id,
@@ -109,12 +119,30 @@ def append_to_decision_log(content: str):
     with open(DECISION_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(f"\n\n{content.strip()}\n")
 
+async def cancel_pending_writes(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Rejects any pending calendar confirmations when a session closes."""
+    for write_id, message_id in get_tracked_confirmation_messages(context):
+        record = get_pending_write(write_id)
+        if record and record.status == CalendarWriteStatus.PENDING:
+            logger.info(f"Session closing. Auto-rejecting pending write {write_id}.")
+            reject_write(write_id)
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text="🚫 *Event cancelled because the session closed before confirmation.*",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Failed to update cancelled proposal UI for {write_id}: {e}")
+    clear_tracked_confirmation_messages(context)
+
 async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
     """Background job to synthesize the session transcript and finalize closing."""
     job_data = context.job.data
     chat_id = job_data["chat_id"]
     session_id = job_data.get("session_id")
-    chat_history = list(get_chat_history(context))
+    chat_history = list(job_data.get("chat_history", []))
     session_date = datetime.now(timezone.utc).date().isoformat()
     
     logger.info(f"Running background synthesis for session {session_id}...")
@@ -138,17 +166,20 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
         # Finalise transition to IDLE even if synthesis fails.
         # Clear both short-term chat state and the per-session calendar cache
         # so the next session always starts from a fresh local view.
-        context.user_data['chat_history'] = []
-        context.user_data.pop('cached_events', None)
-        context.user_data['session_state'] = SessionStatus.IDLE
-        context.user_data['current_session_id'] = None
+        user_data = _user_data(context)
+        user_data['chat_history'] = []
+        user_data.pop('cached_events', None)
+        user_data['session_state'] = SessionStatus.IDLE
+        user_data['current_session_id'] = None
         
         # Evaluate the trigger queue
         await prompt_next_trigger(context, chat_id)
 
 async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: str = "done"):
     """Ends the active session, clears short-term memory, and checks for pending triggers."""
-    session_id = context.user_data.get('current_session_id')
+    user_data = _user_data(context)
+    session_id = user_data.get('current_session_id')
+    chat_history_snapshot = list(user_data.get('chat_history', []))
     if session_id:
         db = get_db()
         db["sessions"].update(session_id, {
@@ -157,7 +188,7 @@ async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: 
         })
         logger.info(f"Transitioning session {session_id} to CLOSING.")
         
-    context.user_data['session_state'] = SessionStatus.CLOSING
+    user_data['session_state'] = SessionStatus.CLOSING
         
     if reason == "timeout":
         text = "Session timed out. Synthesizing decisions in the background..."
@@ -168,6 +199,12 @@ async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: 
         await context.bot.send_message(chat_id=chat_id, text=text)
     except Exception as e:
         logger.error(f"Failed to send session close message: {e}")
+
+    await cancel_pending_writes(context, chat_id)
         
     # Schedule the synthesis task to run immediately without blocking the UI
-    context.job_queue.run_once(execute_synthesis_task, 0, data={"chat_id": chat_id, "session_id": session_id})
+    context.job_queue.run_once(
+        execute_synthesis_task,
+        0,
+        data={"chat_id": chat_id, "session_id": session_id, "chat_history": chat_history_snapshot}
+    )
