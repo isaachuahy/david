@@ -41,6 +41,7 @@ async def test_handle_message(mock_process_message):
     
     context = MagicMock()
     context.user_data = {}
+    context.bot_data = {"allowed_user_id": 123}
     context.job_queue.get_jobs_by_name.return_value = ()
 
     # 2. Act: Call our handler
@@ -58,6 +59,48 @@ async def test_handle_message(mock_process_message):
         user_id=123,
     )
 
+
+@pytest.mark.asyncio
+@patch('bot.handlers.process_message', new_callable=AsyncMock)
+async def test_handle_message_drops_unauthorized_user(mock_process_message):
+    update = MagicMock()
+    update.effective_chat.id = 456
+    update.effective_user.id = 999
+    update.callback_query = None
+    update.message.text = "Hello David"
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {}
+    context.bot_data = {"allowed_user_id": 123}
+
+    await handle_message(update, context)
+
+    mock_process_message.assert_not_awaited()
+    update.message.reply_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers.confirm_write')
+async def test_handle_confirm_rejects_unauthorized_callback(mock_confirm_write):
+    update = MagicMock()
+    update.effective_user.id = 999
+    update.callback_query = MagicMock()
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+
+    context = MagicMock()
+    context.bot_data = {"allowed_user_id": 123}
+
+    await handle_confirm(update, context)
+
+    update.callback_query.answer.assert_awaited_once_with(
+        "This action is not available.",
+        show_alert=True,
+    )
+    update.callback_query.edit_message_text.assert_not_awaited()
+    mock_confirm_write.assert_not_called()
+
 @pytest.mark.asyncio
 @patch('bot.handlers.end_session', new_callable=AsyncMock)
 async def test_done_command_cancels_session_timeout_before_closing(mock_end_session):
@@ -68,6 +111,7 @@ async def test_done_command_cancels_session_timeout_before_closing(mock_end_sess
 
     context = MagicMock()
     context.user_data = {"session_state": "ACTIVE"}
+    context.bot_data = {"allowed_user_id": 123}
     existing_job = MagicMock()
     context.job_queue.get_jobs_by_name.return_value = (existing_job,)
 
@@ -82,6 +126,7 @@ async def test_done_command_cancels_session_timeout_before_closing(mock_end_sess
 @patch('bot.handlers.untrack_confirmation_message')
 async def test_handle_confirm_success(mock_remove_ui, mock_get_pending, mock_confirm_write):
     update = MagicMock()
+    update.effective_user.id = 123
     update.callback_query = MagicMock()
     update.callback_query.data = "confirm_cw_123"
     update.callback_query.answer = AsyncMock()
@@ -90,6 +135,7 @@ async def test_handle_confirm_success(mock_remove_ui, mock_get_pending, mock_con
     
     context = MagicMock()
     context.user_data = {} # Ensure clean state for cache test
+    context.bot_data = {"allowed_user_id": 123}
     
     # Mock the database record
     mock_record = MagicMock()
@@ -120,6 +166,7 @@ async def test_handle_confirm_success(mock_remove_ui, mock_get_pending, mock_con
 @patch('bot.handlers.untrack_confirmation_message')
 async def test_handle_reject_success(mock_remove_ui, mock_get_pending, mock_reject_write):
     update = MagicMock()
+    update.effective_user.id = 123
     update.callback_query = MagicMock()
     update.callback_query.data = "reject_cw_456"
     update.callback_query.answer = AsyncMock()
@@ -127,6 +174,7 @@ async def test_handle_reject_success(mock_remove_ui, mock_get_pending, mock_reje
     update.callback_query.message.text = "Original Proposal Text"
     
     context = MagicMock()
+    context.bot_data = {"allowed_user_id": 123}
     
     # Mock the database record
     mock_record = MagicMock()
@@ -148,12 +196,14 @@ async def test_handle_reject_success(mock_remove_ui, mock_get_pending, mock_reje
 @patch('bot.handlers.consume_trigger')
 async def test_handle_start_trigger_daily(mock_consume_trigger):
     update = MagicMock()
+    update.effective_user.id = 123
     update.callback_query = MagicMock()
     update.callback_query.data = "start_trigger_daily_checkin"
     update.callback_query.answer = AsyncMock()
     update.callback_query.edit_message_text = AsyncMock()
     
     context = MagicMock()
+    context.bot_data = {"allowed_user_id": 123}
     
     await handle_start_trigger(update, context)
     
@@ -173,6 +223,7 @@ async def test_handle_start_trigger_weekly_queues_one_event_at_a_time(
 ):
     update = MagicMock()
     update.effective_chat.id = 456
+    update.effective_user.id = 123
     update.callback_query = MagicMock()
     update.callback_query.data = "start_trigger_weekly_review"
     update.callback_query.answer = AsyncMock()
@@ -180,6 +231,7 @@ async def test_handle_start_trigger_weekly_queues_one_event_at_a_time(
 
     context = MagicMock()
     context.user_data = {}
+    context.bot_data = {"allowed_user_id": 123}
     context.bot.send_message = AsyncMock()
 
     first_event = ProposedEvent(
@@ -226,6 +278,7 @@ async def test_handle_confirm_keeps_cached_events_in_chronological_order(
     mock_confirm_write,
 ):
     update = MagicMock()
+    update.effective_user.id = 123
     update.callback_query = MagicMock()
     update.callback_query.data = "confirm_cw_123"
     update.callback_query.answer = AsyncMock()
@@ -239,6 +292,7 @@ async def test_handle_confirm_keeps_cached_events_in_chronological_order(
             {"id": "evt_later", "summary": "Later Event", "start": {"dateTime": "2026-03-31T15:00:00Z"}},
         ]
     }
+    context.bot_data = {"allowed_user_id": 123}
 
     mock_record = MagicMock()
     mock_record.status = CalendarWriteStatus.PENDING
@@ -268,6 +322,7 @@ async def test_handle_confirm_advances_weekly_review_queue(
     mock_send_calendar_proposal,
 ):
     update = MagicMock()
+    update.effective_user.id = 123
     update.callback_query = MagicMock()
     update.callback_query.data = "confirm_cw_123"
     update.callback_query.answer = AsyncMock()
@@ -288,6 +343,7 @@ async def test_handle_confirm_advances_weekly_review_queue(
         "weekly_review_processed_events": 0,
         "weekly_review_current_write_id": "cw_123",
     }
+    context.bot_data = {"allowed_user_id": 123}
     context.bot.send_message = AsyncMock()
 
     mock_record = MagicMock()
@@ -326,6 +382,7 @@ async def test_handle_reject_completes_weekly_review_queue(
     mock_reject_write,
 ):
     update = MagicMock()
+    update.effective_user.id = 123
     update.callback_query = MagicMock()
     update.callback_query.data = "reject_cw_456"
     update.callback_query.answer = AsyncMock()
@@ -340,6 +397,7 @@ async def test_handle_reject_completes_weekly_review_queue(
         "weekly_review_processed_events": 0,
         "weekly_review_current_write_id": "cw_456",
     }
+    context.bot_data = {"allowed_user_id": 123}
     context.bot.send_message = AsyncMock()
 
     mock_record = MagicMock()
@@ -361,11 +419,13 @@ async def test_handle_reject_completes_weekly_review_queue(
 @pytest.mark.asyncio
 async def test_handle_delay_trigger():
     update = MagicMock()
+    update.effective_user.id = 123
     update.callback_query = MagicMock()
     update.callback_query.answer = AsyncMock()
     update.callback_query.edit_message_text = AsyncMock()
     
     context = MagicMock()
+    context.bot_data = {"allowed_user_id": 123}
     
     await handle_delay_trigger(update, context)
     
@@ -378,6 +438,7 @@ async def test_handle_delay_trigger():
 @patch('bot.handlers.execute_weekly_state_update')
 async def test_handle_confirm_weekly_state(mock_execute):
     update = MagicMock()
+    update.effective_user.id = 123
     update.callback_query = MagicMock()
     update.callback_query.answer = AsyncMock()
     update.callback_query.edit_message_text = AsyncMock()
@@ -388,6 +449,7 @@ async def test_handle_confirm_weekly_state(mock_execute):
             'timestamp': datetime.now(timezone.utc).isoformat(),
         }
     }
+    context.bot_data = {"allowed_user_id": 123}
     mock_execute.return_value = True
     
     await handle_confirm_weekly_state(update, context)
@@ -405,7 +467,9 @@ async def test_handle_confirm_weekly_state(mock_execute):
 async def test_test_schedule_uses_calendar_proposal_helper(mock_send_calendar_proposal):
     update = MagicMock()
     update.effective_chat.id = 456
+    update.effective_user.id = 123
     context = MagicMock()
+    context.bot_data = {"allowed_user_id": 123}
 
     await handler_test_schedule(update, context)
 
@@ -431,6 +495,7 @@ async def test_send_calendar_proposal_displays_toronto_time(
 
     context = MagicMock()
     context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=999))
+    context.bot_data = {"allowed_user_id": 123}
 
     await send_calendar_proposal(
         context=context,
@@ -455,12 +520,14 @@ async def test_send_calendar_proposal_displays_toronto_time(
 @pytest.mark.asyncio
 async def test_handle_reject_weekly_state():
     update = MagicMock()
+    update.effective_user.id = 123
     update.callback_query = MagicMock()
     update.callback_query.answer = AsyncMock()
     update.callback_query.edit_message_text = AsyncMock()
     
     context = MagicMock()
     context.user_data = {'proposed_weekly_state': {'content': 'test', 'timestamp': '2026-03-22T10:00:00Z'}}
+    context.bot_data = {"allowed_user_id": 123}
     
     await handle_reject_weekly_state(update, context)
     

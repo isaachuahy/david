@@ -1,0 +1,13 @@
+# Copy this file to /etc/systemd/system/david-backup.service on the server.
+# This is a one-shot job usually triggered by david-backup.timer.
+[Unit]
+Description=David off-site backup job
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/david
+EnvironmentFile=/opt/david/.env
+ExecStart=/opt/david/scripts/backup.sh

@@ -1,0 +1,12 @@
+# Copy this file to /etc/systemd/system/david-backup.timer on the server.
+# Change OnCalendar if you want a different daily backup time.
+[Unit]
+Description=Run David backup job daily
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+Unit=david-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,4 +1,5 @@
 import asyncio
+from functools import wraps
 from datetime import datetime, timezone, timedelta
 from loguru import logger
 from telegram import Update
@@ -22,6 +23,50 @@ WEEKLY_REVIEW_EVENT_QUEUE_KEY = "weekly_review_event_queue"
 WEEKLY_REVIEW_TOTAL_EVENTS_KEY = "weekly_review_total_events"
 WEEKLY_REVIEW_PROCESSED_EVENTS_KEY = "weekly_review_processed_events"
 WEEKLY_REVIEW_CURRENT_WRITE_ID_KEY = "weekly_review_current_write_id"
+UNAUTHORIZED_CALLBACK_TEXT = "This action is not available."
+
+
+async def _is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Drops any update that does not come from the configured Telegram user."""
+    allowed_user_id = context.bot_data.get("allowed_user_id")
+    user = update.effective_user
+
+    if allowed_user_id is None:
+        logger.error("Authorization is not configured on application bot_data. Dropping update.")
+        if update.callback_query:
+            await update.callback_query.answer(UNAUTHORIZED_CALLBACK_TEXT, show_alert=True)
+        return False
+
+    try:
+        allowed_user_id = int(allowed_user_id)
+    except (TypeError, ValueError):
+        logger.error("Configured allowed_user_id is invalid. Dropping update.")
+        if update.callback_query:
+            await update.callback_query.answer(UNAUTHORIZED_CALLBACK_TEXT, show_alert=True)
+        return False
+
+    if user is None:
+        logger.warning("Received update without an effective Telegram user. Dropping update.")
+        return False
+
+    if user.id == allowed_user_id:
+        return True
+
+    logger.warning(f"Dropped unauthorized update from Telegram user {user.id}.")
+    if update.callback_query:
+        await update.callback_query.answer(UNAUTHORIZED_CALLBACK_TEXT, show_alert=True)
+    return False
+
+
+def authorized_only(handler):
+    """Decorator that enforces the single-user Telegram access policy."""
+    @wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        if not await _is_authorized(update, context):
+            return
+        return await handler(update, context, *args, **kwargs)
+
+    return wrapper
 
 
 def clear_weekly_review_event_queue(context: ContextTypes.DEFAULT_TYPE):
@@ -115,17 +160,20 @@ async def advance_weekly_review_event_queue(
 # These are the entry points for all user interactions, and they delegate to the Router and other orchestrator components to handle the logic and state management. 
 # The handlers also manage session state and ensure that the user experience is smooth and responsive, even when waiting for LLM responses or handling confirmations.
 
+@authorized_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /start command."""
     user_id = update.effective_user.id
     logger.info(f"User {user_id} started the bot.")
     await update.message.reply_text("Hello! I am David.")
 
+@authorized_only
 async def test_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Temporary command to test the trigger queue."""
     trigger_type = context.args[0] if context.args else "daily_checkin"
     await queue_trigger(context, trigger_type, update.effective_chat.id)
 
+@authorized_only
 async def test_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Temporary command to test the confirmation UI."""
     now = datetime.now(USER_TIMEZONE)
@@ -142,6 +190,7 @@ async def test_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prefix_text="I propose scheduling 'David UI Test Event' for the next 15 minutes. Does this look good?"
     )
 
+@authorized_only
 async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles confirmation of a proposed calendar write."""
     query = update.callback_query
@@ -183,6 +232,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             outcome_text="Confirmed",
         )
 
+@authorized_only
 async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles rejection of a proposed calendar write."""
     query = update.callback_query
@@ -207,6 +257,7 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
             outcome_text="Rejected",
         )
 
+@authorized_only
 async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles starting a scheduled trigger."""
     query = update.callback_query
@@ -260,12 +311,14 @@ async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.error(f"Error during Sunday Review: {e}")
             await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ An error occurred during the Sunday Review.")
 
+@authorized_only
 async def handle_delay_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles delaying a scheduled trigger."""
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("Got it - let's chat first. I'll hold onto this trigger until you're ready.", parse_mode="Markdown")
 
+@authorized_only
 async def handle_confirm_weekly_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles confirmation to overwrite the weekly state."""
     query = update.callback_query
@@ -292,6 +345,7 @@ async def handle_confirm_weekly_state(update: Update, context: ContextTypes.DEFA
     else:
         await query.edit_message_text("❌ *Failed to update weekly state. Please check the logs.*", parse_mode="Markdown")
 
+@authorized_only
 async def handle_reject_weekly_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles rejection of the weekly state update."""
     query = update.callback_query
@@ -302,6 +356,7 @@ async def handle_reject_weekly_state(update: Update, context: ContextTypes.DEFAU
         
     await query.edit_message_text("🚫 *Weekly state update rejected.*", parse_mode="Markdown")
 
+@authorized_only
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Closes the active session and checks for pending triggers."""
     if is_session_active(context):
@@ -314,6 +369,7 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("There is no active session to close.")
 
+@authorized_only
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles ad-hoc messages by checking UI state and passing text to the Router."""
     # Block new messages if the session is currently synthesising

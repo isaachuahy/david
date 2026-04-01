@@ -1,0 +1,20 @@
+# Copy this file to /etc/systemd/system/david.service on the server.
+# Review User, WorkingDirectory, and EnvironmentFile before enabling it.
+[Unit]
+Description=David Telegram assistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/david
+EnvironmentFile=/opt/david/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/env uv run python main.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
