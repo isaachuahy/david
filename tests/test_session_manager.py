@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from orchestrator.session_manager import (
     SESSION_INACTIVITY_TIMEOUT,
     SESSION_READY_MESSAGE,
+    invalidate_restart_volatile_user_data,
     get_session_timeout_job_name,
     timeout_inactive_session,
     reset_session_timeout,
@@ -58,6 +59,45 @@ def test_reconcile_orphaned_sessions_noops_when_none_active(mock_get_db):
 
     assert reconciled == 0
     mock_get_db.return_value["sessions"].update.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_invalidate_restart_volatile_user_data_clears_cached_events_only():
+    application = MagicMock()
+    application.user_data = {
+        123: {
+            "cached_events": [{"summary": "Stale cached event"}],
+            "pending_writes": [("cw_123", 999)],
+            "chat_history": [{"role": "user", "content": "Keep me"}],
+        },
+        456: {
+            "pending_writes": [("cw_456", 111)],
+        },
+    }
+    application.mark_data_for_update_persistence = MagicMock()
+    application.update_persistence = AsyncMock()
+
+    await invalidate_restart_volatile_user_data(application)
+
+    assert "cached_events" not in application.user_data[123]
+    assert application.user_data[123]["pending_writes"] == [("cw_123", 999)]
+    assert application.user_data[123]["chat_history"] == [{"role": "user", "content": "Keep me"}]
+    assert application.user_data[456]["pending_writes"] == [("cw_456", 111)]
+    application.mark_data_for_update_persistence.assert_called_once_with(user_ids=[123])
+    application.update_persistence.assert_awaited_once_with()
+
+@pytest.mark.asyncio
+async def test_invalidate_restart_volatile_user_data_noops_when_nothing_to_clear():
+    application = MagicMock()
+    application.user_data = {
+        123: {"pending_writes": [("cw_123", 999)]},
+    }
+    application.mark_data_for_update_persistence = MagicMock()
+    application.update_persistence = AsyncMock()
+
+    await invalidate_restart_volatile_user_data(application)
+
+    application.mark_data_for_update_persistence.assert_not_called()
+    application.update_persistence.assert_not_awaited()
 
 @pytest.mark.asyncio
 @patch('orchestrator.session_manager.end_session', new_callable=AsyncMock)

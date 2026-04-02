@@ -1,9 +1,20 @@
 from loguru import logger
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    PicklePersistence,
+    PersistenceInput,
+    filters,
+)
 
 from orchestrator.trigger_scheduler import setup_scheduler
-from orchestrator.session_manager import reconcile_orphaned_sessions
-from persistence.database import init_db
+from orchestrator.session_manager import (
+    invalidate_restart_volatile_user_data,
+    reconcile_orphaned_sessions,
+)
+from persistence.database import TELEGRAM_PERSISTENCE_PATH, init_db
 from config import ConfigError, load_config
 from bot.handlers import (
     start, done_command, test_trigger, test_schedule,
@@ -22,7 +33,22 @@ def main() -> int:
     logger.info("Initializing David's Telegram interface...")
     init_db()
     reconcile_orphaned_sessions()
-    app = ApplicationBuilder().token(config.telegram_bot_token).build()
+    persistence = PicklePersistence(
+        filepath=TELEGRAM_PERSISTENCE_PATH,
+        store_data=PersistenceInput(
+            bot_data=False,
+            chat_data=False,
+            user_data=True,
+            callback_data=False,
+        ),
+    )
+    app = (
+        ApplicationBuilder()
+        .token(config.telegram_bot_token)
+        .persistence(persistence)
+        .post_init(invalidate_restart_volatile_user_data)
+        .build()
+    )
     app.bot_data["allowed_user_id"] = config.allowed_user_id
 
     # Restrict the bot to only respond to a specific user for security reasons

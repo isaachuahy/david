@@ -60,6 +60,10 @@ async def _is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def authorized_only(handler):
     """Decorator that enforces the single-user Telegram access policy."""
+    # This is a critical security measure to ensure that only the intended user can interact with the bot, 
+    # especially since it has powerful capabilities like reading calendar data, scheduling events and LLM calls.
+    # wraps is a standard Python decorator that preserves the original function's metadata (like its name and docstring) 
+    # when it's wrapped by another function.
     @wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         if not await _is_authorized(update, context):

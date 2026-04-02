@@ -6,6 +6,7 @@ from loguru import logger
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "assistant.db")
+TELEGRAM_PERSISTENCE_PATH = os.path.join(DATA_DIR, "telegram_state.pkl")
 
 def get_db() -> Database:
     """Returns a connection to the SQLite database, ensuring the directory exists."""

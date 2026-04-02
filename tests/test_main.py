@@ -4,6 +4,8 @@ from unittest.mock import MagicMock, patch
 import main
 
 
+@patch("main.PicklePersistence")
+@patch("main.PersistenceInput")
 @patch("main.setup_scheduler")
 @patch("main.ApplicationBuilder")
 @patch("main.reconcile_orphaned_sessions")
@@ -15,6 +17,8 @@ def test_main_initializes_db_and_reconciles_sessions_before_polling(
     mock_reconcile,
     mock_application_builder,
     mock_setup_scheduler,
+    mock_persistence_input,
+    mock_pickle_persistence,
 ):
     mock_load_config.return_value = MagicMock(
         telegram_bot_token="token",
@@ -27,12 +31,30 @@ def test_main_initializes_db_and_reconciles_sessions_before_polling(
 
     app = MagicMock()
     app.bot_data = {}
-    mock_application_builder.return_value.token.return_value.build.return_value = app
+    builder = MagicMock()
+    mock_application_builder.return_value = builder
+    builder.token.return_value = builder
+    builder.persistence.return_value = builder
+    builder.post_init.return_value = builder
+    builder.build.return_value = app
 
     assert main.main() == 0
 
     mock_init_db.assert_called_once_with()
     mock_reconcile.assert_called_once_with()
+    mock_persistence_input.assert_called_once_with(
+        bot_data=False,
+        chat_data=False,
+        user_data=True,
+        callback_data=False,
+    )
+    mock_pickle_persistence.assert_called_once_with(
+        filepath=main.TELEGRAM_PERSISTENCE_PATH,
+        store_data=mock_persistence_input.return_value,
+    )
+    builder.token.assert_called_once_with("token")
+    builder.persistence.assert_called_once_with(mock_pickle_persistence.return_value)
+    builder.post_init.assert_called_once_with(main.invalidate_restart_volatile_user_data)
     assert app.bot_data["allowed_user_id"] == 123
     mock_setup_scheduler.assert_called_once_with(app, 123)
     app.run_polling.assert_called_once_with()

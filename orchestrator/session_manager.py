@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Tuple
 from loguru import logger
-from telegram.ext import ContextTypes
+from telegram.ext import Application, ContextTypes
 
 from persistence.database import get_db
 from orchestrator.confirmation_queue import get_pending_write, reject_write
@@ -20,10 +20,46 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONTEXT_DIR = os.path.join(BASE_DIR, "context")
 DECISION_LOG_PATH = os.path.join(CONTEXT_DIR, "decision_log.md")
 
+# Keys in user_data that should be cleared on restart to avoid stale state issues. 
+# Cached calendar events are the main culprit since they can easily become out of sync with the real calendar state after a restart.
+RESTART_INVALID_USER_DATA_KEYS = ("cached_events",)
+
 def _user_data(context: ContextTypes.DEFAULT_TYPE) -> dict:
     """Returns user_data when available, otherwise a safe empty dict."""
     data = getattr(context, "user_data", None)
     return data if isinstance(data, dict) else {}
+
+async def invalidate_restart_volatile_user_data(application: Application) -> None:
+    """
+    Clears restart-invalid cached values from restored PTB user_data.
+
+    Some state should survive restarts for workflow continuity, such as pending
+    confirmation UIs. Session caches like cached calendar events should be
+    rebuilt after a restart to avoid stale reads from external systems. 
+    (i.e. calendar states changing outside of David's sessions)
+    """
+    sanitized_user_ids: list[int] = []
+
+    for user_id, user_data in application.user_data.items():
+        removed_any = False
+        for key in RESTART_INVALID_USER_DATA_KEYS:
+            if key in user_data:
+                user_data.pop(key, None)
+                removed_any = True
+
+        if removed_any:
+            sanitized_user_ids.append(user_id)
+
+    if not sanitized_user_ids:
+        return
+
+    logger.info(
+        "Cleared restart-invalid user_data keys {} for {} restored user(s).",
+        RESTART_INVALID_USER_DATA_KEYS,
+        len(sanitized_user_ids),
+    )
+    application.mark_data_for_update_persistence(user_ids=sanitized_user_ids)
+    await application.update_persistence()
 
 def is_session_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Checks if the user currently has an active session."""
