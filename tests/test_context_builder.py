@@ -60,9 +60,10 @@ def test_format_calendar_events_no_events():
     # Assert
     assert result == "No upcoming events scheduled."
 
+@patch("orchestrator.context_builder._current_datetime_block", return_value="Today is Thursday, April 9, 2026.")
 @patch("orchestrator.context_builder._format_calendar_events", return_value="<CALENDAR_EVENTS>")
 @patch("orchestrator.context_builder._read_file_safely")
-def test_build_context_structure(mock_read_file, mock_format_calendar):
+def test_build_context_structure(mock_read_file, mock_format_calendar, mock_current_datetime):
     """
     Tests that the final context string is assembled correctly with all its parts.
     """
@@ -80,8 +81,10 @@ def test_build_context_structure(mock_read_file, mock_format_calendar):
     result = build_context(tg_context)
 
     # Assert
+    assert "<CURRENT_DATETIME>\nToday is Thursday, April 9, 2026.\n</CURRENT_DATETIME>" in result
     assert "<GOALS>\n<GOALS_CONTENT>\n</GOALS>" in result
     assert "<WEEKLY_STATE>\n<WEEKLY_STATE_CONTENT>\n</WEEKLY_STATE>" in result
     assert "<DECISION_LOG>\n<DECISION_LOG_CONTENT>\n</DECISION_LOG>" in result
     assert "<UPCOMING_CALENDAR>\n<CALENDAR_EVENTS>\n</UPCOMING_CALENDAR>" in result
+    mock_current_datetime.assert_called_once_with()
     mock_format_calendar.assert_called_once_with(tg_context)

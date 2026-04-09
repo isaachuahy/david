@@ -1,8 +1,11 @@
+from datetime import datetime
+
 from loguru import logger
 from integrations.calendar import get_upcoming_events
 from orchestrator.time_utils import calendar_event_sort_key
 from telegram.ext import ContextTypes
 from runtime_paths import get_context_dir
+from orchestrator.time_utils import USER_TIMEZONE
 
 def _read_file_safely(filename: str, fallback: str) -> str:
     """Reads a text file safely, returning a fallback if it fails or is missing."""
@@ -18,6 +21,17 @@ def _read_file_safely(filename: str, fallback: str) -> str:
     except Exception as e:
         logger.error(f"Error reading {filepath}: {e}")
         return fallback
+
+
+def _current_datetime_block() -> str:
+    """Builds a stable, explicit current datetime block for the LLM context."""
+    now = datetime.now(USER_TIMEZONE)
+    human_date = f"{now.strftime('%A')}, {now.strftime('%B')} {now.day}, {now.year}"
+    return (
+        f"Current local datetime: {now.isoformat()}\n"
+        f"Today is {human_date}.\n"
+        f"Current local time: {now.strftime('%I:%M %p %Z')}"
+    )
 
 def _format_calendar_events(tg_context: ContextTypes.DEFAULT_TYPE = None, days: int = 7) -> str:
     """Fetches and formats upcoming calendar events, utilizing a session cache if available."""
@@ -60,8 +74,10 @@ def build_context(tg_context: ContextTypes.DEFAULT_TYPE = None) -> str:
     weekly = _read_file_safely("weekly_state.md", "No weekly state defined.")
     decisions = _read_file_safely("decision_log.md", "No recent decisions.")
     calendar = _format_calendar_events(tg_context)
+    current_datetime = _current_datetime_block()
 
-    return (f"<CONTEXT>\n<GOALS>\n{goals}\n</GOALS>\n\n"
+    return (f"<CONTEXT>\n<CURRENT_DATETIME>\n{current_datetime}\n</CURRENT_DATETIME>\n\n"
+            f"<GOALS>\n{goals}\n</GOALS>\n\n"
             f"<WEEKLY_STATE>\n{weekly}\n</WEEKLY_STATE>\n\n"
             f"<DECISION_LOG>\n{decisions}\n</DECISION_LOG>\n\n"
             f"<UPCOMING_CALENDAR>\n{calendar}\n</UPCOMING_CALENDAR>\n</CONTEXT>")
