@@ -24,8 +24,9 @@ from reasoning.schemas import ProposedEvent
 from persistence.models import CalendarWriteStatus
 
 @pytest.mark.asyncio
+@patch('bot.handlers.start_session')
 @patch('bot.handlers.process_message', new_callable=AsyncMock)
-async def test_handle_message(mock_process_message):
+async def test_handle_message(mock_process_message, mock_start_session):
     # 1. Arrange: Set up our mocks
     mock_flash_response = FlashResponse(
         message="This is a mocked response from David."
@@ -48,6 +49,7 @@ async def test_handle_message(mock_process_message):
     await handle_message(update, context)
 
     # 3. Assert: Verify the routing logic worked correctly
+    mock_start_session.assert_called_once_with(context)
     mock_process_message.assert_awaited_once_with("Hello David", context)
     update.message.reply_text.assert_called_once_with("This is a mocked response from David.")
     context.job_queue.run_once.assert_called_once_with(

@@ -145,7 +145,8 @@ def start_session(context: ContextTypes.DEFAULT_TYPE) -> str:
     )
     
     db = get_db()
-    db["sessions"].insert(record.model_dump())  # type: ignore
+    # Serialize enums to plain strings so fresh SQLite tables can be created cleanly.
+    db["sessions"].insert(record.model_dump(mode="json"))  # type: ignore
     logger.info(f"Started new session: {session_id}")
     return session_id
 

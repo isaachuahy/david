@@ -14,6 +14,22 @@ from orchestrator.session_manager import (
 )
 from persistence.models import SessionStatus
 
+
+@patch("orchestrator.session_manager.get_db")
+def test_start_session_serializes_enum_status_before_insert(mock_get_db):
+    from orchestrator.session_manager import start_session
+
+    context = MagicMock()
+    context.user_data = {}
+
+    session_id = start_session(context)
+
+    mock_get_db.return_value["sessions"].insert.assert_called_once()
+    inserted_row = mock_get_db.return_value["sessions"].insert.call_args.args[0]
+    assert inserted_row["status"] == SessionStatus.ACTIVE.value
+    assert context.user_data["current_session_id"] == session_id
+    assert context.user_data["session_state"] == SessionStatus.ACTIVE
+
 def test_reset_session_timeout_replaces_existing_job():
     context = MagicMock()
     existing_job = MagicMock()

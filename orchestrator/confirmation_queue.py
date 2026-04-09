@@ -31,7 +31,8 @@ def add_pending_write(summary: str, start_time: datetime, end_time: datetime, de
         created_at=now_iso
     )
     
-    db["calendar_writes"].insert(record.model_dump())  # type: ignore
+    # Serialize enums to plain strings so fresh SQLite tables can be created cleanly.
+    db["calendar_writes"].insert(record.model_dump(mode="json"))  # type: ignore
     logger.info(f"Added pending calendar write [{write_id}]: '{summary}'")
     return write_id
 
