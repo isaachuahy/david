@@ -1,0 +1,56 @@
+[Unit]
+Description=David Executive Assistant
+Documentation=https://github.com/isaachuahy/david
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=david
+Group=david
+WorkingDirectory=/opt/david
+EnvironmentFile=/etc/david/david.env
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+
+# Keep the entrypoint explicit so startup is easy to reason about.
+ExecStartPre=/usr/bin/test -x /opt/david/.venv/bin/python
+ExecStartPre=/usr/bin/test -f /opt/david/main.py
+ExecStart=/opt/david/.venv/bin/python /opt/david/main.py
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Operational resilience
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=90
+TimeoutStopSec=30
+KillSignal=SIGINT
+KillMode=mixed
+
+# Journald logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=david
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/var/log/david /var/lib/david
+
+# Resource tuning defaults (override in drop-in if needed)
+LimitNOFILE=65535
+TasksMax=4096
+
+[Install]
+WantedBy=multi-user.target

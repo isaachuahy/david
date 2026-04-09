@@ -1,5 +1,5 @@
-# Copy this file to /etc/systemd/system/david-backup.timer on the server.
-# Change OnCalendar if you want a different daily backup time.
+# Legacy template kept for reference.
+# Prefer ops/david/david-backup.timer for the active Lightsail deployment path.
 [Unit]
 Description=Run David backup job daily
 

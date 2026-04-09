@@ -1,5 +1,4 @@
 import asyncio
-import os
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Tuple
@@ -11,14 +10,11 @@ from orchestrator.confirmation_queue import get_pending_write, reject_write
 from orchestrator.trigger_scheduler import prompt_next_trigger
 from persistence.models import CalendarWriteStatus, SessionRecord, SessionStatus
 from reasoning.flash_client import generate_session_synthesis
+from runtime_paths import get_context_dir
 
 SESSION_INACTIVITY_TIMEOUT = timedelta(minutes=30)
 SESSION_TIMEOUT_JOB_PREFIX = "session_inactivity_timeout"
 SESSION_READY_MESSAGE = "Session synthesis is done. I'm ready for your next message."
-
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONTEXT_DIR = os.path.join(BASE_DIR, "context")
-DECISION_LOG_PATH = os.path.join(CONTEXT_DIR, "decision_log.md")
 
 # Keys in user_data that should be cleared on restart to avoid stale state issues. 
 # Cached calendar events are the main culprit since they can easily become out of sync with the real calendar state after a restart.
@@ -185,7 +181,9 @@ def reconcile_orphaned_sessions() -> int:
 
 def append_to_decision_log(content: str):
     """Appends synthesized session notes to the decision log."""
-    with open(DECISION_LOG_PATH, "a", encoding="utf-8") as f:
+    decision_log_path = get_context_dir() / "decision_log.md"
+    decision_log_path.parent.mkdir(parents=True, exist_ok=True)
+    with decision_log_path.open("a", encoding="utf-8") as f:
         f.write(f"\n\n{content.strip()}\n")
 
 def persist_decision(session_id: str, content: str):

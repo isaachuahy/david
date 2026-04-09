@@ -1,4 +1,3 @@
-import os
 import uuid
 from datetime import datetime
 from loguru import logger
@@ -8,6 +7,7 @@ from orchestrator.context_builder import build_context
 from integrations.calendar import get_past_events
 from persistence.database import get_db
 from reasoning.pro_client import generate_sunday_review, SundayReviewResponse
+from runtime_paths import get_context_dir
 
 def run_sunday_review(tg_context: ContextTypes.DEFAULT_TYPE = None) -> SundayReviewResponse:
     """
@@ -39,19 +39,18 @@ def execute_weekly_state_update(content: str) -> bool:
     This is a pure file I/O function.
     """
     try:
-        # Resolve context directory relative to the current file
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        context_dir = os.path.join(base_dir, "context")
-        weekly_state_path = os.path.join(context_dir, "weekly_state.md")
+        context_dir = get_context_dir()
+        context_dir.mkdir(parents=True, exist_ok=True)
+        weekly_state_path = context_dir / "weekly_state.md"
         
-        if os.path.exists(weekly_state_path):
+        if weekly_state_path.exists():
             backup_filename = f"weekly_state_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-            backup_path = os.path.join(context_dir, backup_filename)
-            with open(weekly_state_path, "r", encoding="utf-8") as src, open(backup_path, "w", encoding="utf-8") as dst:
+            backup_path = context_dir / backup_filename
+            with weekly_state_path.open("r", encoding="utf-8") as src, backup_path.open("w", encoding="utf-8") as dst:
                 dst.write(src.read())
             logger.info(f"Backed up weekly state to {backup_filename}")
                 
-        with open(weekly_state_path, "w", encoding="utf-8") as f:
+        with weekly_state_path.open("w", encoding="utf-8") as f:
             f.write(content)
 
         snapshot_id = f"wsnap_{uuid.uuid4().hex[:8]}"

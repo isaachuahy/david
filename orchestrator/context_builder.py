@@ -1,22 +1,18 @@
-import os
 from loguru import logger
 from integrations.calendar import get_upcoming_events
 from orchestrator.time_utils import calendar_event_sort_key
 from telegram.ext import ContextTypes
-
-# Resolve the absolute path to the context directory
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONTEXT_DIR = os.path.join(BASE_DIR, "context")
+from runtime_paths import get_context_dir
 
 def _read_file_safely(filename: str, fallback: str) -> str:
     """Reads a text file safely, returning a fallback if it fails or is missing."""
-    filepath = os.path.join(CONTEXT_DIR, filename)
-    if not os.path.exists(filepath):
+    filepath = get_context_dir() / filename
+    if not filepath.exists():
         logger.warning(f"Context file missing: {filepath}")
         return fallback
         
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
+        with filepath.open("r", encoding="utf-8") as f:
             content = f.read().strip()
             return content if content else fallback
     except Exception as e:

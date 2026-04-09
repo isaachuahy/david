@@ -2,7 +2,7 @@ from persistence.database import get_db, init_db
 
 
 def test_init_db_creates_expected_tables(tmp_path, monkeypatch):
-    monkeypatch.setattr("persistence.database.DB_PATH", str(tmp_path / "assistant.db"))
+    monkeypatch.setenv("DAVID_DB_PATH", str(tmp_path / "assistant.db"))
 
     init_db()
 

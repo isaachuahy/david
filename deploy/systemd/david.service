@@ -1,5 +1,5 @@
-# Copy this file to /etc/systemd/system/david.service on the server.
-# Review User, WorkingDirectory, and EnvironmentFile before enabling it.
+# Legacy template kept for reference.
+# Prefer ops/david/david.service for the active Lightsail deployment path.
 [Unit]
 Description=David Telegram assistant
 After=network-online.target

@@ -1,24 +1,36 @@
-import os
-from sqlite_utils import Database
-from loguru import logger
+from pathlib import Path
 
-# Resolve the absolute path to the data directory
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-DB_PATH = os.path.join(DATA_DIR, "assistant.db")
-TELEGRAM_PERSISTENCE_PATH = os.path.join(DATA_DIR, "telegram_state.pkl")
+from loguru import logger
+from sqlite_utils import Database
+
+from runtime_paths import (
+    get_db_path,
+    get_telegram_persistence_path as resolve_telegram_persistence_path,
+)
+
+
+def _ensure_parent_dir(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def get_telegram_persistence_path() -> Path:
+    path = resolve_telegram_persistence_path()
+    _ensure_parent_dir(path)
+    return path
+
 
 def get_db() -> Database:
     """Returns a connection to the SQLite database, ensuring the directory exists."""
-    if not os.path.exists(DATA_DIR):
-        os.makedirs(DATA_DIR)
-    return Database(DB_PATH)
+    db_path = get_db_path()
+    _ensure_parent_dir(db_path)
+    return Database(db_path)
+
 
 def init_db():
     """Initializes the database schema and creates necessary tables if they don't exist."""
     logger.info("Initializing database schema...")
     db = get_db()
-    
+
     # 1. Calendar Writes (Confirmation Queue)
     if "calendar_writes" not in db.table_names():
         db["calendar_writes"].create({
@@ -31,7 +43,7 @@ def init_db():
             "created_at": str
         }, pk="id")
         logger.info("Created table: calendar_writes")
-        
+
     # 2. Sessions
     if "sessions" not in db.table_names():
         db["sessions"].create({
@@ -62,6 +74,7 @@ def init_db():
         logger.info("Created table: weekly_snapshots")
 
     logger.info("Database initialization complete.")
+
 
 if __name__ == "__main__":
     init_db()

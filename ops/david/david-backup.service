@@ -1,0 +1,22 @@
+[Unit]
+Description=Run David backup scripts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=david
+Group=david
+EnvironmentFile=/etc/david/david.env
+WorkingDirectory=/opt/david
+UMask=0077
+
+# Keep the backup entrypoint explicit so failures are easy to debug.
+ExecStartPre=/usr/bin/test -x /opt/david/scripts/backup.sh
+ExecStart=/opt/david/scripts/backup.sh
+
+# Keep backup jobs bounded so systemd can track failures.
+TimeoutStartSec=30m
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=david-backup

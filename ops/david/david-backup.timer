@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic backups for David
+
+[Timer]
+OnBootSec=10m
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=5m
+Persistent=true
+Unit=david-backup.service
+
+[Install]
+WantedBy=timers.target

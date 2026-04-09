@@ -1,16 +1,19 @@
-from unittest.mock import mock_open, patch
+from unittest.mock import patch
 
 from orchestrator.review_manager import execute_weekly_state_update
 
 
 @patch("orchestrator.review_manager.get_db")
-@patch("orchestrator.review_manager.os.path.exists", return_value=True)
-@patch("builtins.open", new_callable=mock_open, read_data="# Previous Weekly State")
+@patch("orchestrator.review_manager.get_context_dir")
 def test_execute_weekly_state_update_persists_snapshot_and_writes_file(
-    mock_file,
-    mock_exists,
+    mock_get_context_dir,
     mock_get_db,
+    tmp_path,
 ):
+    mock_get_context_dir.return_value = tmp_path
+    weekly_state_path = tmp_path / "weekly_state.md"
+    weekly_state_path.write_text("# Previous Weekly State", encoding="utf-8")
+
     success = execute_weekly_state_update("# Updated Weekly State")
 
     assert success is True

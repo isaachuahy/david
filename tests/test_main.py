@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import main
 
 
+@patch("main.get_telegram_persistence_path", return_value=Path("/tmp/telegram_state.pkl"))
 @patch("main.PicklePersistence")
 @patch("main.PersistenceInput")
 @patch("main.setup_scheduler")
@@ -19,6 +20,7 @@ def test_main_initializes_db_and_reconciles_sessions_before_polling(
     mock_setup_scheduler,
     mock_persistence_input,
     mock_pickle_persistence,
+    mock_get_telegram_persistence_path,
 ):
     mock_load_config.return_value = MagicMock(
         telegram_bot_token="token",
@@ -49,7 +51,7 @@ def test_main_initializes_db_and_reconciles_sessions_before_polling(
         callback_data=False,
     )
     mock_pickle_persistence.assert_called_once_with(
-        filepath=main.TELEGRAM_PERSISTENCE_PATH,
+        filepath="/tmp/telegram_state.pkl",
         store_data=mock_persistence_input.return_value,
     )
     builder.token.assert_called_once_with("token")

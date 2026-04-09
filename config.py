@@ -4,14 +4,14 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from loguru import logger
+from runtime_paths import (
+    DEFAULT_DB_PATH,
+    get_google_credentials_path,
+    get_google_token_path,
+)
 
 
 load_dotenv()
-
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_DB_PATH = BASE_DIR / "data" / "assistant.db"
-DEFAULT_GOOGLE_TOKEN_PATH = BASE_DIR / "token.json"
-DEFAULT_GOOGLE_CREDENTIALS_PATH = BASE_DIR / "credentials.json"
 
 
 class ConfigError(ValueError):
@@ -104,11 +104,8 @@ def load_config() -> AppConfig:
     allowed_user_id = _load_allowed_user_id()
 
     db_path = _resolve_path("DAVID_DB_PATH", DEFAULT_DB_PATH)
-    google_token_path = _resolve_path("GOOGLE_TOKEN_PATH", DEFAULT_GOOGLE_TOKEN_PATH)
-    google_credentials_path = _resolve_path(
-        "GOOGLE_CREDENTIALS_PATH",
-        DEFAULT_GOOGLE_CREDENTIALS_PATH,
-    )
+    google_token_path = get_google_token_path()
+    google_credentials_path = get_google_credentials_path()
 
     _validate_google_auth_paths(google_token_path, google_credentials_path)
 

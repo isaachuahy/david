@@ -14,7 +14,7 @@ from orchestrator.session_manager import (
     invalidate_restart_volatile_user_data,
     reconcile_orphaned_sessions,
 )
-from persistence.database import TELEGRAM_PERSISTENCE_PATH, init_db
+from persistence.database import get_telegram_persistence_path, init_db
 from config import ConfigError, load_config
 from bot.handlers import (
     start, done_command, test_trigger, test_schedule,
@@ -34,7 +34,7 @@ def main() -> int:
     init_db()
     reconcile_orphaned_sessions()
     persistence = PicklePersistence(
-        filepath=TELEGRAM_PERSISTENCE_PATH,
+        filepath=str(get_telegram_persistence_path()),
         store_data=PersistenceInput(
             bot_data=False,
             chat_data=False,

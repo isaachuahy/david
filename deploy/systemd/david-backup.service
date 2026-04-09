@@ -1,5 +1,5 @@
-# Copy this file to /etc/systemd/system/david-backup.service on the server.
-# This is a one-shot job usually triggered by david-backup.timer.
+# Legacy template kept for reference.
+# Prefer ops/david/david-backup.service for the active Lightsail deployment path.
 [Unit]
 Description=David off-site backup job
 After=network-online.target
