@@ -347,6 +347,139 @@ If startup succeeds, David will:
 
 ---
 
+## Deployment guide (friendly version)
+
+If you just want a practical production setup, use the `systemd` assets in `ops/david/`. They are designed for a small single-user VPS (for example AWS Lightsail), and they keep code, secrets, and runtime data clearly separated.
+
+### Recommended production layout
+
+```text
+/opt/david/                  # repo checkout + .venv
+/etc/david/david.env         # production env vars
+/etc/david/credentials.json  # Google OAuth client JSON
+/var/lib/david/context/      # goals.md, weekly_state.md, decision_log.md
+/var/lib/david/assistant.db
+/var/lib/david/telegram_state.pkl
+/var/lib/david/token.json
+```
+
+Why this layout is helpful:
+- code stays in one place (`/opt/david`)
+- secrets stay outside the repo (`/etc/david`)
+- mutable runtime state is isolated (`/var/lib/david`)
+
+### Deploy in 7 straightforward steps
+
+1. **Install code and dependencies**
+   ```bash
+   git clone https://github.com/isaachuahy/david.git /opt/david
+   cd /opt/david
+   uv sync
+   ```
+
+2. **Install required system tools**
+   - `sqlite3`
+   - `rclone`
+
+3. **Install service units**
+   ```bash
+   cd /opt/david/ops/david
+   sudo ./install_lightsail_systemd.sh
+   ```
+
+4. **Create production env file**
+   ```bash
+   sudo cp /opt/david/ops/david/david.env.example /etc/david/david.env
+   sudoedit /etc/david/david.env
+   ```
+   At minimum, set:
+   - `TELEGRAM_BOT_TOKEN`
+   - `ALLOWED_USER_ID`
+   - `GEMINI_API_KEY`
+   - `GOOGLE_CREDENTIALS_PATH`
+   - `GOOGLE_TOKEN_PATH`
+   - `DAVID_DB_PATH`
+   - `DAVID_TELEGRAM_PERSISTENCE_PATH`
+   - `DAVID_CONTEXT_DIR`
+   - `DAVID_BACKUP_REMOTE`
+
+5. **Copy Google auth files**
+   - put OAuth client credentials at `/etc/david/credentials.json`
+   - place an existing `token.json` at `/var/lib/david/token.json` for fully headless startup
+
+6. **Copy your live context files**
+   - `goals.md`
+   - `weekly_state.md`
+   - `decision_log.md`
+
+7. **Start and verify**
+   ```bash
+   sudo systemctl start david.service
+   sudo systemctl status david.service
+   sudo journalctl -u david.service -f
+   ```
+
+For a deeper operational reference, see `DEPLOYMENT.md` and `ops/david/README.md`.
+
+---
+
+## Backups (what is saved, how it runs, how to restore)
+
+David includes a backup script at `scripts/backup.sh` and production `systemd` units (`david-backup.service` and `david-backup.timer`).
+
+### What the backup includes
+
+Each backup run creates and uploads a `.tar.gz` archive containing:
+- a consistent SQLite snapshot (`assistant.db`) via `sqlite3 .backup`
+- the full context directory (`goals.md`, `weekly_state.md`, `decision_log.md`, and related files)
+
+Backups are uploaded with `rclone` to your configured remote path.
+
+### Required backup environment variables
+
+- `DAVID_BACKUP_REMOTE` (required): remote destination, for example `b2:my-bucket/david`
+- `DAVID_BACKUP_HOST` (optional): host label in backup paths
+- `DAVID_BACKUP_TMPDIR` (optional): local temp staging dir (default `/tmp/david-backups`)
+- `DAVID_PROJECT_DIR` (optional): project root override
+- `DAVID_CONTEXT_DIR` (optional): context path override
+
+### Run a backup now (manual verification)
+
+```bash
+sudo systemctl start david-backup.service
+sudo journalctl -u david-backup.service -n 200
+```
+
+### Enable daily automatic backups
+
+```bash
+sudo systemctl start david-backup.timer
+sudo systemctl status david-backup.timer
+```
+
+The timer uses `Persistent=true`, so if the server is down during a scheduled time, the missed run is executed after the server comes back.
+
+### Simple restore checklist
+
+1. Download the desired archive from your `rclone` remote.
+2. Extract it to a safe temporary directory.
+3. Stop David before replacing live files:
+   ```bash
+   sudo systemctl stop david.service
+   ```
+4. Restore:
+   - `assistant.db` to your `DAVID_DB_PATH`
+   - extracted `context/` files to your `DAVID_CONTEXT_DIR`
+5. Ensure ownership/permissions are correct for the service user.
+6. Start David again:
+   ```bash
+   sudo systemctl start david.service
+   ```
+
+If you only need partial recovery (for example one context file), you can restore just that file without replacing the full DB.
+
+---
+
 ## How to use it directly
 
 Once the bot is running, message your Telegram bot.
@@ -432,11 +565,15 @@ David includes several pragmatic safeguards:
 - cache invalidation on restart
 
 ### Deployment
-The repo already hints at VPS-style deployment concerns:
+The repo includes first-class VPS deployment assets and a backup flow:
 
 - pre-generated `token.json` for headless calendar access
-- backup-related environment variables
+- `ops/david` systemd units for bot runtime and scheduled backups
+- `scripts/backup.sh` for SQLite + context backups via `rclone`
+- backup-related environment variables in `.env.example`
 - Langfuse and Sentry hooks for production visibility
+
+If you're deploying now, start with the "Deployment guide (friendly version)" and "Backups" sections above.
 
 ---
 
