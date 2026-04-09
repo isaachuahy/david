@@ -29,8 +29,7 @@ def _current_datetime_block() -> str:
     human_date = f"{now.strftime('%A')}, {now.strftime('%B')} {now.day}, {now.year}"
     return (
         f"Current local datetime: {now.isoformat()}\n"
-        f"Today is {human_date}.\n"
-        f"Current local time: {now.strftime('%I:%M %p %Z')}"
+        f"Today is {human_date}."
     )
 
 def _format_calendar_events(tg_context: ContextTypes.DEFAULT_TYPE = None, days: int = 7) -> str:

@@ -203,6 +203,7 @@ token.json
 # David Persistence Database
 data/*.db
 data/*.db-journal
+data/*.pkl
 
 # David Context Files
 context/*.md
