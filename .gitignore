@@ -211,3 +211,5 @@ context/*.md
 .DS_Store
 google_genai_reference.md
 Next Steps.md
+
+*.pem
