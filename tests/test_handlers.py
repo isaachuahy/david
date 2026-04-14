@@ -484,6 +484,7 @@ async def test_test_schedule_uses_calendar_proposal_helper(mock_send_calendar_pr
     assert kwargs["prefix_text"] == "I propose scheduling 'David UI Test Event' for the next 15 minutes. Does this look good?"
 
 @pytest.mark.asyncio
+@patch('bot.handlers.resolve_calendar_display_name')
 @patch('bot.handlers.track_confirmation_message')
 @patch('bot.handlers.build_calendar_confirmation_keyboard')
 @patch('bot.handlers.add_pending_write')
@@ -491,9 +492,11 @@ async def test_send_calendar_proposal_displays_toronto_time(
     mock_add_pending_write,
     mock_build_keyboard,
     mock_track_confirmation_message,
+    mock_resolve_calendar_display_name,
 ):
     mock_add_pending_write.return_value = "cw_123"
     mock_build_keyboard.return_value = "keyboard"
+    mock_resolve_calendar_display_name.return_value = "Team Calendar"
 
     context = MagicMock()
     context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=999))
@@ -506,7 +509,8 @@ async def test_send_calendar_proposal_displays_toronto_time(
             summary="Coffee Chat",
             start_time="2026-03-31T09:00:00-04:00",
             end_time="2026-03-31T09:30:00-04:00",
-            description="Catch-up downtown."
+            description="Catch-up downtown.",
+            calendar_id="team_calendar@example.com",
         ),
         prefix_text="Want me to schedule this?"
     )
@@ -514,6 +518,7 @@ async def test_send_calendar_proposal_displays_toronto_time(
     context.bot.send_message.assert_awaited_once()
     kwargs = context.bot.send_message.await_args.kwargs
     assert kwargs["chat_id"] == 456
+    assert "Calendar: Team Calendar (`team_calendar@example.com`)" in kwargs["text"]
     assert "Start: 2026-03-31 09:00 EDT" in kwargs["text"]
     assert "End: 2026-03-31 09:30 EDT" in kwargs["text"]
     assert "UTC" not in kwargs["text"]

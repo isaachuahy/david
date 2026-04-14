@@ -8,6 +8,7 @@ from telegram.ext import ContextTypes
 from orchestrator.router import process_message
 from orchestrator.confirmation_queue import add_pending_write, confirm_write, reject_write, get_pending_write
 from orchestrator.trigger_scheduler import queue_trigger, consume_trigger
+from integrations.calendar import resolve_calendar_display_name
 from orchestrator.session_manager import (
     start_session, end_session, reset_session_timeout, cancel_session_timeout, get_session_state,
     is_session_active, track_confirmation_message, get_tracked_confirmation_messages, 
@@ -87,11 +88,29 @@ async def send_calendar_proposal(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     start_dt = parse_user_datetime(action.start_time)
     end_dt = parse_user_datetime(action.end_time)
     
-    write_id = add_pending_write(action.summary, start_dt, end_dt, action.description)
+    write_id = add_pending_write(
+        action.summary,
+        start_dt,
+        end_dt,
+        action.description,
+        action.calendar_id,
+    )
     reply_markup = build_calendar_confirmation_keyboard(write_id)
     
+    calendar_name = await asyncio.to_thread(resolve_calendar_display_name, action.calendar_id)
+    calendar_line = (
+        f"Calendar: {calendar_name} (`{action.calendar_id}`)"
+        if calendar_name != action.calendar_id
+        else f"Calendar ID: `{action.calendar_id}`"
+    )
+
     full_text = f"{prefix_text}\n\n" if prefix_text else ""
-    full_text += f"🗓️ *Proposed Event:*\n*{action.summary}*\n_{action.description}_\n\nStart: {format_user_datetime(start_dt)}\nEnd: {format_user_datetime(end_dt)}"
+    full_text += (
+        f"🗓️ *Proposed Event:*\n*{action.summary}*\n_{action.description}_\n\n"
+        f"{calendar_line}\n"
+        f"Start: {format_user_datetime(start_dt)}\n"
+        f"End: {format_user_datetime(end_dt)}"
+    )
     
     message = await context.bot.send_message(
         chat_id=chat_id,
