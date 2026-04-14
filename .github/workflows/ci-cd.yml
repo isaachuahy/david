@@ -35,6 +35,33 @@ jobs:
       - name: Run tests
         run: uv run pytest -q
 
+  integration-test:
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Run cross-layer integration tests
+        run: >
+          uv run pytest -q
+          tests/test_main.py
+          tests/test_handlers.py
+          tests/test_router.py
+          tests/test_confirmation_queue.py
+          tests/test_context_builder.py
+
   deploy:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: test
