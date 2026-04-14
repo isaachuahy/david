@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  unit-test:
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
@@ -36,7 +36,6 @@ jobs:
         run: uv run pytest -q
 
   integration-test:
-    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
@@ -64,7 +63,9 @@ jobs:
 
   deploy:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-    needs: test
+    needs:
+      - unit-test
+      - integration-test
     runs-on: ubuntu-latest
     steps:
       - name: Deploy to Lightsail over SSH
