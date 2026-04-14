@@ -66,6 +66,7 @@ jobs:
     needs:
       - unit-test
       - integration-test
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - name: Deploy to Lightsail over SSH
@@ -75,14 +76,32 @@ jobs:
           username: ${{ secrets.LIGHTSAIL_USER }}
           key: ${{ secrets.LIGHTSAIL_SSH_KEY }}
           script_stop: true
+          command_timeout: 30m
           script: |
             set -euo pipefail
             export PATH="$HOME/.local/bin:$PATH"
             cd /opt/david
-            git pull --ff-only origin main
+            git fetch origin main
+            git reset --hard origin/main
             uv sync
-            sudo /opt/david/ops/david/install_lightsail_systemd.sh
-            sudo systemctl daemon-reload
+            # Bootstrap-only: install units if this is a fresh server.
+            if [ ! -f /etc/systemd/system/david.service ]; then
+              sudo /opt/david/ops/david/install_lightsail_systemd.sh
+              sudo systemctl daemon-reload
+            fi
+
             sudo systemctl restart david.service
             sudo systemctl start david-backup.timer
-            sudo systemctl is-active david.service
+            for i in {1..12}; do
+              if sudo systemctl is-active --quiet david.service; then
+                echo "david.service is active"
+                exit 0
+              fi
+              echo "waiting for david.service to become active ($i/12)"
+              sleep 5
+            done
+
+            echo "david.service failed to stabilize"
+            sudo systemctl status david.service --no-pager -l || true
+            sudo journalctl -u david.service -n 200 --no-pager || true
+            exit 1
