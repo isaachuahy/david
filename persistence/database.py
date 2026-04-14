@@ -50,7 +50,7 @@ def init_db():
         table = db["calendar_writes"]
         existing_columns = {column.name for column in table.columns}
         if "calendar_id" not in existing_columns:
-            table.add_column("calendar_id", str, default="primary")
+            table.add_column("calendar_id", str, not_null_default="primary")
             logger.info("Added column calendar_writes.calendar_id")
         if "created_event_id" not in existing_columns:
             table.add_column("created_event_id", str)
