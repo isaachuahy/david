@@ -13,7 +13,13 @@ from persistence.models import CalendarWriteRecord, CalendarWriteStatus
 # The user can then confirm or reject these pending writes through the Telegram bot interface, which will call the confirm_write or reject_write functions.
 # Confirmation queue is necessary to ensure that David does not make any calendar changes without explicit user approval, adding a layer of safety and control.
 
-def add_pending_write(summary: str, start_time: datetime, end_time: datetime, description: str = "") -> str:
+def add_pending_write(
+    summary: str,
+    start_time: datetime,
+    end_time: datetime,
+    description: str = "",
+    calendar_id: str = "primary",
+) -> str:
     """
     Adds a proposed calendar write to the database and returns its unique ID.
     """
@@ -27,6 +33,7 @@ def add_pending_write(summary: str, start_time: datetime, end_time: datetime, de
         start_time=start_time.isoformat(),
         end_time=end_time.isoformat(),
         description=description,
+        calendar_id=calendar_id,
         status=CalendarWriteStatus.PENDING,
         created_at=now_iso
     )
@@ -76,11 +83,19 @@ def confirm_write(write_id: str) -> Optional[dict]:
         summary=record.summary,
         start_time=start_dt,
         end_time=end_dt,
-        description=record.description
+        description=record.description,
+        calendar_id=record.calendar_id,
     )
     
     if created_event:
-        db["calendar_writes"].update(write_id, {"status": CalendarWriteStatus.EXECUTED.value})  # type: ignore
+        db["calendar_writes"].update(
+            write_id,
+            {
+                "status": CalendarWriteStatus.EXECUTED.value,
+                "created_event_id": created_event.get("id"),
+                "created_event_calendar_id": created_event.get("calendar_id", record.calendar_id),
+            },
+        )  # type: ignore
         logger.success(f"Successfully executed write {write_id} to Google Calendar.")
         # Return created_event for caching within same session
         return created_event

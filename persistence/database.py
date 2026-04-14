@@ -39,10 +39,25 @@ def init_db():
             "start_time": str,  # ISO format
             "end_time": str,    # ISO format
             "description": str,
+            "calendar_id": str,
             "status": str,      # pending, confirmed, rejected, executed
-            "created_at": str
+            "created_at": str,
+            "created_event_id": str,
+            "created_event_calendar_id": str,
         }, pk="id")
         logger.info("Created table: calendar_writes")
+    else:
+        table = db["calendar_writes"]
+        existing_columns = {column.name for column in table.columns}
+        if "calendar_id" not in existing_columns:
+            table.add_column("calendar_id", str, default="primary")
+            logger.info("Added column calendar_writes.calendar_id")
+        if "created_event_id" not in existing_columns:
+            table.add_column("created_event_id", str)
+            logger.info("Added column calendar_writes.created_event_id")
+        if "created_event_calendar_id" not in existing_columns:
+            table.add_column("created_event_calendar_id", str)
+            logger.info("Added column calendar_writes.created_event_calendar_id")
 
     # 2. Sessions
     if "sessions" not in db.table_names():

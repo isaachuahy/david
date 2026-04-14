@@ -21,8 +21,11 @@ class CalendarWriteRecord(BaseModel):
     start_time: str
     end_time: str
     description: str
+    calendar_id: str = "primary"
     status: CalendarWriteStatus
     created_at: str
+    created_event_id: Optional[str] = None
+    created_event_calendar_id: Optional[str] = None
 
 class SessionRecord(BaseModel):
     id: str
