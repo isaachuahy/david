@@ -5,6 +5,7 @@ from integrations.calendar import (
     get_past_events,
     get_upcoming_events,
     insert_event,
+    resolve_calendar_reference,
     resolve_calendar_display_name,
 )
 
@@ -111,3 +112,51 @@ def test_resolve_calendar_display_name_returns_summary_for_known_calendar(mock_g
 
 def test_resolve_calendar_display_name_primary_is_human_readable():
     assert resolve_calendar_display_name("primary") == "Primary"
+
+
+@patch("integrations.calendar.get_calendar_service")
+def test_resolve_calendar_reference_accepts_exact_calendar_id(mock_get_calendar_service):
+    mock_service = MagicMock()
+    mock_get_calendar_service.return_value = mock_service
+    mock_service.calendarList.return_value.list.return_value.execute.return_value = {
+        "items": [{"id": "team_calendar@example.com", "summary": "Team Calendar"}]
+    }
+
+    resolved = resolve_calendar_reference("team_calendar@example.com")
+
+    assert resolved == {
+        "calendar_id": "team_calendar@example.com",
+        "calendar_display_name": "Team Calendar",
+    }
+
+
+@patch("integrations.calendar.get_calendar_service")
+def test_resolve_calendar_reference_matches_calendar_summary(mock_get_calendar_service):
+    mock_service = MagicMock()
+    mock_get_calendar_service.return_value = mock_service
+    mock_service.calendarList.return_value.list.return_value.execute.return_value = {
+        "items": [{"id": "ent_calendar@example.com", "summary": "Entertainment"}]
+    }
+
+    resolved = resolve_calendar_reference("Entertainment")
+
+    assert resolved == {
+        "calendar_id": "ent_calendar@example.com",
+        "calendar_display_name": "Entertainment",
+    }
+
+
+@patch("integrations.calendar.get_calendar_service")
+def test_resolve_calendar_reference_matches_calendar_phrase(mock_get_calendar_service):
+    mock_service = MagicMock()
+    mock_get_calendar_service.return_value = mock_service
+    mock_service.calendarList.return_value.list.return_value.execute.return_value = {
+        "items": [{"id": "ent_calendar@example.com", "summary": "Entertainment"}]
+    }
+
+    resolved = resolve_calendar_reference("entertainment calendar")
+
+    assert resolved == {
+        "calendar_id": "ent_calendar@example.com",
+        "calendar_display_name": "Entertainment",
+    }

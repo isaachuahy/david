@@ -3,16 +3,22 @@ from unittest.mock import patch, MagicMock
 
 from orchestrator.context_builder import build_context, _format_calendar_events
 
+@patch("orchestrator.context_builder.resolve_calendar_display_name")
 @patch("orchestrator.context_builder.get_upcoming_events")
-def test_format_calendar_events_cache_miss(mock_get_events):
+def test_format_calendar_events_cache_miss(mock_get_events, mock_resolve_calendar_display_name):
     """
     Tests the cache-miss scenario: on the first call, it should hit the API
     and populate the cache.
     """
     # Arrange
     # We only mock summary and start time for simplicity, but in reality these would be more complex event objects.
-    mock_events = [{"summary": "API Event", "start": {"dateTime": "2023-01-01T10:00:00Z"}}]
+    mock_events = [{
+        "summary": "API Event",
+        "start": {"dateTime": "2023-01-01T10:00:00Z"},
+        "calendar_id": "team_calendar@example.com",
+    }]
     mock_get_events.return_value = mock_events
+    mock_resolve_calendar_display_name.return_value = "Team Calendar"
     
     tg_context = MagicMock()
     tg_context.user_data = {} # Empty cache
@@ -24,18 +30,29 @@ def test_format_calendar_events_cache_miss(mock_get_events):
     mock_get_events.assert_called_once()
     assert tg_context.user_data['cached_events'] == mock_events
     assert "API Event" in result
+    assert "Calendar: Team Calendar; calendar_id: team_calendar@example.com" in result
 
+@patch("orchestrator.context_builder.resolve_calendar_display_name")
 @patch("orchestrator.context_builder.get_upcoming_events")
-def test_format_calendar_events_cache_hit(mock_get_events):
+def test_format_calendar_events_cache_hit(mock_get_events, mock_resolve_calendar_display_name):
     """
     Tests the cache-hit scenario: on subsequent calls, it should use the
     cached data and not hit the API.
     """
     # Arrange
     cached_events = [
-        {"summary": "Later Event", "start": {"dateTime": "2023-01-01T11:00:00Z"}},
-        {"summary": "Earlier Event", "start": {"dateTime": "2023-01-01T09:00:00Z"}},
+        {
+            "summary": "Later Event",
+            "start": {"dateTime": "2023-01-01T11:00:00Z"},
+            "calendar_id": "team_calendar@example.com",
+        },
+        {
+            "summary": "Earlier Event",
+            "start": {"dateTime": "2023-01-01T09:00:00Z"},
+            "calendar_id": "team_calendar@example.com",
+        },
     ]
+    mock_resolve_calendar_display_name.return_value = "Team Calendar"
     
     tg_context = MagicMock()
     tg_context.user_data = {'cached_events': cached_events}
@@ -46,6 +63,7 @@ def test_format_calendar_events_cache_hit(mock_get_events):
     # Assert
     mock_get_events.assert_not_called()
     assert result.index("Earlier Event") < result.index("Later Event")
+    assert "Calendar: Team Calendar; calendar_id: team_calendar@example.com" in result
     assert tg_context.user_data["cached_events"][0]["summary"] == "Earlier Event"
 
 def test_format_calendar_events_no_events():

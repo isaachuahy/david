@@ -8,7 +8,7 @@ from telegram.ext import ContextTypes
 from orchestrator.router import process_message
 from orchestrator.confirmation_queue import add_pending_write, confirm_write, reject_write, get_pending_write
 from orchestrator.trigger_scheduler import queue_trigger, consume_trigger
-from integrations.calendar import resolve_calendar_display_name
+from integrations.calendar import resolve_calendar_reference
 from orchestrator.session_manager import (
     start_session, end_session, reset_session_timeout, cancel_session_timeout, get_session_state,
     is_session_active, track_confirmation_message, get_tracked_confirmation_messages, 
@@ -83,8 +83,20 @@ def clear_weekly_review_event_queue(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_calendar_proposal(context: ContextTypes.DEFAULT_TYPE, chat_id: int, action, prefix_text: str = "") -> str:
-    """Helper to process a calendar action, queue it, and send the Telegram confirmation UI."""
+    """
+    Resolves calendar metadata once, then queues and presents a proposal.
+
+    This keeps the Google Calendar ID authoritative for the rest of the flow
+    while still surfacing a human-readable calendar name in the confirmation UI.
+    """
     # Used both for ad-hoc calendar proposals from the LLM and for proposed events generated during the Sunday Review process.
+    resolved_calendar = await asyncio.to_thread(
+        resolve_calendar_reference,
+        action.requested_calendar_text,
+    )
+    action.calendar_id = resolved_calendar["calendar_id"]
+    action.calendar_display_name = resolved_calendar["calendar_display_name"]
+
     start_dt = parse_user_datetime(action.start_time)
     end_dt = parse_user_datetime(action.end_time)
     
@@ -97,10 +109,9 @@ async def send_calendar_proposal(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     )
     reply_markup = build_calendar_confirmation_keyboard(write_id)
     
-    calendar_name = await asyncio.to_thread(resolve_calendar_display_name, action.calendar_id)
     calendar_line = (
-        f"Calendar: {calendar_name} (`{action.calendar_id}`)"
-        if calendar_name != action.calendar_id
+        f"Calendar: {action.calendar_display_name} (`{action.calendar_id}`)"
+        if action.calendar_display_name != action.calendar_id
         else f"Calendar ID: `{action.calendar_id}`"
     )
 

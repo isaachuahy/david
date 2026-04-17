@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from loguru import logger
-from integrations.calendar import get_upcoming_events
+from integrations.calendar import get_upcoming_events, resolve_calendar_display_name
 from orchestrator.time_utils import calendar_event_sort_key
 from telegram.ext import ContextTypes
 from runtime_paths import get_context_dir
@@ -35,6 +35,7 @@ def _current_datetime_block() -> str:
 def _format_calendar_events(tg_context: ContextTypes.DEFAULT_TYPE = None, days: int = 7) -> str:
     """Fetches and formats upcoming calendar events, utilizing a session cache if available."""
     events = None
+    calendar_name_cache: dict[str, str] = {}
 
     # tg_context is a cache for calendar events to avoid hitting the API on every message. 
     # This is for each user session, and needs to be maintained within the same session.
@@ -58,7 +59,18 @@ def _format_calendar_events(tg_context: ContextTypes.DEFAULT_TYPE = None, days: 
     for event in events:
         start = event['start'].get('dateTime', event['start'].get('date'))
         summary = event.get('summary', 'Busy / No Title')
-        lines.append(f"- [{start}] {summary}")
+        calendar_id = event.get("calendar_id", "primary")
+
+        # Keep the canonical calendar ID visible in model context so later
+        # scheduling proposals can anchor to a real Google Calendar target.
+        if calendar_id not in calendar_name_cache:
+            calendar_name_cache[calendar_id] = resolve_calendar_display_name(calendar_id)
+
+        calendar_display_name = calendar_name_cache[calendar_id]
+        lines.append(
+            f"- [{start}] {summary} "
+            f"(Calendar: {calendar_display_name}; calendar_id: {calendar_id})"
+        )
         
     return "\n".join(lines)
 

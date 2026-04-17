@@ -20,6 +20,106 @@ def get_calendar_service():
         logger.error(f"Failed to build Calendar service: {e}")
         raise
 
+def _normalize_calendar_reference(value: str) -> str:
+    """
+    Normalizes a calendar reference for deterministic matching.
+
+    This keeps matching simple and readable while still handling natural
+    phrases like "entertainment calendar" in addition to plain names.
+    """
+    normalized = " ".join(value.strip().lower().split())
+    if normalized.endswith(" calendar"):
+        normalized = normalized[: -len(" calendar")].strip()
+    return normalized
+
+def _build_calendar_match_keys(calendar: dict) -> set[str]:
+    """
+    Builds the set of normalized lookup keys for a single calendar entry.
+
+    The ID remains authoritative, but the summary is included so application
+    code can deterministically resolve user-facing references into that ID.
+    """
+    calendar_id = calendar.get("id", "").strip()
+    summary = calendar.get("summary", calendar_id).strip()
+
+    raw_keys = {calendar_id, summary}
+    if summary:
+        raw_keys.add(f"{summary} calendar")
+
+    return {
+        _normalize_calendar_reference(key)
+        for key in raw_keys
+        if key.strip()
+    }
+
+def resolve_calendar_reference(requested_calendar_text: str) -> dict:
+    """
+    Resolves a human-facing calendar reference into canonical calendar metadata.
+
+    This is the single deterministic boundary where natural language such as
+    "entertainment calendar" becomes the authoritative `calendar_id` that will
+    be carried through storage, session state, and Google Calendar writes.
+    """
+    raw_reference = requested_calendar_text.strip() or "primary"
+    normalized_reference = _normalize_calendar_reference(raw_reference)
+
+    if normalized_reference == "primary":
+        return {
+            "calendar_id": "primary",
+            "calendar_display_name": "Primary",
+        }
+
+    service = get_calendar_service()
+    try:
+        calendar_list = service.calendarList().list().execute()
+        calendars = calendar_list.get("items", [])
+
+        # Exact ID match wins immediately because calendar IDs are canonical.
+        for calendar in calendars:
+            calendar_id = calendar.get("id", "").strip()
+            if calendar_id == raw_reference:
+                return {
+                    "calendar_id": calendar_id,
+                    "calendar_display_name": calendar.get("summary", calendar_id),
+                }
+
+        matches = [
+            calendar
+            for calendar in calendars
+            if normalized_reference in _build_calendar_match_keys(calendar)
+        ]
+
+        if len(matches) == 1:
+            match = matches[0]
+            calendar_id = match.get("id", "").strip()
+            return {
+                "calendar_id": calendar_id,
+                "calendar_display_name": match.get("summary", calendar_id),
+            }
+
+        if len(matches) > 1:
+            matching_names = [calendar.get("summary", calendar.get("id", "")) for calendar in matches]
+            logger.error(
+                f"Ambiguous calendar reference '{requested_calendar_text}'. "
+                f"Matching calendars: {matching_names}"
+            )
+            raise ValueError(
+                f"Ambiguous calendar reference '{requested_calendar_text}'. "
+                "Please use a more specific calendar name."
+            )
+
+        logger.error(
+            f"Unknown calendar reference '{requested_calendar_text}'. "
+            "No matching Google Calendar ID was found."
+        )
+        raise ValueError(
+            f"Unknown calendar reference '{requested_calendar_text}'. "
+            "No matching Google Calendar ID was found."
+        )
+    except HttpError as error:
+        logger.error(f"Could not resolve calendar reference '{requested_calendar_text}': {error}")
+        raise
+
 def resolve_calendar_display_name(calendar_id: str) -> str:
     """
     Returns a human-friendly calendar name for a calendar ID.
