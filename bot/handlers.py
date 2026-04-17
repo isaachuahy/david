@@ -25,6 +25,10 @@ WEEKLY_REVIEW_TOTAL_EVENTS_KEY = "weekly_review_total_events"
 WEEKLY_REVIEW_PROCESSED_EVENTS_KEY = "weekly_review_processed_events"
 WEEKLY_REVIEW_CURRENT_WRITE_ID_KEY = "weekly_review_current_write_id"
 UNAUTHORIZED_CALLBACK_TEXT = "This action is not available."
+CALENDAR_AUTH_ERROR_TEXT = (
+    "Google Calendar is currently unavailable because the saved Google authorization "
+    "has expired or was revoked. Please refresh the server's calendar token and try again."
+)
 
 
 async def _is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -56,6 +60,37 @@ async def _is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     logger.warning(f"Dropped unauthorized update from Telegram user {user.id}.")
     if update.callback_query:
         await update.callback_query.answer(UNAUTHORIZED_CALLBACK_TEXT, show_alert=True)
+    return False
+
+
+def _is_calendar_auth_error(error: Exception) -> bool:
+    """
+    Detects calendar OAuth failures that should be surfaced to the user directly.
+
+    The bigger picture here is graceful degradation: when Google Calendar auth
+    breaks on a headless Lightsail instance, David should explain the operational
+    issue instead of replying with a generic failure message.
+    """
+    auth_error_markers = (
+        "invalid_grant",
+        "token has been expired or revoked",
+        "could not locate runnable browser",
+        "oauth credentials not found",
+        "failed to refresh token",
+    )
+
+    current_error: Exception | None = error
+    while current_error is not None:
+        message = str(current_error).lower()
+
+        # We walk the exception chain because calendar auth failures may be
+        # wrapped by higher-level orchestration errors before reaching the
+        # Telegram handler boundary where we decide what the user should see.
+        if any(marker in message for marker in auth_error_markers):
+            return True
+
+        current_error = current_error.__cause__ or current_error.__context__
+
     return False
 
 
@@ -446,4 +481,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(response.message)
     except Exception as e:
         logger.error(f"Error handling message: {e}")
+        if _is_calendar_auth_error(e):
+            await update.message.reply_text(CALENDAR_AUTH_ERROR_TEXT)
+            return
+
         await update.message.reply_text("Sorry, I encountered an error. Please check the logs.")
