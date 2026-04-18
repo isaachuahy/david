@@ -4,6 +4,7 @@ from typing import Optional
 from pydantic import BaseModel, Field
 from google import genai
 from loguru import logger
+from observability.sentry import capture_exception as capture_sentry_exception
 
 from reasoning.parser import parse_model_response
 from reasoning.schemas import ProposedEvent
@@ -34,6 +35,11 @@ def _read_prompt_template(prompt_filename: str) -> str:
             return f.read().strip()
     except Exception as e:
         logger.error(f"Failed to read {prompt_filename}: {e}")
+        capture_sentry_exception(
+            e,
+            component="gemini_flash",
+            operation=f"read_prompt:{prompt_filename}",
+        )
         raise
 
 def _format_chat_history(chat_history: list[dict]) -> str:
@@ -78,13 +84,23 @@ def generate_flash_response(user_message: str, context_block: str, chat_history:
     if thinking_level:
         generation_config['thinking_config'] = {'thinking_level': thinking_level}
 
-    response = client.models.generate_content(
-        model='gemini-3-flash-preview',
-        contents=prompt,
-        config=generation_config
-    )
-    
-    return parse_model_response(response, FlashResponse)
+    try:
+        response = client.models.generate_content(
+            model='gemini-3-flash-preview',
+            contents=prompt,
+            config=generation_config
+        )
+    except Exception as e:
+        logger.error(f"Gemini Flash request failed: {e}")
+        capture_sentry_exception(e, component="gemini_flash", operation="generate_flash_response")
+        raise
+
+    try:
+        return parse_model_response(response, FlashResponse)
+    except Exception as e:
+        logger.error(f"Gemini Flash response parsing failed: {e}")
+        capture_sentry_exception(e, component="gemini_flash", operation="parse_flash_response")
+        raise
 
 def generate_session_synthesis(chat_history: list[dict], session_date: str) -> SessionSynthesisResponse:
     """
@@ -100,17 +116,29 @@ def generate_session_synthesis(chat_history: list[dict], session_date: str) -> S
         session_date=session_date
     )
 
-    response = client.models.generate_content(
-        model='gemini-3-flash-preview',
-        contents=prompt,
-        config={
-            'temperature': 1.0,
-            'thinking_config': {'thinking_level': 'high'}
-        }
-    )
+    try:
+        response = client.models.generate_content(
+            model='gemini-3-flash-preview',
+            contents=prompt,
+            config={
+                'temperature': 1.0,
+                'thinking_config': {'thinking_level': 'high'}
+            }
+        )
+    except Exception as e:
+        logger.error(f"Gemini Flash session synthesis request failed: {e}")
+        capture_sentry_exception(e, component="gemini_flash", operation="generate_session_synthesis")
+        raise
 
     content = response.text.strip()
     if not content:
-        raise ValueError("Gemini Flash returned an empty session synthesis response.")
+        empty_response_error = ValueError("Gemini Flash returned an empty session synthesis response.")
+        logger.error(str(empty_response_error))
+        capture_sentry_exception(
+            empty_response_error,
+            component="gemini_flash",
+            operation="empty_session_synthesis",
+        )
+        raise empty_response_error
 
     return SessionSynthesisResponse(content=content)

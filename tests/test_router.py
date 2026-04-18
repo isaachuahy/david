@@ -87,9 +87,46 @@ async def test_process_message_thinking_levels(
     assert kwargs["thinking_level"] == expected_level
 
 @pytest.mark.asyncio
+@patch("orchestrator.router.capture_sentry_exception")
 @patch("orchestrator.router.build_context", side_effect=Exception("Mocked error"))
-async def test_process_message_error(mock_build_context):
+async def test_process_message_error(mock_build_context, mock_capture_exception):
     context = MagicMock()
+
     with pytest.raises(Exception, match="Mocked error"):
         await process_message("Any user message", context)
+
     mock_build_context.assert_called_once_with(context)
+    error = mock_capture_exception.call_args.args[0]
+    assert "Mocked error" in str(error)
+    mock_capture_exception.assert_called_once_with(
+        error,
+        component="router",
+        operation="process_message",
+        tags=None,
+    )
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.router.capture_sentry_exception")
+@patch("orchestrator.router.classify_intent", return_value=MessageIntent.BRAINSTORM)
+@patch("orchestrator.router.generate_flash_response", side_effect=RuntimeError("Gemini failed"))
+@patch("orchestrator.router.get_chat_history", return_value=[])
+@patch("orchestrator.router.build_context", return_value="<CONTEXT>")
+async def test_process_message_error_reports_intent_tag(
+    mock_build_context,
+    mock_get_chat_history,
+    mock_generate_flash_response,
+    mock_classify_intent,
+    mock_capture_exception,
+):
+    context = MagicMock()
+
+    with pytest.raises(RuntimeError, match="Gemini failed"):
+        await process_message("let's brainstorm", context)
+
+    mock_capture_exception.assert_called_once_with(
+        mock_generate_flash_response.side_effect,
+        component="router",
+        operation="process_message",
+        tags={"intent": "brainstorm"},
+    )

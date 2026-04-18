@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 from loguru import logger
 from telegram.ext import Application, ContextTypes
 
+from observability.sentry import capture_exception as capture_sentry_exception
 from persistence.database import get_db
 from orchestrator.confirmation_queue import get_pending_write, reject_write
 from orchestrator.trigger_scheduler import prompt_next_trigger
@@ -202,6 +203,12 @@ def persist_decision(session_id: str, content: str):
         logger.success(f"Persisted decision {decision_id} for session {session_id}.")
     except Exception as e:
         logger.error(f"Failed to persist decision for session {session_id}: {e}")
+        capture_sentry_exception(
+            e,
+            component="session_manager",
+            operation="persist_decision",
+            tags={"session_id": session_id},
+        )
         raise
 
 async def cancel_pending_writes(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
@@ -220,6 +227,11 @@ async def cancel_pending_writes(context: ContextTypes.DEFAULT_TYPE, chat_id: int
                 )
             except Exception as e:
                 logger.error(f"Failed to update cancelled proposal UI for {write_id}: {e}")
+                capture_sentry_exception(
+                    e,
+                    component="session_manager",
+                    operation="cancel_pending_writes",
+                )
     clear_tracked_confirmation_messages(context)
 
 async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
@@ -246,6 +258,12 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Skipping synthesis for session {session_id}: no chat history found.")
     except Exception as e:
         logger.error(f"Failed to synthesize session {session_id}: {e}")
+        capture_sentry_exception(
+            e,
+            component="session_manager",
+            operation="execute_synthesis_task",
+            tags={"session_id": session_id} if session_id is not None else None,
+        )
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -253,6 +271,12 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as notify_error:
             logger.error(f"Failed to send synthesis failure message: {notify_error}")
+            capture_sentry_exception(
+                notify_error,
+                component="session_manager",
+                operation="notify_synthesis_failure",
+                tags={"session_id": session_id} if session_id is not None else None,
+            )
     finally:
         # Finalise transition to IDLE even if synthesis fails.
         # Clear both short-term chat state and the per-session calendar cache
@@ -265,6 +289,12 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
                 logger.info(f"Marked session {session_id} as COMPLETED after synthesis finalization.")
             except Exception as e:
                 logger.error(f"Failed to mark session {session_id} as COMPLETED: {e}")
+                capture_sentry_exception(
+                    e,
+                    component="session_manager",
+                    operation="mark_session_completed",
+                    tags={"session_id": session_id},
+                )
 
         user_data = _user_data(context)
         user_data['chat_history'] = []
@@ -276,6 +306,12 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
             await prompt_next_trigger(context, chat_id)
         except Exception as e:
             logger.error(f"Failed to evaluate the trigger queue after session {session_id}: {e}")
+            capture_sentry_exception(
+                e,
+                component="session_manager",
+                operation="prompt_next_trigger_after_session",
+                tags={"session_id": session_id} if session_id is not None else None,
+            )
 
         logger.info(f"Session {session_id} synthesis finalization complete. Ready for new messages.")
         try:
@@ -285,6 +321,12 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logger.error(f"Failed to send ready-for-next-message prompt for session {session_id}: {e}")
+            capture_sentry_exception(
+                e,
+                component="session_manager",
+                operation="send_session_ready_message",
+                tags={"session_id": session_id} if session_id is not None else None,
+            )
 
 async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: str = "done", user_id: Optional[int] = None):
     """Ends the active session, clears short-term memory, and checks for pending triggers."""
@@ -310,6 +352,12 @@ async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: 
         await context.bot.send_message(chat_id=chat_id, text=text)
     except Exception as e:
         logger.error(f"Failed to send session close message: {e}")
+        capture_sentry_exception(
+            e,
+            component="session_manager",
+            operation="send_session_close_message",
+            tags={"session_id": session_id} if session_id is not None else None,
+        )
 
     await cancel_pending_writes(context, chat_id)
 

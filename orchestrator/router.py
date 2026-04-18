@@ -3,6 +3,7 @@ from enum import Enum
 from loguru import logger
 from telegram.ext import ContextTypes
 
+from observability.sentry import capture_exception as capture_sentry_exception
 from orchestrator.context_builder import build_context
 from reasoning.flash_client import generate_flash_response, FlashResponse
 from orchestrator.session_manager import get_chat_history, append_chat_history
@@ -39,6 +40,7 @@ def classify_intent(text: str) -> MessageIntent:
 
 async def process_message(text: str, context: ContextTypes.DEFAULT_TYPE) -> FlashResponse:
     """Processes an incoming text message, handles model routing, and updates history."""
+    intent = None
     try:
         context_block = await asyncio.to_thread(build_context, context)
         chat_history = get_chat_history(context)
@@ -62,4 +64,10 @@ async def process_message(text: str, context: ContextTypes.DEFAULT_TYPE) -> Flas
         return flash_response
     except Exception as e:
         logger.error(f"Error during reasoning loop: {e}")
+        capture_sentry_exception(
+            e,
+            component="router",
+            operation="process_message",
+            tags={"intent": intent.value} if intent is not None else None,
+        )
         raise

@@ -4,6 +4,7 @@ from string import Template
 from pydantic import BaseModel, Field
 from google import genai
 from loguru import logger
+from observability.sentry import capture_exception as capture_sentry_exception
 
 from reasoning.parser import parse_model_response
 from reasoning.schemas import ProposedEvent
@@ -31,6 +32,11 @@ def generate_sunday_review(context_block: str, past_events_block: str) -> Sunday
             template = Template(f.read())
     except Exception as e:
         logger.error(f"Failed to read sunday_review.txt: {e}")
+        capture_sentry_exception(
+            e,
+            component="gemini_pro",
+            operation="read_prompt:sunday_review.txt",
+        )
         raise
 
     # Template is designed with placeholders $context_block and $past_events_block for dynamic content injection
@@ -42,14 +48,24 @@ def generate_sunday_review(context_block: str, past_events_block: str) -> Sunday
     
     client = genai.Client()
     
-    response = client.models.generate_content(
-        model='gemini-3-pro-preview',
-        contents=prompt,
-        config={
-            'response_mime_type': 'application/json',
-            'response_schema': SundayReviewResponse,
-            'temperature': 1.0 # Google recommends temperature of 1.0
-        }
-    )
-    
-    return parse_model_response(response, SundayReviewResponse)
+    try:
+        response = client.models.generate_content(
+            model='gemini-3-pro-preview',
+            contents=prompt,
+            config={
+                'response_mime_type': 'application/json',
+                'response_schema': SundayReviewResponse,
+                'temperature': 1.0 # Google recommends temperature of 1.0
+            }
+        )
+    except Exception as e:
+        logger.error(f"Gemini Pro Sunday review request failed: {e}")
+        capture_sentry_exception(e, component="gemini_pro", operation="generate_sunday_review")
+        raise
+
+    try:
+        return parse_model_response(response, SundayReviewResponse)
+    except Exception as e:
+        logger.error(f"Gemini Pro Sunday review parsing failed: {e}")
+        capture_sentry_exception(e, component="gemini_pro", operation="parse_sunday_review")
+        raise
