@@ -1,6 +1,6 @@
 import asyncio
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import main
 
@@ -46,6 +46,7 @@ def test_init_sentry_initializes_sdk_when_dsn_is_present(
         release="test-release",
         send_default_pii=False,
         enable_tracing=False,
+        before_send=ANY,
     )
     mock_set_tag.assert_called_once_with("service", "david")
     mock_logger.info.assert_called_once_with(
@@ -184,8 +185,12 @@ def test_capture_app_exception_logs_and_reports_with_tags(
         tags={"token_path": "/tmp/token.json"},
     )
 
-    mock_logger.opt.assert_called_once_with(exception=error)
-    mock_logger.opt.return_value.error.assert_called_once_with("Captured app failure")
+    mock_logger.error.assert_called_once_with(
+        "Exception captured: message={message} error_type={error_type} error={error}",
+        message="Captured app failure",
+        error_type="RuntimeError",
+        error="boom",
+    )
     assert scope.set_tag.call_args_list == [
         (("component", "calendar_auth"),),
         (("operation", "refresh_token"),),
