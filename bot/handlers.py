@@ -8,7 +8,7 @@ from telegram.ext import ContextTypes
 from orchestrator.router import process_message
 from orchestrator.confirmation_queue import add_pending_write, confirm_write, reject_write, get_pending_write
 from orchestrator.trigger_scheduler import queue_trigger, consume_trigger
-from integrations.calendar import resolve_calendar_reference
+from integrations.calendar import resolve_calendar_reference, get_upcoming_events
 from orchestrator.session_manager import (
     start_session, end_session, reset_session_timeout, cancel_session_timeout, get_session_state,
     is_session_active, track_confirmation_message, get_tracked_confirmation_messages, 
@@ -132,6 +132,20 @@ async def send_calendar_proposal(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     action.calendar_id = resolved_calendar["calendar_id"]
     action.calendar_display_name = resolved_calendar["calendar_display_name"]
 
+    if action.action_type in ("cancel", "reschedule"):
+        if "cached_events" not in context.user_data:
+            context.user_data["cached_events"] = await asyncio.to_thread(get_upcoming_events)
+        matched_event = _match_existing_event(context.user_data["cached_events"], action)
+        if not matched_event:
+            raise ValueError(
+                "I couldn't identify a single calendar event to "
+                f"{action.action_type}. Please include the event title and/or start time."
+            )
+        action.target_event_id = matched_event.get("id")
+        action.target_event_calendar_id = matched_event.get("calendar_id", action.calendar_id)
+        if not action.target_event_id:
+            raise ValueError("Matched event is missing an event ID and cannot be modified.")
+
     start_dt = parse_user_datetime(action.start_time)
     end_dt = parse_user_datetime(action.end_time)
     
@@ -141,6 +155,9 @@ async def send_calendar_proposal(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         end_dt,
         action.description,
         action.calendar_id,
+        action_type=action.action_type,
+        target_event_id=action.target_event_id,
+        target_event_calendar_id=action.target_event_calendar_id,
     )
     reply_markup = build_calendar_confirmation_keyboard(write_id)
     
@@ -151,12 +168,27 @@ async def send_calendar_proposal(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     )
 
     full_text = f"{prefix_text}\n\n" if prefix_text else ""
-    full_text += (
-        f"🗓️ *Proposed Event:*\n*{action.summary}*\n_{action.description}_\n\n"
-        f"{calendar_line}\n"
-        f"Start: {format_user_datetime(start_dt)}\n"
-        f"End: {format_user_datetime(end_dt)}"
-    )
+    if action.action_type == "cancel":
+        full_text += (
+            f"🗓️ *Proposed Cancellation:*\n*{action.summary}*\n_{action.description}_\n\n"
+            f"{calendar_line}\n"
+            f"Current Start: {format_user_datetime(start_dt)}\n"
+            f"Current End: {format_user_datetime(end_dt)}"
+        )
+    elif action.action_type == "reschedule":
+        full_text += (
+            f"🗓️ *Proposed Reschedule:*\n*{action.summary}*\n_{action.description}_\n\n"
+            f"{calendar_line}\n"
+            f"New Start: {format_user_datetime(start_dt)}\n"
+            f"New End: {format_user_datetime(end_dt)}"
+        )
+    else:
+        full_text += (
+            f"🗓️ *Proposed Event:*\n*{action.summary}*\n_{action.description}_\n\n"
+            f"{calendar_line}\n"
+            f"Start: {format_user_datetime(start_dt)}\n"
+            f"End: {format_user_datetime(end_dt)}"
+        )
     
     message = await context.bot.send_message(
         chat_id=chat_id,
@@ -166,6 +198,47 @@ async def send_calendar_proposal(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     )
     track_confirmation_message(context, write_id, message.message_id)
     return write_id
+
+
+def _match_existing_event(cached_events: list[dict], action: ProposedEvent):
+    """Attempts to match a cancel/reschedule action to one specific upcoming event."""
+    target_summary = (action.target_event_summary or action.summary or "").strip().lower()
+    target_start_dt = parse_user_datetime(action.target_event_start_time) if action.target_event_start_time else None
+
+    best_event = None
+    best_score = float("-inf")
+    for event in cached_events:
+        event_summary = event.get("summary", "").strip().lower()
+        event_calendar_id = event.get("calendar_id", "primary")
+        event_start_raw = event.get("start", {}).get("dateTime", event.get("start", {}).get("date"))
+        if not event_start_raw:
+            continue
+
+        score = 0.0
+        if target_summary:
+            if event_summary == target_summary:
+                score += 3.0
+            elif target_summary in event_summary or event_summary in target_summary:
+                score += 1.5
+            else:
+                continue
+
+        if target_start_dt:
+            try:
+                event_start_dt = parse_user_datetime(event_start_raw)
+                delta_minutes = abs((event_start_dt - target_start_dt).total_seconds()) / 60.0
+                score += max(0.0, 2.0 - min(delta_minutes, 120.0) / 60.0)
+            except Exception:
+                continue
+
+        if action.calendar_id and event_calendar_id == action.calendar_id:
+            score += 1.0
+
+        if score > best_score:
+            best_score = score
+            best_event = event
+
+    return best_event
 
 
 async def send_next_weekly_review_event(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
@@ -275,7 +348,8 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     created_event = await asyncio.to_thread(confirm_write, write_id)
     if created_event:
-        text = f"{query.message.text}\n\n✅ *Event Confirmed and Scheduled.*"
+        action_label = record.action_type.capitalize()
+        text = f"{query.message.text}\n\n✅ *{action_label} confirmed and executed.*"
         # Immediately update the local cache so the LLM knows about this new event
         # Note: This cache is only for the current session and will not persist across sessions.
         # This is a workaround to ensure that if the user schedules an event and then immediately asks David about their schedule, 
@@ -287,10 +361,24 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if 'cached_events' not in context.user_data:
             context.user_data['cached_events'] = []
-        context.user_data['cached_events'].append(created_event)
+        if record.action_type == "cancel":
+            context.user_data['cached_events'] = [
+                event
+                for event in context.user_data['cached_events']
+                if event.get("id") != record.target_event_id
+            ]
+        elif record.action_type == "reschedule":
+            existing = [
+                event for event in context.user_data['cached_events']
+                if event.get("id") != record.target_event_id
+            ]
+            existing.append(created_event)
+            context.user_data['cached_events'] = existing
+        else:
+            context.user_data['cached_events'].append(created_event)
         context.user_data['cached_events'].sort(key=calendar_event_sort_key)
     else:
-        text = f"{query.message.text}\n\n❌ *Failed to schedule event.*"
+        text = f"{query.message.text}\n\n❌ *Failed to execute calendar action.*"
         
     await query.edit_message_text(text=text, parse_mode="Markdown")
     if created_event:
@@ -316,7 +404,8 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     success = reject_write(write_id)
-    text = f"{query.message.text}\n\n🚫 *Event Rejected.*" if success else f"{query.message.text}\n\n❌ *Failed to reject event.*"
+    action_label = record.action_type.capitalize()
+    text = f"{query.message.text}\n\n🚫 *{action_label} rejected.*" if success else f"{query.message.text}\n\n❌ *Failed to reject calendar action.*"
     await query.edit_message_text(text=text, parse_mode="Markdown")
     if success:
         await advance_weekly_review_event_queue(
@@ -479,6 +568,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await update.message.reply_text(response.message)
+    except ValueError as e:
+        logger.error(f"Calendar proposal validation error: {e}")
+        await update.message.reply_text(str(e))
     except Exception as e:
         logger.error(f"Error handling message: {e}")
         if _is_calendar_auth_error(e):

@@ -35,11 +35,14 @@ def init_db():
     if "calendar_writes" not in db.table_names():
         db["calendar_writes"].create({
             "id": str,
+            "action_type": str,
             "summary": str,
             "start_time": str,  # ISO format
             "end_time": str,    # ISO format
             "description": str,
             "calendar_id": str,
+            "target_event_id": str,
+            "target_event_calendar_id": str,
             "status": str,      # pending, confirmed, rejected, executed
             "created_at": str,
             "created_event_id": str,
@@ -52,6 +55,15 @@ def init_db():
         if "calendar_id" not in existing_columns:
             table.add_column("calendar_id", str, not_null_default="primary")
             logger.info("Added column calendar_writes.calendar_id")
+        if "action_type" not in existing_columns:
+            table.add_column("action_type", str, not_null_default="schedule")
+            logger.info("Added column calendar_writes.action_type")
+        if "target_event_id" not in existing_columns:
+            table.add_column("target_event_id", str)
+            logger.info("Added column calendar_writes.target_event_id")
+        if "target_event_calendar_id" not in existing_columns:
+            table.add_column("target_event_calendar_id", str)
+            logger.info("Added column calendar_writes.target_event_calendar_id")
         if "created_event_id" not in existing_columns:
             table.add_column("created_event_id", str)
             logger.info("Added column calendar_writes.created_event_id")

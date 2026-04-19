@@ -142,6 +142,7 @@ async def test_handle_confirm_success(mock_remove_ui, mock_get_pending, mock_con
     # Mock the database record
     mock_record = MagicMock()
     mock_record.status = CalendarWriteStatus.PENDING
+    mock_record.action_type = "schedule"
     mock_get_pending.return_value = mock_record
     
     # Mock successful execution
@@ -157,7 +158,7 @@ async def test_handle_confirm_success(mock_remove_ui, mock_get_pending, mock_con
     mock_remove_ui.assert_called_once_with(context, "cw_123")
     mock_confirm_write.assert_called_once_with("cw_123")
     update.callback_query.edit_message_text.assert_awaited_once_with(
-        text="Original Proposal Text\n\n✅ *Event Confirmed and Scheduled.*", parse_mode="Markdown"
+        text="Original Proposal Text\n\n✅ *Schedule confirmed and executed.*", parse_mode="Markdown"
     )
     # Verify that the cache was updated
     assert context.user_data['cached_events'] == [mock_created_event]
@@ -181,6 +182,7 @@ async def test_handle_reject_success(mock_remove_ui, mock_get_pending, mock_reje
     # Mock the database record
     mock_record = MagicMock()
     mock_record.status = CalendarWriteStatus.PENDING
+    mock_record.action_type = "schedule"
     mock_get_pending.return_value = mock_record
     
     # Mock successful rejection
@@ -191,7 +193,7 @@ async def test_handle_reject_success(mock_remove_ui, mock_get_pending, mock_reje
     mock_remove_ui.assert_called_once_with(context, "cw_456")
     mock_reject_write.assert_called_once_with("cw_456")
     update.callback_query.edit_message_text.assert_awaited_once_with(
-        text="Original Proposal Text\n\n🚫 *Event Rejected.*", parse_mode="Markdown"
+        text="Original Proposal Text\n\n🚫 *Schedule rejected.*", parse_mode="Markdown"
     )
 
 @pytest.mark.asyncio
@@ -526,6 +528,9 @@ async def test_send_calendar_proposal_displays_toronto_time(
         ANY,
         "Catch-up downtown.",
         "team_calendar@example.com",
+        action_type="schedule",
+        target_event_id=None,
+        target_event_calendar_id=None,
     )
     kwargs = context.bot.send_message.await_args.kwargs
     assert kwargs["chat_id"] == 456

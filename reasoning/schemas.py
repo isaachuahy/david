@@ -1,4 +1,7 @@
+from typing import Literal, Optional
 from pydantic import BaseModel, Field
+
+CalendarActionType = Literal["schedule", "reschedule", "cancel"]
 
 
 class ProposedEvent(BaseModel):
@@ -15,6 +18,10 @@ class ProposedEvent(BaseModel):
     never be used as the write target.
     """
 
+    action_type: CalendarActionType = Field(
+        default="schedule",
+        description="Calendar action intent: schedule, reschedule, or cancel.",
+    )
     summary: str = Field(description="The title of the calendar event.")
     start_time: str = Field(description="The event start time in timezone-aware ISO 8601 format, including a UTC offset, e.g., 2026-03-22T09:00:00-04:00")
     end_time: str = Field(description="The event end time in timezone-aware ISO 8601 format, including a UTC offset, e.g., 2026-03-22T11:00:00-04:00")
@@ -43,4 +50,20 @@ class ProposedEvent(BaseModel):
             "resolution. This is not an API identifier and must never be used "
             "in place of calendar_id."
         ),
+    )
+    target_event_summary: Optional[str] = Field(
+        default=None,
+        description="For cancel/reschedule: the original event title or shorthand to match against upcoming events.",
+    )
+    target_event_start_time: Optional[str] = Field(
+        default=None,
+        description="For cancel/reschedule: optional original event start time in timezone-aware ISO 8601 format to disambiguate a specific event.",
+    )
+    target_event_id: Optional[str] = Field(
+        default=None,
+        description="Resolved canonical Google Calendar event ID for cancel/reschedule operations.",
+    )
+    target_event_calendar_id: Optional[str] = Field(
+        default=None,
+        description="Resolved canonical calendar ID containing target_event_id.",
     )
