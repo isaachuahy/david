@@ -1,8 +1,31 @@
 import os
+import re
 from typing import Mapping
 
 import sentry_sdk
 from loguru import logger
+
+_TELEGRAM_BOT_TOKEN_PATTERN = re.compile(r"/bot\d+:[^/\s]+")
+
+
+def _redact_text(value: str) -> str:
+    return _TELEGRAM_BOT_TOKEN_PATTERN.sub("/bot<redacted>", value)
+
+
+def _scrub(value):
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, dict):
+        return {key: _scrub(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_scrub(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_scrub(item) for item in value)
+    return value
+
+
+def _before_send(event: dict, hint: dict) -> dict:
+    return _scrub(event)
 
 
 def init_sentry() -> bool:
@@ -23,6 +46,7 @@ def init_sentry() -> bool:
         release=os.getenv("DAVID_RELEASE"),
         send_default_pii=False,
         enable_tracing=False,
+        before_send=_before_send,
     )
     sentry_sdk.set_tag("service", "david")
     logger.info("Sentry is enabled for runtime error reporting.")
@@ -44,8 +68,16 @@ def capture_exception(
     `tags` carries any additional workflow-specific context such as session or
     trigger identifiers.
     """
+    redacted_message = _redact_text(message) if message else None
+    redacted_error_text = _redact_text(str(error))
+
     if message:
-        logger.opt(exception=error).error(message)
+        logger.error(
+            "Exception captured: message={message} error_type={error_type} error={error}",
+            message=redacted_message,
+            error_type=type(error).__name__,
+            error=redacted_error_text,
+        )
 
     with sentry_sdk.new_scope() as scope:
         scope.set_tag("component", component)

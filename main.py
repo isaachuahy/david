@@ -1,4 +1,7 @@
+import httpcore
+import httpx
 from loguru import logger
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -39,6 +42,14 @@ async def _handle_application_error(update: object, context: ContextTypes.DEFAUL
     if context.error is None:
         return
 
+    if update is None and _is_transient_polling_transport_error(context.error):
+        logger.warning(
+            "Suppressed transient Telegram polling transport error: type={error_type} message={error_message}",
+            error_type=type(context.error).__name__,
+            error_message=str(context.error),
+        )
+        return
+
     capture_sentry_exception(
         context.error,
         component="telegram",
@@ -48,6 +59,34 @@ async def _handle_application_error(update: object, context: ContextTypes.DEFAUL
             "has_update": str(update is not None).lower(),
         },
     )
+
+
+def _walk_exception_chain(error: BaseException):
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _is_transient_polling_transport_error(error: BaseException) -> bool:
+    transient_error_types = (
+        NetworkError,
+        TimedOut,
+        httpx.ReadError,
+        httpx.ConnectError,
+        httpx.ReadTimeout,
+        httpx.ConnectTimeout,
+        httpcore.ReadError,
+        httpcore.ConnectError,
+        httpcore.ReadTimeout,
+        httpcore.ConnectTimeout,
+        TimeoutError,
+        ConnectionResetError,
+        BrokenPipeError,
+    )
+    return any(isinstance(exc, transient_error_types) for exc in _walk_exception_chain(error))
 
 def main() -> int:
     bootstrap_sentry()
