@@ -16,4 +16,11 @@ def test_init_db_calendar_writes_includes_multi_calendar_columns(tmp_path, monke
     init_db()
 
     columns = {column.name for column in get_db()["calendar_writes"].columns}
-    assert {"calendar_id", "created_event_id", "created_event_calendar_id"} <= columns
+    assert {
+        "action_type",
+        "calendar_id",
+        "target_event_id",
+        "target_event_calendar_id",
+        "created_event_id",
+        "created_event_calendar_id",
+    } <= columns

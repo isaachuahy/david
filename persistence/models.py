@@ -17,11 +17,14 @@ class CalendarWriteStatus(str, Enum):
 
 class CalendarWriteRecord(BaseModel):
     id: str
+    action_type: str = "schedule"
     summary: str
     start_time: str
     end_time: str
     description: str
     calendar_id: str = "primary"
+    target_event_id: Optional[str] = None
+    target_event_calendar_id: Optional[str] = None
     status: CalendarWriteStatus
     created_at: str
     created_event_id: Optional[str] = None

@@ -261,3 +261,53 @@ def insert_event(
     except HttpError as error:
         logger.error(f"An error occurred inserting the event: {error}")
         return {}
+
+
+def delete_event(event_id: str, calendar_id: str = "primary") -> bool:
+    """Deletes an event from Google Calendar."""
+    service = get_calendar_service()
+    try:
+        logger.info(f"Deleting event '{event_id}' from calendar '{calendar_id}'...")
+        service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
+        return True
+    except HttpError as error:
+        logger.error(f"An error occurred deleting event {event_id}: {error}")
+        return False
+
+
+def update_event(
+    event_id: str,
+    summary: str,
+    start_time: datetime,
+    end_time: datetime,
+    description: str = "",
+    calendar_id: str = "primary",
+) -> dict:
+    """Updates an existing event in the selected calendar."""
+    if start_time.tzinfo is None or end_time.tzinfo is None:
+        raise ValueError("start_time and end_time must be timezone-aware datetime objects.")
+
+    start_local = start_time.astimezone(USER_TIMEZONE)
+    end_local = end_time.astimezone(USER_TIMEZONE)
+
+    service = get_calendar_service()
+    try:
+        event_body = {
+            'summary': summary,
+            'description': description,
+            'start': {
+                'dateTime': start_local.isoformat(),
+                'timeZone': 'America/Toronto',
+            },
+            'end': {
+                'dateTime': end_local.isoformat(),
+                'timeZone': 'America/Toronto',
+            },
+        }
+        logger.info(f"Updating event: '{event_id}' in calendar '{calendar_id}'...")
+        updated_event = service.events().patch(calendarId=calendar_id, eventId=event_id, body=event_body).execute()
+        updated_event.setdefault("calendar_id", updated_event.get("calendarId", calendar_id))
+        return updated_event
+    except HttpError as error:
+        logger.error(f"An error occurred updating event {event_id}: {error}")
+        return {}

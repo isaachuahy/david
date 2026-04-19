@@ -28,6 +28,7 @@ def test_add_pending_write_serializes_enum_status_before_insert(mock_get_db):
     assert inserted_row["status"] == CalendarWriteStatus.PENDING.value
     assert inserted_row["summary"] == "Deep Work"
     assert inserted_row["calendar_id"] == "team_calendar@example.com"
+    assert inserted_row["action_type"] == "schedule"
     assert write_id.startswith("cw_")
 
 
@@ -48,6 +49,7 @@ def test_confirm_write_persists_created_event_identifiers(
         "summary": "Team Sync",
         "description": "Weekly sync",
         "calendar_id": "team_calendar@example.com",
+        "action_type": "schedule",
     })()
     mock_insert_event.return_value = {
         "id": "evt_123",
@@ -103,6 +105,7 @@ def test_confirm_write_reports_insert_event_failures(
         "summary": "Team Sync",
         "description": "Weekly sync",
         "calendar_id": "team_calendar@example.com",
+        "action_type": "schedule",
     })()
 
     with pytest.raises(RuntimeError, match="calendar insert failed"):
@@ -111,8 +114,8 @@ def test_confirm_write_reports_insert_event_failures(
     mock_capture_exception.assert_called_once_with(
         mock_insert_event.side_effect,
         component="confirmation_queue",
-        operation="confirm_write_insert_event",
-        tags={"write_id": "cw_insert"},
+        operation="confirm_write_execute",
+        tags={"write_id": "cw_insert", "action_type": "schedule"},
     )
 
 
@@ -135,6 +138,7 @@ def test_confirm_write_reports_execution_persist_failures(
         "summary": "Team Sync",
         "description": "Weekly sync",
         "calendar_id": "team_calendar@example.com",
+        "action_type": "schedule",
     })()
     mock_insert_event.return_value = {
         "id": "evt_123",
