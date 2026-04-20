@@ -1,5 +1,9 @@
 # David
 
+## Demo (only sped up typing and scrolling, not operational calls):
+https://github.com/user-attachments/assets/d04ce538-03a8-4995-a3d2-3e1954462dd6
+
+
 David is a personal executive AI assistant built for a specific failure mode of modern assistants: they can answer questions, but they struggle to help a person **run their life across time**.
 
 The project is designed around a narrower and more operational goal:
