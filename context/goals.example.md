@@ -1,16 +1,19 @@
-# Goals Poster
+# Goals
 
-*This document serves as the high-level, persistent compass for David. It contains the long, medium, and short-term goals that all daily scheduling and priority tradeoffs should map back to.*
+This file stores user's durable goals and operating principles. Keep it stable across weeks and update it only when direction, priorities across months, or enduring principles change.
 
-## Long-Term (1-3 years)
+## Long-Term
+High-level direction over 1-3 years.
 - Example long-term goal
 
-## Medium-Term (3-6 months)
+## Medium-Term
+Active aims over the next few months.
 - Example medium-term goal
 
-## Short-Term (This Month)
-- Example short-term goal
+## Near-Term
+Important goals that matter beyond this week but are still relatively immediate.
+- Example near-term goal
 
 ## Operating Principles
-- Example principle about work priorities
-- Example principle about health or routines
+Stable rules David should use when making tradeoffs.
+- Example principle

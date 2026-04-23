@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 from enum import Enum
 from loguru import logger
 from telegram.ext import ContextTypes
@@ -8,47 +9,142 @@ from orchestrator.context_builder import build_context
 from reasoning.flash_client import generate_flash_response, FlashResponse
 from orchestrator.session_manager import get_chat_history, append_chat_history
 
-# We use enum instead of string literals for message intents to ensure consistency and avoid typos.
-# This also makes it easier to manage and update intents in the future, as we can simply add new values to the enum.
 class MessageIntent(Enum):
     OPERATIONAL = "operational"
-    BRAINSTORM = "brainstorm"
-    GOAL_REVIEW = "goal_review"
+    STRATEGIC = "strategic"
+
+
+@dataclass(frozen=True)
+class RoutingDecision:
+    """
+    Captures both how we should reason about the message and which long-lived
+    context sections are needed to answer it well.
+    """
+
+    intent: MessageIntent
+    needs_calendar_context: bool
+    needs_strategy_context: bool
 
 THINKING_LEVELS = {
-    MessageIntent.OPERATIONAL: "low",    # For lowest level, we can use a low thinking level to prioritize latency and cost.
-    MessageIntent.BRAINSTORM: "high",    # Brainstorming may require more creative and expansive thinking, so we can use a high thinking level to allow for more exploration and idea generation.
-    MessageIntent.GOAL_REVIEW: "high",  # Goal review may also benefit from a high thinking level to allow for more strategic and big-picture analysis, especially if the user is asking for guidance on priorities or direction.
+    MessageIntent.OPERATIONAL: "low",
+    MessageIntent.STRATEGIC: "high",
 }
 
-def classify_intent(text: str) -> MessageIntent:
-    """Classifies user intent based on keywords."""
+
+def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
+    """Returns True when the message contains any keyword or phrase."""
+    return any(keyword in text for keyword in keywords)
+
+
+def _select_context_profile(routing_decision: RoutingDecision) -> str:
+    """
+    Maps routing flags into the smallest context profile that still gives the
+    model the information it needs for this turn.
+    """
+    if routing_decision.needs_calendar_context and routing_decision.needs_strategy_context:
+        return "full"
+    if routing_decision.needs_calendar_context:
+        return "calendar_context"
+    if routing_decision.needs_strategy_context:
+        return "priority_strategy"
+    return "lean"
+
+
+def classify_intent(text: str) -> RoutingDecision:
+    """
+    Classifies the message into a reasoning mode and the context dependencies
+    needed for that mode.
+    """
     text_lower = text.lower()
-    
-    # Heuristic keyword-based classification.
-    # Testing and iteration will be needed to refine these keyword lists for better accuracy.
-    # Also consider using a lightweight intent classification model in the future if we find that keyword-based classification is too brittle or inaccurate.
-    goal_keywords = ["GOAL_REVIEW", "goal", "priority", "priorities", "direction", "plan for the week", "what should i do"]
-    if any(keyword in text_lower for keyword in goal_keywords):
-        return MessageIntent.GOAL_REVIEW
-        
-    brainstorm_keywords = ["brainstorm", "what if", "let's discuss", "think about", "explore", "idea"]
-    if any(keyword in text_lower for keyword in brainstorm_keywords):
-        return MessageIntent.BRAINSTORM
-        
-    return MessageIntent.OPERATIONAL
+
+    # Calendar-aware prompts need current schedule state to answer correctly or
+    # to ground a proposed event in real availability.
+    calendar_keywords = (
+        "schedule",
+        "reschedule",
+        "cancel",
+        "move",
+        "book",
+        "calendar",
+        "event",
+        "meeting",
+        "appointment",
+        "free",
+        "available",
+        "busy",
+        "open slot",
+        "next event",
+        "later today",
+        "this afternoon",
+        "tonight",
+        "tomorrow morning",
+        "time block",
+        "block off",
+        "fit this in",
+    )
+    needs_calendar_context = _contains_any(text_lower, calendar_keywords)
+
+    # Strategy-aware prompts need longer-lived memory so David can reason about
+    # priorities, tradeoffs, and continuity across sessions.
+    strategy_keywords = (
+        "goal",
+        "goals",
+        "priority",
+        "priorities",
+        "focus",
+        "application",
+        "applications",
+        "direction",
+        "tradeoff",
+        "tradeoffs",
+        "align",
+        "alignment",
+        "what should i do",
+        "what should i focus on",
+        "plan for the week",
+        "weekly plan",
+        "review",
+        "brainstorm",
+        "what if",
+        "let's discuss",
+        "think about",
+        "explore",
+        "idea",
+        "remember",
+        "last time",
+        "we decided",
+        "preference",
+        "why did we",
+    )
+    needs_strategy_context = _contains_any(text_lower, strategy_keywords)
+
+    intent = (
+        MessageIntent.STRATEGIC
+        if needs_strategy_context
+        else MessageIntent.OPERATIONAL
+    )
+    return RoutingDecision(
+        intent=intent,
+        needs_calendar_context=needs_calendar_context,
+        needs_strategy_context=needs_strategy_context,
+    )
 
 async def process_message(text: str, context: ContextTypes.DEFAULT_TYPE) -> FlashResponse:
     """Processes an incoming text message, handles model routing, and updates history."""
-    intent = None
+    routing_decision = None
     try:
-        context_block = await asyncio.to_thread(build_context, context)
+        routing_decision = classify_intent(text)
+        context_profile = _select_context_profile(routing_decision)
+        context_block = await asyncio.to_thread(build_context, context, profile=context_profile)
         chat_history = get_chat_history(context)
-        
-        # Classify intent and determine thinking level
-        intent = classify_intent(text)
-        thinking_level = THINKING_LEVELS.get(intent)
-        logger.info(f"Classified intent as {intent.value} with level: {thinking_level}")
+
+        thinking_level = THINKING_LEVELS.get(routing_decision.intent)
+        logger.info(
+            "Classified intent as {} with level: {} and context profile: {}",
+            routing_decision.intent.value,
+            thinking_level,
+            context_profile,
+        )
         
         flash_response = await asyncio.to_thread(
             generate_flash_response,
@@ -68,6 +164,6 @@ async def process_message(text: str, context: ContextTypes.DEFAULT_TYPE) -> Flas
             e,
             component="router",
             operation="process_message",
-            tags={"intent": intent.value} if intent is not None else None,
+            tags={"intent": routing_decision.intent.value} if routing_decision is not None else None,
         )
         raise

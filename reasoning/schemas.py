@@ -6,17 +6,13 @@ CalendarActionType = Literal["schedule", "reschedule", "cancel"]
 
 class ProposedEvent(BaseModel):
     """
-    Structured calendar proposal returned by the reasoning layer.
+    Structured calendar action proposed by the reasoning layer.
 
-    The reasoning layer may identify which calendar the user meant via
-    `requested_calendar_text`, but application code is responsible for resolving
-    that text into authoritative calendar metadata exactly once.
-
-    `calendar_id` is the canonical Google Calendar identifier that must be
-    preserved throughout the scheduling flow after deterministic resolution.
-    `calendar_display_name` is a human-readable label for UI only and must
-    never be used as the write target.
+    The model may infer the user's intended calendar via `requested_calendar_text`,
+    but application code is responsible for resolving that reference into canonical
+    calendar metadata before any write occurs.
     """
+
 
     action_type: CalendarActionType = Field(
         default="schedule",

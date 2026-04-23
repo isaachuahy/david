@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Iterable, Literal, Optional
 
 from loguru import logger
 from integrations.calendar import get_upcoming_events, resolve_calendar_display_name
@@ -6,6 +7,34 @@ from orchestrator.time_utils import calendar_event_sort_key
 from telegram.ext import ContextTypes
 from runtime_paths import get_context_dir
 from orchestrator.time_utils import USER_TIMEZONE
+
+# Type constraint for valid context sections to ensure type safety and prevent typos.
+ContextSection = Literal[
+    "CURRENT_DATETIME",
+    "GOALS",
+    "WEEKLY_STATE",
+    "DECISION_LOG",
+    "UPCOMING_CALENDAR",
+]
+
+# Define a stable order for context sections to ensure consistent prompt structure.
+CONTEXT_SECTION_ORDER: tuple[ContextSection, ...] = (
+    "CURRENT_DATETIME",
+    "GOALS",
+    "WEEKLY_STATE",
+    "DECISION_LOG",
+    "UPCOMING_CALENDAR",
+)
+
+# These profiles define the minimum context bundle we want to expose for
+# common routing cases. The names should describe why the extra sections are
+# present, not just how many sections are included.
+CONTEXT_PROFILES: dict[str, tuple[ContextSection, ...]] = {
+    "lean": ("CURRENT_DATETIME", "WEEKLY_STATE"),
+    "calendar_context": ("CURRENT_DATETIME", "WEEKLY_STATE", "UPCOMING_CALENDAR"),
+    "priority_strategy": ("CURRENT_DATETIME", "GOALS", "WEEKLY_STATE", "DECISION_LOG"),
+    "full": CONTEXT_SECTION_ORDER,
+}
 
 def _read_file_safely(filename: str, fallback: str) -> str:
     """Reads a text file safely, returning a fallback if it fails or is missing."""
@@ -74,21 +103,79 @@ def _format_calendar_events(tg_context: ContextTypes.DEFAULT_TYPE = None, days: 
         
     return "\n".join(lines)
 
-def build_context(tg_context: ContextTypes.DEFAULT_TYPE = None) -> str:
+def _resolve_requested_sections(
+    sections: Optional[Iterable[ContextSection]] = None,
+    profile: Optional[str] = None, # we only usually use profile, but allow sections for flexibility in testing and future use cases
+) -> tuple[ContextSection, ...]:
+    """
+    Resolves either an explicit section list or a named profile into a stable,
+    deduplicated section tuple.
+    """
+    if sections is not None and profile is not None:
+        raise ValueError("Pass either sections or profile, not both.")
+
+    if profile is not None:
+        if profile not in CONTEXT_PROFILES:
+            raise ValueError(f"Unknown context profile: {profile}")
+        requested_sections = CONTEXT_PROFILES[profile]
+    elif sections is None:
+        requested_sections = CONTEXT_SECTION_ORDER
+    else:
+        requested_sections = tuple(sections)
+
+    requested_set = set(requested_sections)
+    unknown_sections = requested_set.difference(CONTEXT_SECTION_ORDER)
+    if unknown_sections:
+        unknown_list = ", ".join(sorted(unknown_sections))
+        raise ValueError(f"Unknown context sections: {unknown_list}")
+
+    # Preserve canonical ordering so prompt structure stays predictable even
+    # when callers pass sections in an arbitrary order.
+    return tuple(
+        section for section in CONTEXT_SECTION_ORDER if section in requested_set
+    )
+
+
+def build_context(
+    tg_context: ContextTypes.DEFAULT_TYPE = None,
+    sections: Optional[Iterable[ContextSection]] = None,
+    profile: Optional[str] = None,
+) -> str:
     """
     Assembles the full context block to be injected into LLM calls.
-    Includes goals, weekly state, decision log, and live calendar.
+
+    Callers can request either explicit sections or a named profile to keep
+    the prompt aligned with the task at hand. When neither is provided, the
+    builder returns the full context for backward compatibility.
     """
     logger.info("Building context block for LLM...")
-    
-    goals = _read_file_safely("goals.md", "No goals defined.")
-    weekly = _read_file_safely("weekly_state.md", "No weekly state defined.")
-    decisions = _read_file_safely("decision_log.md", "No recent decisions.")
-    calendar = _format_calendar_events(tg_context)
-    current_datetime = _current_datetime_block()
+    requested_sections = _resolve_requested_sections(sections=sections, profile=profile)
+    section_content: dict[ContextSection, str] = {}
 
-    return (f"<CONTEXT>\n<CURRENT_DATETIME>\n{current_datetime}\n</CURRENT_DATETIME>\n\n"
-            f"<GOALS>\n{goals}\n</GOALS>\n\n"
-            f"<WEEKLY_STATE>\n{weekly}\n</WEEKLY_STATE>\n\n"
-            f"<DECISION_LOG>\n{decisions}\n</DECISION_LOG>\n\n"
-            f"<UPCOMING_CALENDAR>\n{calendar}\n</UPCOMING_CALENDAR>\n</CONTEXT>")
+    # Load only the requested sections so lean profiles reduce both token
+    # footprint and unnecessary work, especially calendar fetches.
+    if "CURRENT_DATETIME" in requested_sections:
+        section_content["CURRENT_DATETIME"] = _current_datetime_block()
+    if "GOALS" in requested_sections:
+        section_content["GOALS"] = _read_file_safely("goals.md", "No goals defined.")
+    if "WEEKLY_STATE" in requested_sections:
+        section_content["WEEKLY_STATE"] = _read_file_safely(
+            "weekly_state.md",
+            "No weekly state defined.",
+        )
+    if "DECISION_LOG" in requested_sections:
+        section_content["DECISION_LOG"] = _read_file_safely(
+            "decision_log.md",
+            "No recent decisions.",
+        )
+    if "UPCOMING_CALENDAR" in requested_sections:
+        section_content["UPCOMING_CALENDAR"] = _format_calendar_events(tg_context)
+
+    context_parts = ["<CONTEXT>"]
+    for section in requested_sections:
+        context_parts.append(
+            f"<{section}>\n{section_content[section]}\n</{section}>"
+        )
+
+    context_parts.append("</CONTEXT>")
+    return "\n\n".join(context_parts)
