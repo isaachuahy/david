@@ -14,16 +14,27 @@ from orchestrator.session_manager import (
     is_session_active, track_confirmation_message, get_tracked_confirmation_messages, 
     untrack_confirmation_message, clear_tracked_confirmation_messages
 )
-from orchestrator.review_manager import run_sunday_review, execute_weekly_state_update
+from orchestrator.review_manager import (
+    apply_weekly_review_event_feedback,
+    apply_weekly_state_feedback,
+    execute_weekly_state_update,
+    start_weekly_review_workflow,
+)
 from orchestrator.time_utils import USER_TIMEZONE, calendar_event_sort_key, parse_iso, parse_user_datetime, format_user_datetime
-from persistence.models import CalendarWriteStatus, SessionStatus
+from persistence.models import (
+    CalendarWriteStatus,
+    ReviewWorkflowStatus,
+    SessionStatus,
+)
 from reasoning.schemas import ProposedEvent
 from bot.keyboards import build_calendar_confirmation_keyboard, build_weekly_state_keyboard
+from observability.sentry import capture_exception as capture_sentry_exception
 
 WEEKLY_REVIEW_EVENT_QUEUE_KEY = "weekly_review_event_queue"
 WEEKLY_REVIEW_TOTAL_EVENTS_KEY = "weekly_review_total_events"
 WEEKLY_REVIEW_PROCESSED_EVENTS_KEY = "weekly_review_processed_events"
 WEEKLY_REVIEW_CURRENT_WRITE_ID_KEY = "weekly_review_current_write_id"
+ACTIVE_REVIEW_WORKFLOW_ID_KEY = "active_review_workflow_id"
 UNAUTHORIZED_CALLBACK_TEXT = "This action is not available."
 CALENDAR_AUTH_ERROR_TEXT = (
     "Google Calendar is currently unavailable because the saved Google authorization "
@@ -115,6 +126,32 @@ def clear_weekly_review_event_queue(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop(WEEKLY_REVIEW_TOTAL_EVENTS_KEY, None)
     context.user_data.pop(WEEKLY_REVIEW_PROCESSED_EVENTS_KEY, None)
     context.user_data.pop(WEEKLY_REVIEW_CURRENT_WRITE_ID_KEY, None)
+
+
+def has_pending_weekly_review_event_feedback(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Returns whether the weekly review still has event proposals awaiting feedback.
+
+    Weekly state confirmation is only one part of the review flow. The review
+    should remain open if calendar proposals from that same Sunday review are
+    still queued or currently waiting for confirmation.
+    """
+    if context.user_data.get(WEEKLY_REVIEW_CURRENT_WRITE_ID_KEY):
+        return True
+
+    queued_events = context.user_data.get(WEEKLY_REVIEW_EVENT_QUEUE_KEY, [])
+    return bool(queued_events)
+
+
+def has_pending_weekly_state_feedback(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Returns whether the Sunday review still has a weekly-state confirmation open.
+
+    This is intentionally separate from calendar-event feedback because the
+    review may still be incomplete even after all event proposals are resolved.
+    """
+    proposed_state = context.user_data.get("proposed_weekly_state")
+    return isinstance(proposed_state, dict)
 
 
 async def send_calendar_proposal(context: ContextTypes.DEFAULT_TYPE, chat_id: int, action, prefix_text: str = "") -> str:
@@ -293,6 +330,21 @@ async def advance_weekly_review_event_queue(
         return
 
     clear_weekly_review_event_queue(context)
+    review_id = context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
+    review_workflow = (
+        await apply_weekly_review_event_feedback(
+            review_id,
+            has_pending_weekly_state_feedback=has_pending_weekly_state_feedback(context),
+        )
+        if review_id
+        else None
+    )
+    if (
+        review_workflow is not None
+        and review_workflow.workflow_status == ReviewWorkflowStatus.COMPLETED
+    ):
+        context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
+
     await context.bot.send_message(
         chat_id=chat_id,
         text=f"{outcome_text} weekly review proposal {processed} of {total}. Weekly review calendar proposals are complete.",
@@ -422,14 +474,17 @@ async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     
     trigger_type = query.data.split("start_trigger_")[1]
-    consume_trigger(context, trigger_type)
-    
     if trigger_type == "daily_checkin":
+        consume_trigger(context, trigger_type)
         await query.edit_message_text("🌅 *Daily Check-in Started.* What are your top priorities for today?", parse_mode="Markdown")
     elif trigger_type == "weekly_review":
         await query.edit_message_text("📅 *Starting Sunday Review. Analysing your week...*", parse_mode="Markdown")
         try:
-            review = await asyncio.to_thread(run_sunday_review, context)
+            review_workflow, review = await start_weekly_review_workflow(context)
+            context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = review_workflow.id
+            # Only consume the trigger after the review workflow is durable and has
+            # actually started. This keeps the trigger retryable if startup fails.
+            consume_trigger(context, trigger_type)
             
             # Send the synthesis message
             await context.bot.send_message(
@@ -441,7 +496,8 @@ async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
             # Ask for confirmation before overwriting the weekly state
             context.user_data['proposed_weekly_state'] = {
                 "content": review.weekly_state_content,
-                "timestamp": datetime.now(timezone.utc).isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "review_id": review_workflow.id,
             }
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
@@ -467,6 +523,16 @@ async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
         except Exception as e:
             logger.error(f"Error during Sunday Review: {e}")
+            capture_sentry_exception(
+                e,
+                component="handlers",
+                operation="handle_start_trigger_weekly_review",
+                message="Failed to start or execute the Sunday review flow from the trigger handler.",
+                tags={
+                    "review_id": context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY, "unknown"),
+                },
+            )
+            context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
             await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ An error occurred during the Sunday Review.")
 
 @authorized_only
@@ -487,10 +553,19 @@ async def handle_confirm_weekly_state(update: Update, context: ContextTypes.DEFA
         await query.edit_message_text("❌ *No proposed weekly state found.*", parse_mode="Markdown")
         return
         
+    review_id = proposed_state.get("review_id") or context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
+
     # Lazy Expiration: Check if the proposal is older than 2 hours
     proposal_time = parse_iso(proposed_state["timestamp"])
     if datetime.now(timezone.utc) - proposal_time > timedelta(hours=2):
         del context.user_data['proposed_weekly_state']
+        if review_id:
+            await apply_weekly_state_feedback(
+                review_id,
+                accepted=False,
+                proposal_expired=True,
+                has_pending_event_feedback=has_pending_weekly_review_event_feedback(context),
+            )
         await query.edit_message_text("❌ *This weekly state proposal has expired (older than 2 hours).*", parse_mode="Markdown")
         return
 
@@ -499,6 +574,17 @@ async def handle_confirm_weekly_state(update: Update, context: ContextTypes.DEFA
     del context.user_data['proposed_weekly_state']
     
     if success:
+        if review_id:
+            review_workflow = await apply_weekly_state_feedback(
+                review_id,
+                accepted=True,
+                has_pending_event_feedback=has_pending_weekly_review_event_feedback(context),
+            )
+            if (
+                review_workflow is not None
+                and review_workflow.workflow_status == ReviewWorkflowStatus.COMPLETED
+            ):
+                context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
         await query.edit_message_text("✅ *Weekly State successfully updated and backed up.*", parse_mode="Markdown")
     else:
         await query.edit_message_text("❌ *Failed to update weekly state. Please check the logs.*", parse_mode="Markdown")
@@ -508,11 +594,28 @@ async def handle_reject_weekly_state(update: Update, context: ContextTypes.DEFAU
     """Handles rejection of the weekly state update."""
     query = update.callback_query
     await query.answer()
-    
+
+    proposed_state = context.user_data.get('proposed_weekly_state')
+    review_id = (
+        proposed_state.get("review_id")
+        if isinstance(proposed_state, dict)
+        else context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
+    )
+
     if 'proposed_weekly_state' in context.user_data:
         del context.user_data['proposed_weekly_state']
-        
-    await query.edit_message_text("🚫 *Weekly state update rejected.*", parse_mode="Markdown")
+
+    if review_id:
+        await apply_weekly_state_feedback(
+            review_id,
+            accepted=False,
+            has_pending_event_feedback=has_pending_weekly_review_event_feedback(context),
+        )
+
+    await query.edit_message_text(
+        "🚫 *Weekly state update rejected. The Sunday review remains open for revision.*",
+        parse_mode="Markdown",
+    )
 
 @authorized_only
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

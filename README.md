@@ -1,283 +1,50 @@
 # David
 
-## Demo (only sped up typing and scrolling, not operational calls):
+Personal executive assistant for a single user, built around Telegram, Google Calendar, persistent markdown context, and structured workflow state.
+
+## Demo
+
+Typing and scrolling are sped up in the demo; operational calls are not.
+
 https://github.com/user-attachments/assets/d04ce538-03a8-4995-a3d2-3e1954462dd6
 
+## Documentation
 
-David is a personal executive AI assistant built for a specific failure mode of modern assistants: they can answer questions, but they struggle to help a person **run their life across time**.
+- [DESIGN_DOC.md](./DESIGN_DOC.md)
+  Target product design, file contracts, workflow model, and key design decisions.
+- [ARCHITECTURE.md](./ARCHITECTURE.md)
+  Runtime flow, Sunday review pipeline, proposal lifecycle, and persisted state boundaries.
+- [DEPLOYMENT.md](./DEPLOYMENT.md)
+  Deployment and operational setup details.
+- [ops/david/README.md](./ops/david/README.md)
+  `systemd`-based production deployment assets.
 
-The project is designed around a narrower and more operational goal:
+## What It Does
 
-- maintain short-term conversational context during a working session
-- ground responses in persistent files such as goals, weekly state, and decision logs
-- read live calendar state before making suggestions
-- propose calendar actions instead of silently executing them
-- run recurring check-ins and weekly reviews without requiring the user to remember to initiate them
-- preserve enough structure that the system is auditable, debuggable, and incrementally extensible
+David is designed to:
 
-David currently runs as a **single-user Telegram assistant** with **Gemini reasoning**, **Google Calendar integration**, **SQLite-backed workflow state**, and scheduled routines for daily and weekly planning.
+- answer operational and strategic planning questions through Telegram
+- ground reasoning in `goals.md`, `weekly_state.md`, `decision_log.md`, and live calendar state
+- propose calendar changes and require explicit confirmation before writing them
+- maintain session synthesis and rolling memory
+- run recurring workflows such as daily check-ins and Sunday review
 
----
+## Tech Stack
 
-## Why this exists
-
-Typical chat assistants are optimized for stateless question answering. Executive assistance is a different problem.
-
-In practice, the hard parts are not just generation quality. The real issues are:
-
-- **context fragmentation**: goals, recent decisions, and calendar obligations live in different places
-- **weak temporal continuity**: a good answer now can still be wrong in the context of the next week
-- **unsafe write behavior**: assistants that can modify external systems need explicit control boundaries
-- **no operational cadence**: users still have to remember when to review priorities, close loops, or reset direction
-- **poor memory structure**: long-term plans and short-term sessions get mixed together, creating drift and noise
-
-David addresses those issues by separating conversational reasoning from operational state.
-
----
-
-## What David fixes
-
-### 1. It turns planning into an actual system
-David reads from persistent context files and live calendar events before reasoning. Instead of generating from scratch each time, it works from an operating context made of:
-
-- goals
-- weekly state
-- decision log
-- upcoming calendar events
-
-### 2. It keeps calendar writes safe
-Model output does **not** directly mutate Google Calendar. Calendar actions are proposed, stored as pending writes, and only executed after explicit user confirmation in Telegram.
-
-### 3. It distinguishes live sessions from long-term memory
-A session stays active while the conversation is ongoing. When it ends, David synthesizes the session into a durable decision artifact and clears the short-term conversation state.
-
-### 4. It supports recurring executive workflows
-David includes built-in scheduled routines:
-
-- a daily check-in
-- a Sunday review
-
-These are not passive reminders. They feed into reasoning and planning workflows that can produce updated weekly state and proposed calendar actions.
-
----
-
-## Current outcomes
-
-David is already structured to provide the following outcomes:
-
-- lower decision fatigue around planning and scheduling
-- better continuity between goals, weekly priorities, and calendar reality
-- explicit human approval for external writes
-- session-level memory for working conversations without uncontrolled context growth
-- durable decision logging after each completed session
-- automated cadence for operational review
-
-This makes it closer to an **operational copilot** than a generic chatbot.
-
----
-
-## Core capabilities
-
-### Conversational assistance
-- Telegram-based interaction loop
-- session-aware conversation handling
-- lightweight intent classification for operational vs brainstorming vs goal-review flows
-- different reasoning budgets depending on request type
-
-### Context-aware reasoning
-- loads persistent markdown context from the `context/` directory
-- injects live calendar context into prompts
-- includes current-session chat history in model calls
-
-### Calendar support
-- fetches upcoming events across all calendars
-- fetches past events for weekly review
-- proposes new events with explicit approval UI
-- writes to Google Calendar only after confirmation
-
-### Session lifecycle management
-- creates session records in SQLite
-- auto-times out inactive sessions after 30 minutes
-- synthesizes completed sessions into decision artifacts
-- reconciles orphaned sessions on restart
-
-### Scheduled executive workflows
-- daily check-in trigger
-- Sunday review trigger
-- weekly-state update proposal flow
-- queued review event proposals, confirmed one at a time
-
-### Operational durability
-- SQLite persistence for workflow state
-- Telegram persistence for user state across restarts
-- restart-safe invalidation of volatile caches
-- hooks for Langfuse and Sentry
-- backup-related environment variables for deployment workflows
-
----
-
-## Tech stack
-
-### Runtime
 - Python 3.12+
 - [`uv`](https://docs.astral.sh/uv/) for dependency management
-
-### Interfaces and orchestration
-- `python-telegram-bot` for the main user interface and job queue
-- `APScheduler` via PTB job queue for recurring triggers
-
-### Reasoning
+- `python-telegram-bot`
 - Google Gemini via `google-genai`
-- Gemini Flash for conversational responses and session synthesis
-- Gemini Pro for the higher-value Sunday review workflow
-- Pydantic schemas for structured model outputs
-
-### Integrations
 - Google Calendar API
-- OAuth via `google-auth-oauthlib`
+- SQLite
+- Loguru
+- Langfuse
+- Sentry
 
-### Persistence and observability
-- SQLite via `sqlite-utils`
-- Loguru for logging
-- Langfuse for tracing/observability
-- Sentry for alerting
-
----
-
-## Architecture
-
-```text
-Telegram user
-    |
-    v
-bot/handlers.py
-    |
-    v
-orchestrator/router.py
-    |
-    +--> orchestrator/context_builder.py
-    |         |
-    |         +--> context/*.md
-    |         +--> integrations/calendar.py
-    |
-    +--> reasoning/flash_client.py
-    |         |
-    |         +--> Gemini Flash
-    |
-    +--> proposed calendar action?
-              |
-              +--> orchestrator/confirmation_queue.py
-                        |
-                        +--> SQLite pending write
-                        +--> Telegram confirm/reject UI
-                        +--> integrations/calendar.py -> Google Calendar
-
-Session close
-    |
-    v
-orchestrator/session_manager.py
-    |
-    +--> reasoning/flash_client.py (session synthesis)
-    +--> context/decision_log.md
-    +--> SQLite decisions table
-
-Scheduled triggers
-    |
-    v
-orchestrator/trigger_scheduler.py
-    |
-    +--> daily check-in
-    +--> weekly review
-              |
-              +--> orchestrator/review_manager.py
-              +--> reasoning/pro_client.py -> Gemini Pro
-              +--> weekly state update + proposed events
-```
-
----
-
-## System design rationale
-
-### Single-user by design
-David is intentionally restricted to a configured Telegram user ID.
-
-Why:
-- the assistant has access to sensitive planning context and calendar data
-- the current architecture is optimized for personal executive support, not multi-tenant isolation
-- this sharply reduces the security and product surface area while the core operating model is still being refined
-
-### Explicit confirmation for writes
-David uses a pending-write queue before touching Google Calendar.
-
-Why:
-- model inference should not have direct write authority
-- approval creates a clean human-in-the-loop control point
-- queued writes are inspectable, rejectable, and expire if left unresolved
-
-### Persistent files + live APIs instead of opaque memory only
-The model context is assembled from markdown files and live calendar data.
-
-Why:
-- goals and weekly direction should be editable outside the model
-- operational state should remain understandable without replaying hidden memory
-- calendar data must reflect reality, not just prior conversation summaries
-
-### Session memory, not unlimited memory
-David stores current-session chat history and then synthesizes it into a durable artifact when the session ends.
-
-Why:
-- raw long chat history does not scale cleanly
-- synthesis compresses useful signal into a decision log
-- clearing volatile session state reduces drift and stale assumptions
-
-### Different models for different jobs
-David uses Gemini Flash for interactive response loops and Gemini Pro for Sunday review.
-
-Why:
-- not every request deserves the same latency/cost profile
-- weekly review is a higher-value batch workflow with more strategic reasoning requirements
-- model routing is a simpler and more controllable optimization than one-model-for-everything
-
-### Cache where latency matters, invalidate where correctness matters
-Upcoming events are cached within a session, but restart-volatile caches are invalidated on boot.
-
-Why:
-- repeated calendar fetches on every message are unnecessary
-- stale external state after restart is dangerous
-- this balances responsiveness with correctness
-
-### SQLite over heavier infrastructure
-David persists workflow state in SQLite.
-
-Why:
-- the current system is single-user and operationally small
-- SQLite is fast, simple, inspectable, and deployment-friendly
-- it keeps the architecture easy to run on a VPS without introducing service sprawl
-
----
-
-## Repository structure
-
-```text
-.
-├── bot/                 # Telegram handlers and UI keyboards
-├── context/             # Long-lived markdown context: goals, weekly state, decisions
-├── integrations/        # Google Calendar auth and API integration
-├── orchestrator/        # Context assembly, routing, sessions, triggers, review flow
-├── persistence/         # SQLite schema and typed records
-├── reasoning/           # Gemini clients, response schemas, prompt templates
-├── data/                # SQLite DB and Telegram persistence files at runtime
-├── main.py              # Application entrypoint
-├── config.py            # Runtime configuration loading and validation
-├── pyproject.toml       # Project metadata and dependencies
-└── .env.example         # Example environment variables
-```
-
----
-
-## Quick start
+## Quick Start
 
 ### 1. Prerequisites
+
 You need:
 
 - Python 3.12+
@@ -287,21 +54,23 @@ You need:
 - a Gemini API key
 - Google Calendar OAuth client credentials
 
-### 2. Clone and install
+### 2. Install
+
 ```bash
 git clone https://github.com/isaachuahy/david.git
 cd david
 uv sync
 ```
 
-### 3. Configure environment variables
-Create a local `.env` file.
+### 3. Configure environment
+
+Create a local `.env`:
 
 ```bash
 cp .env.example .env
 ```
 
-Required values:
+Minimum required values:
 
 ```env
 TELEGRAM_BOT_TOKEN="..."
@@ -312,50 +81,53 @@ GOOGLE_TOKEN_PATH="token.json"
 ```
 
 Notes:
-- `ALLOWED_USER_ID` must be your numeric Telegram user ID.
-- `GOOGLE_CREDENTIALS_PATH` should point to your OAuth client JSON from Google Cloud Console.
-- `GOOGLE_TOKEN_PATH` is where David stores the authorized user token after OAuth completes.
 
-### 4. Add Google OAuth credentials
-Place your Google OAuth credentials file at the configured location, commonly:
+- `ALLOWED_USER_ID` must be your numeric Telegram user ID.
+- `GOOGLE_CREDENTIALS_PATH` should point to your Google OAuth client JSON.
+- `GOOGLE_TOKEN_PATH` is where the authorized user token is stored.
+
+### 4. Add Google auth files
+
+Place your Google OAuth client credentials at the configured path, commonly:
 
 ```text
 credentials.json
 ```
 
-On first use, David may open a local browser-based OAuth flow to create `token.json`.
+On first use, David may open a local browser-based OAuth flow to generate `token.json`.
 
 For headless or VPS deployment, generate `token.json` ahead of time and deploy it with the app.
 
 ### 5. Prepare context files
-Populate the `context/` directory with your operating context:
+
+Populate `context/` with:
 
 - `goals.md`
 - `weekly_state.md`
 - `decision_log.md`
 
-David will still boot if some files are missing, but the assistant is materially better when these are maintained.
+David can boot without them, but the system is materially better when they are maintained.
 
 ### 6. Run the bot
+
 ```bash
 uv run python main.py
 ```
 
-If startup succeeds, David will:
+On successful startup, David will:
+
 - validate config
-- initialize SQLite tables
-- reconcile orphaned sessions
+- initialize persistence
+- reconcile restart-sensitive state
 - restore Telegram persistence
-- register daily and weekly scheduled triggers
+- register recurring triggers
 - start polling Telegram
 
----
+## Production Deployment
 
-## Deployment guide (friendly version)
+For a practical VPS setup, use the `systemd` assets in [`ops/david/`](./ops/david/).
 
-If you just want a practical production setup, use the `systemd` assets in `ops/david/`. They are designed for a small single-user VPS (for example AWS Lightsail), and they keep code, secrets, and runtime data clearly separated.
-
-### Recommended production layout
+Recommended production split:
 
 ```text
 /opt/david/                  # repo checkout + .venv
@@ -367,255 +139,92 @@ If you just want a practical production setup, use the `systemd` assets in `ops/
 /var/lib/david/token.json
 ```
 
-Why this layout is helpful:
-- code stays in one place (`/opt/david`)
-- secrets stay outside the repo (`/etc/david`)
-- mutable runtime state is isolated (`/var/lib/david`)
+For full instructions, see:
 
-### Deploy in 7 straightforward steps
+- [DEPLOYMENT.md](./DEPLOYMENT.md)
+- [ops/david/README.md](./ops/david/README.md)
 
-1. **Install code and dependencies**
-   ```bash
-   git clone https://github.com/isaachuahy/david.git /opt/david
-   cd /opt/david
-   uv sync
-   ```
+## Backups
 
-2. **Install required system tools**
-   - `sqlite3`
-   - `rclone`
+Backups use `scripts/backup.sh` plus the production `systemd` units:
 
-3. **Install service units**
-   ```bash
-   cd /opt/david/ops/david
-   sudo ./install_lightsail_systemd.sh
-   ```
+- `david-backup.service`
+- `david-backup.timer`
 
-4. **Create production env file**
-   ```bash
-   sudo cp /opt/david/ops/david/david.env.example /etc/david/david.env
-   sudoedit /etc/david/david.env
-   ```
-   At minimum, set:
-   - `TELEGRAM_BOT_TOKEN`
-   - `ALLOWED_USER_ID`
-   - `GEMINI_API_KEY`
-   - `GOOGLE_CREDENTIALS_PATH`
-   - `GOOGLE_TOKEN_PATH`
-   - `DAVID_DB_PATH`
-   - `DAVID_TELEGRAM_PERSISTENCE_PATH`
-   - `DAVID_CONTEXT_DIR`
-   - `DAVID_BACKUP_REMOTE`
+Each backup includes:
 
-5. **Copy Google auth files**
-   - put OAuth client credentials at `/etc/david/credentials.json`
-   - place an existing `token.json` at `/var/lib/david/token.json` for fully headless startup
+- a consistent SQLite snapshot
+- the full context directory
 
-6. **Copy your live context files**
-   - `goals.md`
-   - `weekly_state.md`
-   - `decision_log.md`
+For restore and backup operations, use [DEPLOYMENT.md](./DEPLOYMENT.md) and the ops docs rather than this README.
 
-7. **Start and verify**
-   ```bash
-   sudo systemctl start david.service
-   sudo systemctl status david.service
-   sudo journalctl -u david.service -f
-   ```
+## Operations
 
-For a deeper operational reference, see `DEPLOYMENT.md` and `ops/david/README.md`.
+### Logging
 
----
+David uses:
 
-## Backups (what is saved, how it runs, how to restore)
+- Loguru for application logs
+- Langfuse for LLM traces and usage visibility
+- Sentry for exception reporting
 
-David includes a backup script at `scripts/backup.sh` and production `systemd` units (`david-backup.service` and `david-backup.timer`).
-
-### What the backup includes
-
-Each backup run creates and uploads a `.tar.gz` archive containing:
-- a consistent SQLite snapshot (`assistant.db`) via `sqlite3 .backup`
-- the full context directory (`goals.md`, `weekly_state.md`, `decision_log.md`, and related files)
-
-Backups are uploaded with `rclone` to your configured remote path.
-
-### Required backup environment variables
-
-- `DAVID_BACKUP_REMOTE` (required): remote destination, for example `b2:my-bucket/david`
-- `DAVID_BACKUP_HOST` (optional): host label in backup paths
-- `DAVID_BACKUP_TMPDIR` (optional): local temp staging dir (default `/tmp/david-backups`)
-- `DAVID_PROJECT_DIR` (optional): project root override
-- `DAVID_CONTEXT_DIR` (optional): context path override
-
-### Run a backup now (manual verification)
+In production, the first place to inspect issues is usually the service journal:
 
 ```bash
-sudo systemctl start david-backup.service
+sudo journalctl -u david.service -f
+```
+
+### Health Checks
+
+Common checks:
+
+```bash
+sudo systemctl status david.service
+sudo journalctl -u david.service -n 200
+```
+
+A healthy service should:
+
+- stay in the `active (running)` state
+- start without config or auth errors
+- register recurring triggers
+- respond to Telegram messages
+- continue reading context and calendar state normally
+
+If backup automation is enabled, you can also verify:
+
+```bash
+sudo systemctl status david-backup.timer
 sudo journalctl -u david-backup.service -n 200
 ```
 
-### Enable daily automatic backups
+For deeper operational troubleshooting, use [DEPLOYMENT.md](./DEPLOYMENT.md) and [ops/david/README.md](./ops/david/README.md).
 
-```bash
-sudo systemctl start david-backup.timer
-sudo systemctl status david-backup.timer
-```
-
-The timer uses `Persistent=true`, so if the server is down during a scheduled time, the missed run is executed after the server comes back.
-
-### Simple restore checklist
-
-1. Download the desired archive from your `rclone` remote.
-2. Extract it to a safe temporary directory.
-3. Stop David before replacing live files:
-   ```bash
-   sudo systemctl stop david.service
-   ```
-4. Restore:
-   - `assistant.db` to your `DAVID_DB_PATH`
-   - extracted `context/` files to your `DAVID_CONTEXT_DIR`
-5. Ensure ownership/permissions are correct for the service user.
-6. Start David again:
-   ```bash
-   sudo systemctl start david.service
-   ```
-
-If you only need partial recovery (for example one context file), you can restore just that file without replacing the full DB.
-
----
-
-## How to use it directly
-
-Once the bot is running, message your Telegram bot.
-
-Typical usage patterns:
-
-### Operational scheduling
-Examples:
-- “Schedule deep work tomorrow from 9 to 11.”
-- “Block 30 minutes for interview prep this afternoon.”
-
-David will propose the event in Telegram and wait for confirmation before writing to Google Calendar.
-
-### Brainstorming and planning
-Examples:
-- “Let’s discuss how I should structure this week.”
-- “Brainstorm approaches for reducing decision fatigue.”
-
-### Goal review
-Examples:
-- “What should I prioritize this week?”
-- “Review my direction based on current goals and calendar.”
-
-### Session closure
-Use:
+## Repository Layout
 
 ```text
-/done
+.
+├── bot/                 # Telegram handlers and UI
+├── context/             # Goals, weekly state, and decision log
+├── integrations/        # Google Calendar auth and API access
+├── orchestrator/        # Routing, context assembly, sessions, triggers, review flow
+├── persistence/         # SQLite schema and typed records
+├── reasoning/           # Model clients, schemas, and prompt templates
+├── data/                # Runtime DB and Telegram persistence files
+├── ops/                 # Deployment assets
+├── scripts/             # Operational scripts such as backups
+├── main.py              # Application entrypoint
+├── config.py            # Runtime configuration loading
+└── pyproject.toml       # Project metadata and dependencies
 ```
 
-This closes the active session and triggers background synthesis into the decision log.
+## Typical Use
 
----
+Examples:
 
-## Data model and persistence
+- “Schedule deep work tomorrow from 9 to 11.”
+- “Am I free this afternoon?”
+- “What should I prioritize this week?”
+- “Let’s think through next week.”
 
-David currently persists four main workflow artifacts in SQLite:
-
-- `calendar_writes`: pending/executed/rejected/expired calendar actions
-- `sessions`: session lifecycle state
-- `decisions`: synthesized session outputs
-- `weekly_snapshots`: backups of accepted weekly state revisions
-
-It also stores Telegram persistence separately to preserve UI-related user state across restarts.
-
-This separation is deliberate:
-- SQLite stores auditable workflow records
-- Telegram persistence stores bot interaction state
-- markdown files remain the human-editable source of planning context
-
----
-
-## Scheduling behavior
-
-By default, David schedules:
-
-- **daily check-in** at **8:00 AM America/Toronto**
-- **weekly review** at **8:05 AM Sunday America/Toronto**
-
-These are defined in `orchestrator/trigger_scheduler.py`.
-
-If you deploy for another timezone or routine, this is one of the first places to adapt.
-
----
-
-## Operational considerations
-
-### Security
-Current security posture is intentionally simple:
-
-- bot access is restricted to one Telegram user ID
-- calendar writes require explicit approval
-- credentials are loaded from environment variables and local files
-
-This is appropriate for a personal system, not a hardened multi-user SaaS.
-
-### Failure handling
-David includes several pragmatic safeguards:
-
-- startup reconciliation of orphaned sessions
-- expiration of stale calendar proposals
-- auto-rejection of interrupted or session-abandoned writes
-- cache invalidation on restart
-
-### Deployment
-The repo includes first-class VPS deployment assets and a backup flow:
-
-- pre-generated `token.json` for headless calendar access
-- `ops/david` systemd units for bot runtime and scheduled backups
-- `scripts/backup.sh` for SQLite + context backups via `rclone`
-- backup-related environment variables in `.env.example`
-- Langfuse and Sentry hooks for production visibility
-
-If you're deploying now, start with the "Deployment guide (friendly version)" and "Backups" sections above.
-
----
-
-## Known limitations
-
-At its current stage, David is intentionally opinionated and narrow.
-
-- single-user only
-- Google Calendar focused
-- Telegram is the only interface
-- intent classification is heuristic, not learned
-- local markdown files are simple and effective, but not yet collaborative or remotely managed
-- no formal API or multi-service separation yet
-
-These are tradeoffs, not accidents. The current architecture optimizes for correctness, simplicity, and iteration speed.
-
----
-
-## Where this can evolve next
-
-Natural next steps include:
-
-- richer planning primitives beyond calendar events
-- more explicit task and project state models
-- better intent routing than keyword heuristics
-- calendar modification/deletion flows in addition to insertion
-- stronger observability around reasoning quality and trigger outcomes
-- a web or mobile control plane on top of the current core
-- multi-user or role-based variants, if the product direction broadens
-
----
-
-## Development philosophy
-
-David is not trying to be a general assistant with shallow capability breadth.
-
-It is a narrower system built around a stronger thesis:
-
-> executive assistance works best when the assistant can reason over durable context, interact with live operational systems, preserve explicit safety boundaries, and maintain continuity across time.
-
-That is the design center of this repository.
+Use `/done` to close an active working session and trigger background synthesis.

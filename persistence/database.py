@@ -100,6 +100,28 @@ def init_db():
         }, pk="id")
         logger.info("Created table: weekly_snapshots")
 
+    # 5. Durable Sunday Review Workflows
+    if "review_workflows" not in db.table_names():
+        db["review_workflows"].create({
+            "id": str,
+            "workflow_status": str,
+            "updated_at": str,
+            "state_json": str,
+        }, pk="id")
+        logger.info("Created table: review_workflows")
+    else:
+        table = db["review_workflows"]
+        existing_columns = {column.name for column in table.columns}
+        if "workflow_status" not in existing_columns:
+            table.add_column("workflow_status", str, not_null_default="active")
+            logger.info("Added column review_workflows.workflow_status")
+        if "updated_at" not in existing_columns:
+            table.add_column("updated_at", str, not_null_default="")
+            logger.info("Added column review_workflows.updated_at")
+        if "state_json" not in existing_columns:
+            table.add_column("state_json", str, not_null_default="{}")
+            logger.info("Added column review_workflows.state_json")
+
     logger.info("Database initialization complete.")
 
 

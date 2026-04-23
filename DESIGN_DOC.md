@@ -1,229 +1,335 @@
 # David — Design Document
 
-*Personal executive assistant bot. Single author, single user. Last updated: March 2026.*
+Single-user personal executive assistant for Isaac. End-state design only.
 
----
+For runtime flow and component boundaries, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
-## Why
+## Purpose
 
-The problem is not a lack of information or ambition — it is a gap between intention and execution caused by two compounding failure modes.
+David exists to reduce the gap between intention and execution.
 
-The first is reactive decision-making. Without a structured system that holds long-term goals in view, daily decisions get made in response to immediate pressure rather than actual priority. A message arrives, a task surfaces, and attention shifts — not because it should, but because the friction of re-evaluating everything from scratch every time is too high.
+The system should make it easier to:
+- keep long-term goals connected to weekly action
+- make scheduling and prioritization decisions intentionally rather than reactively
+- reduce decision fatigue during both ordinary days and weekly planning
+- preserve durable lessons, preferences, and tradeoffs across time
 
-The second is decision fatigue compounding into paralysis. The same friction that causes reactive decisions also causes perfectionism to stall progress. If the cost of deciding what to do next is high, the temptation is to either react or do nothing. Neither moves the needle on what actually matters.
+David is not meant to automate Isaac's life. It is meant to lower the cost of making good decisions and following through on them.
 
-What's missing is a system that holds context across time — one that knows not just what's on the calendar today, but why it's there, what it connects to, and what would happen if it moved. Off-the-shelf AI assistants cannot do this. They have no persistent memory of decisions and rationale, no ability to write to a calendar, and no mechanism to trigger reviews or check-ins without manual initiation. They are reactive by design, and they may have one or a few of these capabilities, but are not integrated or seamless in terms of user experience.
+## Target Outcomes
 
-David is a custom-built personal assistant with a front-end user interface on Telegram, integrates directly with Google Calendar, and maintains a living context document injected into every reasoning call. The goal is not to automate decisions but to reduce the cost of making good ones and stick with them, so that structured thinking becomes the path of least resistance rather than a tax on willpower.
+David is successful when it reliably produces the following outcomes:
 
-In three months, success looks like: a more structured daily plan that flexes based on actual priorities, less friction between intention and action, and a clearer sense of how each day connects to longer-term goals. The gym is already frictionless. David should extend that quality — habitual, low-overhead, consistent — to cognitively demanding work.
+- Isaac can ask for operational help or strategic help without re-explaining the full context every time.
+- Calendar changes are proposed clearly, revised through feedback when needed, and executed only after explicit confirmation.
+- Weekly planning reflects what actually happened during the week, not just what was previously intended.
+- Durable goals, durable memory, and weekly execution state stay cleanly separated.
+- The system preserves important positive and negative signal: decisions, rejections, recurring friction, and unresolved issues.
+- Review workflows survive restarts and resume from the exact active stage.
 
----
+## Core Interaction Modes
 
-## What
+David has two runtime reasoning modes:
 
-### Success Criteria
+- `operational`
+  Short-horizon assistance such as scheduling, availability checks, next-step help, and lightweight execution guidance.
+- `strategic`
+  Longer-horizon reasoning such as prioritization, tradeoffs, reflection, review, planning, and goal alignment.
 
-David works if, after three months of use:
+These modes drive both thinking depth and context selection. They do not imply separate assistants.
 
-- Daily and weekly plans are proposed, confirmed, and largely followed — with changes made intentionally rather than reactively
-- Long-term goals remain visible and connected to near-term actions, not buried until a quarterly review
-- The cost of deciding what to do next is low enough that it no longer becomes a reason to stall
+## Scheduled Workflows
 
-These are intentionally qualitative. This is a personal productivity system, not a production ML service — the measure is whether it changes behaviour, not whether it hits a metric.
+David also runs two recurring workflows:
 
-### Functional Requirements
+- daily check-in
+  A lightweight recurring planning touchpoint that helps reset the day against current priorities and calendar reality.
+- Sunday review
+  The heavier weekly reset that reviews the past week, audits durable context, and prepares the coming week.
 
-David must handle three interaction modes. The first is automated: a daily morning check-in and a Sunday weekly review, both triggered without manual initiation. The second is operational ad hoc: short exchanges to reschedule events, retrieve past decisions, or block time. The third is reasoning ad hoc: open-ended brainstorming and priority discussion sessions that may run long.
+## System Shape
 
-All calendar writes require explicit user confirmation before execution. The bot proposes, the user confirms or adjusts, only then does anything get written to Google Calendar.
+David is designed as a lightweight, always-on assistant with four core layers:
 
-The Sunday review must read the prior week's actual calendar against what was planned, reason about the gap, propose the coming week's time blocks, and wait for sign-off before writing anything.
+- interface
+  Telegram is the primary user surface for conversation, review feedback, and confirmations.
+- reasoning
+  LLM calls handle operational help, strategic help, memory synthesis, and staged weekly review.
+- memory
+  `goals.md`, `weekly_state.md`, and `decision_log.md` carry durable context in human-readable form.
+- persistence
+  Durable workflow state, proposal state, and audit data survive restarts and support resumable review flows.
 
-The system must maintain three persistent context documents — a goals poster, a weekly state, and a decision log — and inject all three into every LLM call. This is what separates David from a stateless chat assistant: it always knows the why behind the current state of the calendar.
+This design favors clarity, inspectability, and low operational overhead over framework-heavy orchestration.
 
-### Technical Requirements and Constraints
+## Context Model
 
-David runs as a single-user system on a VPS with always-on availability — no cold starts, no sleep timeouts. The Telegram interface must be responsive to messages at any hour. Scheduled triggers must fire reliably without manual intervention.
+Context is selective, not always full.
 
-Total cost must stay under $20/month. Expected actual cost is approximately $8–9/month including infrastructure, LLM API calls, and observability tooling.
+David uses four context profiles:
 
-Any calendar write must be auditable after the fact. The system must log what was proposed, whether it was confirmed, and when it was executed. Timeouts must be handled automatically, with requests or triggers queued for scheduled runs that arrive during active sessions.
+- `lean`
+  `CURRENT_DATETIME`, `WEEKLY_STATE`
+- `calendar_context`
+  `CURRENT_DATETIME`, `WEEKLY_STATE`, `UPCOMING_CALENDAR`
+- `priority_strategy`
+  `CURRENT_DATETIME`, `GOALS`, `WEEKLY_STATE`, `DECISION_LOG`
+- `full`
+  `CURRENT_DATETIME`, `GOALS`, `WEEKLY_STATE`, `DECISION_LOG`, `UPCOMING_CALENDAR`
 
-### Out of Scope (v1)
+The system should choose the smallest valid profile for the task at hand. Calendar-aware turns earn calendar context. Strategy-aware turns earn goal and memory context. Mixed turns earn full context.
 
-The following are explicitly deferred: multi-user or shared calendar access, voice input, work calendar integration, semantic search over historical decisions, and any mobile notification mechanism beyond Telegram messages. Data privacy hardening (encryption at rest, self-hosted LLM) is also deferred.
+## Key Architectural Decisions
 
-### Assumptions
+- Selective context over always-full context
+  The system uses the smallest valid context profile for the turn instead of injecting all artifacts into every call.
+- Markdown artifacts as first-class memory
+  Goals, weekly state, and rolling memory stay human-readable, editable, and easy to audit.
+- Staged Sunday review over one-shot review
+  Weekly review is split into sequential stages so later steps inherit earlier findings.
+- Revision-aware proposal threads
+  Calendar proposals are refined through revisions and feedback before execution.
+- Durable workflow state over chat-history-only coordination
+  Structured workflow records, snapshots, and change sets are the source of truth for review recovery and resume behavior.
 
-Isaac is the only user. Daily interaction volume is low — on the order of 5–15 exchanges per day across all modes. The reasoning workload is primarily natural language (priority tradeoffs, goal framing, scheduling logic), not structured ML inference. Google Calendar is the single source of truth for scheduled time.
+## Persistent Artifacts
 
----
+David maintains three long-lived markdown artifacts. Each has a strict ownership boundary.
 
-## How
+### `goals.md`
 
-### Methodology
+Purpose:
+- store durable direction and operating principles
 
-The core design decision is to treat context as a first-class artifact rather than relying on conversation history. Every LLM call is assembled by a `ContextBuilder` that reads three flat files — `goals.md`, `weekly_state.md`, `decision_log.md` — along with a live read of the Google Calendar. This means the reasoning model always has the full picture, regardless of whether the current exchange is a 1-turn reschedule request or a 30-turn brainstorm.
+Contains:
+- long-term goals
+- medium-term goals
+- near-term goals that still matter beyond a single week
+- stable operating principles David should consistently respect
+
+Does not contain:
+- this week's priorities
+- session-level decisions
+- temporary scheduling concerns
+- short-lived execution notes
 
-Instead of model routing, David uses **thinking budget routing**. The system uses a single general driver model (Gemini Flash) for all daily interactions, ad hoc reasoning, and session synthesis, allocating inference compute dynamically. Gemini Pro is reserved exclusively for the Sunday weekly review.
+### `weekly_state.md`
 
-The `MessageRouter` evaluates incoming messages using heuristic classification to determine the user's intent: `OPERATIONAL` (reschedule, retrieve, simple queries — no thinking budget), `BRAINSTORM` (open-ended discussion — low-medium thinking budget), or `GOAL_REVIEW` (direction, priorities, what should I do — high thinking budget). Flash is then called with the assembled context and the corresponding thinking budget passed through to the API config.
+Purpose:
+- store this week's operating plan only
 
-Gemini Flash always returns a typed `FlashResponse` object with two fields: `message` (the response text) and an optional `proposed_calendar_action` (a structured event proposal). If a calendar action is proposed, the orchestrator queues it for confirmation. Using a structured response schema via the `google-genai` SDK enforces this at the API level.
+Contains:
+- top priorities for the current week
+- intentional carryover
+- current-week constraints
+- execution focus for this week
 
-Brainstorming sessions run on Flash throughout and close when the user presses a `/done` button or after 30 minutes of inactivity. At close, the full session transcript is synthesised by Flash using a high thinking budget. This avoids the cost of Pro entirely for daily operations while maintaining a high-quality distillation of the decision log.
+Does not contain:
+- durable goals
+- cross-week preferences
+- rolling memory
+- transcript-style reasoning
 
-For system diagrams, see [ARCHITECTURE.md](./ARCHITECTURE.md).
+### `decision_log.md`
 
-### System Design
+Purpose:
+- store cross-week memory plus a current-week inbox
 
-The system has five layers.
+Contains two sections:
+- `Current Rolling Context`
+  Durable memory that should survive week resets
+- `Recent Decisions (Appended Daily)`
+  Current-week notes waiting for weekly compaction
 
-The **interface layer** is a `python-telegram-bot` async process. It receives messages and button presses, routes them to the orchestration layer, and sends responses back. Inline buttons handle confirmation flows and session close actions.
+`Current Rolling Context` stores:
+- durable preferences and boundaries
+- important accepted or rejected decisions with lasting relevance
+- recurring friction patterns
+- interpretation rules that improve future reasoning
+- unresolved issues worth resurfacing later
 
-The **orchestration layer** is self-built Python — no LangChain, no LangGraph. It owns five concerns: session lifecycle state (`SessionManager`), intent classification and budget routing (`MessageRouter`), context assembly (`ContextBuilder`), confirmation-gated calendar writes (`ConfirmationQueue`), and scheduled trigger management (`TriggerScheduler`). Each is a single-responsibility module; the whole layer is approximately 400 lines.
+`Recent Decisions` stores:
+- compact weekly signal for later review and compaction
 
-The **reasoning layer** is two Gemini clients — Flash and Pro — both via the `google-genai` SDK. Flash receives dynamic thinking budgets based on intent. Flash responses are typed via Pydantic response schema, enforcing structured output at the API level. Both models have 1M token context windows, which means the assembled context never needs to be trimmed.
+It should not become a transcript archive or a duplicate of `weekly_state.md`.
 
-The **context layer** is three markdown files on disk. They are read by `ContextBuilder` on every call and written by Flash at the end of brainstorm sessions, and by Pro during Sunday reviews. Keeping them as flat files rather than database rows means they are human-readable, human-editable, and straightforward to debug.
+## Memory Maintenance
 
-The **persistence layer** is SQLite with four tables: `sessions`, `decisions`, `calendar_writes`, and `weekly_snapshots`. This is the structured audit trail — not the LLM's working memory, which lives in the context files. The `decision_log.md` is synthesised weekly to maintain a rolling window of recent decisions, preventing indefinite growth.
+David maintains memory in two passes:
 
-### Conversation Lifecycle
+- session synthesis
+  Distills completed sessions into compact entries for `Recent Decisions (Appended Daily)`
+- weekly compaction
+  Promotes durable signal from `Recent Decisions` into `Current Rolling Context` and clears the weekly inbox
 
-Every conversation has an explicit lifecycle: `IDLE → ACTIVE → CLOSING → IDLE`. The transition from `ACTIVE` to `CLOSING` is triggered either by the user pressing a `/done` button on Telegram (which surfaces two options — close without calendar actions, or close and propose calendar changes) or by a 30-minute inactivity timeout. At `CLOSING`, the session transcript is sent to Flash (with a high thinking budget) to distill decisions, rationale, and calendar actions, which are then appended to the current `decision_log.md`. The full log is only synthesised and compacted into a rolling window once a week during the Sunday review.
+Session synthesis should keep:
+- accepted decisions
+- meaningful rejections
+- important rationale
+- recurring friction
+- notable follow-ups or unresolved issues
+- interpretation rules clarified during the session
 
-Scheduled triggers respect active sessions. If the daily check-in fires during an active brainstorm, it is queued and delivered immediately after the session closes. If the Sunday review fires during an active session, a non-intrusive nudge is sent and the review waits for manual initiation or fires automatically one hour after the session closes.
+Weekly compaction should keep only what still matters after the week ends. It should not preserve routine schedule snapshots or restate weekly execution plans.
 
-### Infrastructure
+## Rejected Alternatives
 
-David runs as a `systemd` service on AWS Lightsail. Latency is 15–20ms — imperceptible given LLM call times of 1–3 seconds. The service costs approximately USD $5/month. Daily backups of `assistant.db` and the `/context` directory are pushed to Backblaze B2 via `rclone` at negligible cost.
+- Always injecting full context into every call
+  This increases token use and noise on turns that only need a narrow slice of state.
+- One-shot Sunday review
+  A single reasoning pass cannot reliably carry forward constraints, revisions, and feedback across the whole review flow.
+- Single immutable proposals
+  Calendar work often needs iterative revision, so proposals must support multiple drafts before confirmation.
+- Transcript-only memory
+  Raw history is too noisy to serve as durable memory without structured synthesis and weekly compaction.
+- Raw line-diff artifact management
+  Markdown files need semantic additions, deletions, and modifications rather than low-level textual diffs.
 
-Observability uses three tools: Langfuse (cloud free tier) for per-call LLM traces, token counts, and cost tracking; Sentry (free tier) for exception capture; and `loguru` for structured local logs with rotation.
-
-### Tech Stack
-
-| Layer | Tool |
-|---|---|
-| Language | Python 3.12 |
-| Dependency management | `uv` |
-| Telegram interface | `python-telegram-bot` |
-| LLM — daily/ad hoc | Gemini Flash (`google-genai`) |
-| LLM — weekly review | Gemini Pro |
-| Calendar | `google-api-python-client` + `google-auth-oauthlib` |
-| Scheduler | `APScheduler` 3.x |
-| Database | SQLite + `sqlite-utils` |
-| Config | `python-dotenv` |
-| Logging | `loguru` |
-| LLM tracing | Langfuse |
-| Error alerting | Sentry |
-| Deployment | AWS Lightsail + `systemd` |
-| Backups | `rclone` → Backblaze B2 |
-
-### Cost
-
-| Item | Monthly |
-|---|---|
-| AWS Lightsail | ~$5 USD |
-| Gemini Flash (daily, ad hoc, synthesis) | ~$1.50 |
-| Gemini Pro (weekly) | ~$0.50 |
-| Langfuse, Sentry, Backblaze B2 | $0 |
-| **Total** | **~$7.00** |
-
----
-
-## Alternatives Considered and Rejected
-
-**LangChain / LangGraph as the orchestration framework.** Both were considered and rejected. LangChain adds abstraction over APIs that are already mature and easy to use directly; the abstraction makes debugging harder without meaningful benefit at this scale. LangGraph is well-suited for complex agent graphs with parallel branches and many nodes — the orchestration here is sequential and is better served by 400 lines of clean Python than by a graph framework.
-
-**Two-tier model escalation (Flash drafting for Pro).** Initially considered as a way to reserve reasoning costs. Rejected because dynamically adjusting the "thinking budget" on a single model (Flash) is architecturally simpler, faster, and achieves the same reasoning depth without maintaining an `EscalationHandler`, an `escalations` database table, or complex inter-model state handoffs.
-
-**`[[ESCALATE: reason]]` string signal for escalation routing.** Initially considered as a simple mechanism for Flash to signal the need for escalation. Rejected because Flash is a probabilistic system — it will sometimes emit partial matches, capitalisation variations, or omit the signal under certain generation conditions. String matching on free-text output is a fragile interface for a routing decision that affects cost, latency, and response quality. The current approach avoids escalation routing entirely: Flash handles daily interactions directly and returns a typed `FlashResponse` via the `response_schema` parameter.
-**Three-layer router architecture (daily layer → strategy layer → logic layer).** Considered at the suggestion of common agentic design patterns. Rejected because the complexity — additional latency, a separate routing model, more prompt engineering surface area — is not justified for a single-user, low-volume system. Heuristic classification of thinking budgets in a single router achieves the same functional outcome with far less to debug.
-
-**Sending only Flash's summary to Pro during a handoff.** Considered as a way to reduce token cost on the Sunday review path. Rejected because Pro's job there is to reason about the full weekly picture involving goals, calendar commitments, and decision history. Stripping that context and asking Pro to judge from a summary alone would make Pro's reasoning less grounded than Flash's daily context. Token cost on the weekly review call is negligible given the 1M context window.
-
-**Claude Sonnet 4.6 as the reasoning model.** Strong instruction-following and structured output reliability. Rejected primarily on cost ($3/$15 per 1M tokens vs. $2/$12 for Gemini Pro) and context window (200k vs. 1M). The 1M context window eliminates an entire class of engineering problems — no need to trim the context document as the decision log grows.
-
-**GPT-5.4 as the reasoning model.** Impressive benchmark performance. Rejected because its tiered pricing doubles past 272k tokens for the full session — an active risk for a system that deliberately injects large context on every call.
-
-**PostgreSQL instead of SQLite.** Rejected. PostgreSQL introduces a separate server process, network overhead, connection management, and ops complexity. For a single-user system generating ~50–100 rows per day, SQLite is the correct choice — it handles millions of rows, provides full ACID transactions, and is a single file that can be backed up with `cp`.
-
-**Fly.io or Render for deployment.** Both considered. Fly.io has usage-based pricing that is hard to predict and risks cold starts. Render's free tier sleeps on inactivity — fatal for an always-on bot. The paid Render tier that avoids sleep costs $19/month before compute. AWS Lightsail provides full control, predictable cost, and no cold start behaviour.
-
-**Offloading brainstorming to an external chatbot (Claude.ai, ChatGPT).** Considered as a way to leverage better UX for long reasoning sessions and avoid LLM costs during multi-turn exchanges. Rejected because it breaks the integrated workflow: an external chatbot has no awareness of the goals poster, decision log, or calendar state, so it cannot make grounded recommendations. Using Flash for both exploration and synthesis achieves low cost and high-quality output at session close, without leaving the integrated system.
-
-**Using Gemini Pro for session synthesis** Original thought was to use the heavy reasoning power of Gemini Pro to be able to succinctly synthesise conversations while maintaining important context. However, seeing that each API call would quickly explode the cost especially with how long multi-turn conversations could get, opt for Flash with high thinking budget. A well-steered prompt + Flash should be adequate for session synthesis.
-
----
-
-## Appendix
-
-### Repository Structure
-
-```
-david/
-├── main.py
-├── .env
-├── .env.example
-├── pyproject.toml
-│
-├── bot/
-│   ├── handlers.py
-│   └── keyboards.py
-│
-├── orchestrator/
-│   ├── session_manager.py
-│   ├── message_router.py
-│   ├── context_builder.py
-│   ├── confirmation_queue.py
-│   └── trigger_scheduler.py
-│
-├── reasoning/
-│   ├── flash_client.py
-│   ├── pro_client.py
-│   └── prompts/
-│       ├── daily_checkin.txt
-│       ├── adhoc_operational.txt
-│       ├── adhoc_brainstorm.txt
-│       ├── synthesis.txt
-│       └── sunday_review.txt
-│
-├── integrations/
-│   ├── calendar.py
-│   └── auth.py
-│
-├── persistence/
-│   ├── database.py
-│   └── models.py
-│
-├── context/
-│   ├── goals.md
-│   ├── weekly_state.md
-│   └── decision_log.md
-│
-├── data/
-│   └── assistant.db
-│
-├── logs/
-│   └── app.log
-│
-└── scripts/
-    ├── setup.py
-    └── backup.sh
-```
-
-### Build Order
-
-1. Repo scaffold + `uv` environment
-2. Google Calendar OAuth + basic read test
-3. Telegram bot loop (echo test)
-4. `ContextBuilder` + `goals.md` schema
-5. First Gemini Flash call through orchestrator with typed `FlashResponse`
-6. Calendar write with confirmation queue
-7. APScheduler daily trigger
-8. Session lifecycle (`SessionManager` + `/done` button)
-9. Sunday review flow (Pro)
-10. Langfuse + Sentry wiring
-11. Backup script
+## Proposal Model
+
+Calendar proposals are revision-aware.
+
+David uses proposal threads, not single immutable proposals.
+
+A proposal thread represents one underlying intent, such as:
+- reschedule an event
+- find a workable deep work block
+- refine a weekly review scheduling proposal
+
+Thread-level states:
+- `draft`
+- `in_revision`
+- `ready_for_confirmation`
+- `confirmed`
+- `rejected`
+- `executed`
+
+Revision-level states:
+- `active`
+- `superseded`
+
+`superseded` applies to an older revision that has been replaced by a newer revision in the same thread.
+
+`rejected` applies to the proposal thread as a whole.
+
+Calendar `cancel` remains an event operation, not a general proposal lifecycle state.
+
+## Sunday Review
+
+Sunday review is a staged workflow.
+
+Its responsibilities are:
+- review what happened during the week
+- reconfirm goals and detect drift
+- audit rolling memory for accuracy and relevance
+- reset the coming week's operating plan
+- propose time blocks that respect what the review has learned
+
+The workflow runs in order:
+
+1. `week_review`
+2. `goals_audit`
+3. `memory_audit`
+4. `weekly_plan`
+5. `scheduling_pass`
+6. `final_review`
+
+Later stages must inherit constraints and lessons from earlier stages. If the review learns that a certain class of schedule proposal does not work, the scheduling pass must respect that.
+
+## Workflow State
+
+Sunday review is a durable workflow, not a disposable session.
+
+Each review begins by freezing one `SourceSnapshot`:
+- `goals.md`
+- `weekly_state.md`
+- `decision_log.md`
+- past-week calendar
+- upcoming calendar context when needed
+
+This snapshot is stored once for the workflow and reused by later stages. Stages should not keep duplicating the same source files.
+
+The workflow persists a `ReviewState` record that stores:
+- workflow status
+- current stage
+- stage status
+- source snapshot reference
+- compact stage outputs
+- artifact change sets
+- active proposal threads
+
+Chat history may support the workflow, but it is not the source of truth.
+
+## Stage Outputs
+
+Each review stage writes a compact structured result. A stage output should store only what later stages need, such as:
+- `summary`
+- `key_findings`
+- `constraints`
+- `carry_forward`
+- final artifact text when that stage directly produces one
+
+Stage outputs should be short, behavior-driving summaries rather than verbose reasoning dumps.
+
+## Artifact Changes
+
+Markdown updates should be tracked as semantic change sets rather than raw line diffs.
+
+Each change set records:
+- additions
+- deletions
+- modifications
+- a short summary of intent
+
+Full markdown is the final rendered artifact, not the only stored representation.
+
+This keeps review outputs:
+- inspectable
+- resumable
+- easier to revise after feedback
+
+## Reliability And Recovery
+
+Review workflows must survive restarts and process failures. The system guarantees:
+- stale-session cleanup does not discard active review workflows
+- each stage has a commit boundary
+- a stage advances only after its output is validated and persisted
+- workflows resume from the exact active stage and interaction state
+- important review progress is never stored only in chat history
+
+Ordinary chat sessions may be disposable. Sunday review workflows are not.
+
+## Functional Deliverables
+
+The end-state system should deliver:
+
+- operational and strategic reasoning modes
+- selective context routing
+- confirmation-gated calendar execution
+- revision-aware proposal threads
+- compact session synthesis
+- durable weekly memory compaction
+- staged Sunday review orchestration
+- persisted review workflow state
+- semantic change tracking for managed markdown artifacts
+
+## Constraints
+
+The system is designed for:
+- one user
+- low to moderate daily interaction volume
+- always-on availability
+- auditable calendar writes
+- low monthly operating cost
+
+The design optimizes for clarity, durability, and low-friction reasoning rather than maximal automation or multi-user scale.
+
+## Out Of Scope
+
+The following are out of scope for this design:
+- multi-user support
+- shared-calendar collaboration workflows
+- voice-first interaction
+- enterprise/team planning
+- transcript archival as a primary memory system
+- generic agent framework abstraction for its own sake

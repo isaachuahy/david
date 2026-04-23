@@ -1,3 +1,4 @@
+import asyncio
 import httpcore
 import httpx
 from loguru import logger
@@ -17,6 +18,7 @@ from observability.sentry import (
     capture_exception as capture_sentry_exception,
     init_sentry as bootstrap_sentry,
 )
+from orchestrator.review_manager import reconcile_review_workflows
 from orchestrator.trigger_scheduler import setup_scheduler
 from orchestrator.session_manager import (
     invalidate_restart_volatile_user_data,
@@ -96,6 +98,17 @@ def main() -> int:
         logger.info("Initializing David's Telegram interface...")
         init_db()
         reconcile_orphaned_sessions()
+        try:
+            asyncio.run(reconcile_review_workflows())
+        except Exception as exc:
+            capture_sentry_exception(
+                exc,
+                component="startup",
+                operation="reconcile_review_workflows",
+                message="Failed to restore persisted Sunday review workflows during startup.",
+                tags={"error_kind": "review_reconciliation"},
+            )
+            raise
         persistence = PicklePersistence(
             filepath=str(get_telegram_persistence_path()),
             store_data=PersistenceInput(

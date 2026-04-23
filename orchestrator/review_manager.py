@@ -1,5 +1,7 @@
+import asyncio
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Optional
 from loguru import logger
 from telegram.ext import ContextTypes
 
@@ -7,8 +9,389 @@ from observability.sentry import capture_exception as capture_sentry_exception
 from orchestrator.context_builder import build_context
 from integrations.calendar import get_past_events
 from persistence.database import get_db
+from persistence.models import (
+    ReviewStage,
+    ReviewWorkflowRecord,
+    ReviewWorkflowStatus,
+    SourceSnapshot,
+    StageCheckpoint,
+    StageStatus,
+)
+from persistence.review_workflows import (
+    load_resumable_review_workflows_sync,
+    load_review_workflow_sync,
+    save_review_workflow_sync,
+)
 from reasoning.pro_client import generate_sunday_review, SundayReviewResponse
 from runtime_paths import get_context_dir
+
+
+_REVIEW_STAGE_FIELD_BY_STAGE = {
+    ReviewStage.WEEK_REVIEW: "week_review",
+    ReviewStage.GOALS_AUDIT: "goals_audit",
+    ReviewStage.MEMORY_AUDIT: "memory_audit",
+    ReviewStage.WEEKLY_PLAN: "weekly_plan",
+    ReviewStage.SCHEDULING_PASS: "scheduling_pass",
+    ReviewStage.FINAL_REVIEW: "final_review",
+}
+
+
+def _utc_now_iso() -> str:
+    """Returns a timezone-aware UTC timestamp for durable workflow records."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _read_context_markdown(filename: str) -> str:
+    """
+    Reads one context markdown file from disk.
+
+    Missing files are treated as empty strings so a review can still be
+    initialized during partial migrations or early setup.
+    """
+    path = get_context_dir() / filename
+    if not path.exists():
+        logger.warning("Context file {} was missing while building a review snapshot.", filename)
+        return ""
+    return path.read_text(encoding="utf-8").strip()
+
+
+def _format_past_event_lines(past_events_raw: list[dict]) -> list[str]:
+    """
+    Normalizes past-week calendar events into compact durable strings.
+
+    The review snapshot stores these lines rather than raw event payloads so
+    later stages can reason from a stable, compact baseline across restarts.
+    """
+    lines: list[str] = []
+
+    for event in past_events_raw:
+        # Keep each event compact and human-readable because the snapshot is
+        # meant to anchor review reasoning, not preserve the full API payload.
+        start_time = event["start"].get("dateTime", event["start"].get("date"))
+        summary = event.get("summary", "Busy / No Title")
+        lines.append(f"[{start_time}] {summary}")
+
+    return lines
+
+
+async def build_review_source_snapshot() -> SourceSnapshot:
+    """
+    Builds the frozen source snapshot for a Sunday review workflow.
+
+    The snapshot is captured once at review creation time so the multi-stage
+    review can recover from process failures without re-reading a drifting
+    working set from disk on every resume.
+    """
+    try:
+        goals_markdown, weekly_state_markdown, decision_log_markdown, past_events_raw = await asyncio.gather(
+            asyncio.to_thread(_read_context_markdown, "goals.md"),
+            asyncio.to_thread(_read_context_markdown, "weekly_state.md"),
+            asyncio.to_thread(_read_context_markdown, "decision_log.md"),
+            asyncio.to_thread(get_past_events, days=7),
+        )
+
+        return SourceSnapshot(
+            goals_markdown=goals_markdown,
+            weekly_state_markdown=weekly_state_markdown,
+            decision_log_markdown=decision_log_markdown,
+            past_week_events=_format_past_event_lines(past_events_raw or []),
+        )
+    except Exception as error:
+        capture_sentry_exception(
+            error,
+            component="review_manager",
+            operation="build_review_source_snapshot",
+            message="Failed to build the Sunday review source snapshot.",
+        )
+        raise
+
+
+async def save_review_workflow(record: ReviewWorkflowRecord) -> ReviewWorkflowRecord:
+    """
+    Saves the full review workflow snapshot after a meaningful state transition.
+
+    The entire record is rewritten on each checkpoint so the persisted state is
+    always self-contained and resumable after a restart.
+    """
+    try:
+        record.updated_at = _utc_now_iso()
+        await asyncio.to_thread(save_review_workflow_sync, record)
+        return record
+    except Exception as error:
+        capture_sentry_exception(
+            error,
+            component="review_manager",
+            operation="save_review_workflow",
+            message="Failed to persist Sunday review workflow state.",
+            tags={
+                "review_id": record.id,
+                "current_stage": record.current_stage.value,
+                "stage_status": record.stage_status.value,
+            },
+        )
+        raise
+
+
+async def load_review_workflow(review_id: str) -> Optional[ReviewWorkflowRecord]:
+    """Loads a review workflow asynchronously from SQLite."""
+    try:
+        return await asyncio.to_thread(load_review_workflow_sync, review_id)
+    except Exception as error:
+        capture_sentry_exception(
+            error,
+            component="review_manager",
+            operation="load_review_workflow",
+            message="Failed to load Sunday review workflow state.",
+            tags={"review_id": review_id},
+        )
+        raise
+
+
+async def create_review_workflow(snapshot: Optional[SourceSnapshot] = None) -> ReviewWorkflowRecord:
+    """
+    Creates and persists a new Sunday review workflow record.
+
+    Callers may provide a prebuilt snapshot for testing or for future staged
+    orchestration; otherwise the snapshot is built from the current durable
+    markdown artifacts and past-week calendar history.
+    """
+    try:
+        timestamp = _utc_now_iso()
+        review_snapshot = snapshot or await build_review_source_snapshot()
+        record = ReviewWorkflowRecord(
+            id=f"review_{uuid.uuid4().hex[:8]}",
+            created_at=timestamp,
+            updated_at=timestamp,
+            source_snapshot=review_snapshot,
+        )
+        return await save_review_workflow(record)
+    except Exception as error:
+        capture_sentry_exception(
+            error,
+            component="review_manager",
+            operation="create_review_workflow",
+            message="Failed to create a new Sunday review workflow.",
+        )
+        raise
+
+
+async def update_review_stage_state(
+    record: ReviewWorkflowRecord,
+    *,
+    workflow_status: Optional[ReviewWorkflowStatus] = None,
+    current_stage: Optional[ReviewStage] = None,
+    stage_status: Optional[StageStatus] = None,
+    last_completed_stage: Optional[ReviewStage] = None,
+) -> ReviewWorkflowRecord:
+    """
+    Applies a review-stage transition and persists it.
+
+    The caller controls the transition explicitly so the persistence layer stays
+    predictable: stage boundaries and feedback pauses are committed only when
+    the orchestrator decides the workflow has truly advanced.
+    """
+    if workflow_status is not None:
+        record.workflow_status = workflow_status
+    if current_stage is not None:
+        record.current_stage = current_stage
+    if stage_status is not None:
+        record.stage_status = stage_status
+    if last_completed_stage is not None:
+        record.last_completed_stage = last_completed_stage
+
+    return await save_review_workflow(record)
+
+
+async def save_stage_checkpoint(
+    record: ReviewWorkflowRecord,
+    stage: ReviewStage,
+    checkpoint: StageCheckpoint,
+) -> ReviewWorkflowRecord:
+    """
+    Stores the distilled result for one review stage and persists the workflow.
+
+    The stage-to-field mapping is centralized here so later orchestration code
+    can checkpoint stages without scattering attribute-name logic.
+    """
+    setattr(record, _REVIEW_STAGE_FIELD_BY_STAGE[stage], checkpoint)
+    record.last_completed_stage = stage
+    return await save_review_workflow(record)
+
+
+async def reconcile_review_workflows() -> list[ReviewWorkflowRecord]:
+    """
+    Returns persisted reviews that should survive startup reconciliation.
+
+    This does not attempt to auto-run the next stage yet; it simply restores
+    the durable records that must not be treated like disposable chat sessions.
+    """
+    try:
+        records = await asyncio.to_thread(load_resumable_review_workflows_sync)
+        if not records:
+            logger.info("No active Sunday review workflows found during startup reconciliation.")
+            return []
+
+        logger.info(
+            "Restored {} resumable Sunday review workflow(s) from persistence.",
+            len(records),
+        )
+        return records
+    except Exception as error:
+        capture_sentry_exception(
+            error,
+            component="review_manager",
+            operation="reconcile_review_workflows",
+            message="Failed to reconcile persisted Sunday review workflows at startup.",
+        )
+        raise
+
+
+async def start_weekly_review_workflow(
+    tg_context: ContextTypes.DEFAULT_TYPE | None = None,
+) -> tuple[ReviewWorkflowRecord, SundayReviewResponse]:
+    """
+    Starts the current Sunday review flow behind one orchestration boundary.
+
+    This is the bridge away from handler-owned workflow logic: the Telegram
+    layer should only ask to start the review, while this function handles
+    durable workflow creation, state transitions, checkpointing, and the
+    temporary one-shot review call that still powers the analysis today.
+    """
+    review_workflow: ReviewWorkflowRecord | None = None
+
+    try:
+        review_workflow = await create_review_workflow()
+        review_workflow = await update_review_stage_state(
+            review_workflow,
+            current_stage=ReviewStage.WEEK_REVIEW,
+            stage_status=StageStatus.RUNNING,
+        )
+        review = await asyncio.to_thread(run_sunday_review, tg_context)
+
+        carry_forward = ["Weekly state proposal is awaiting confirmation."]
+        if review.proposed_events:
+            carry_forward.append(
+                f"{len(review.proposed_events)} calendar proposal(s) are queued for confirmation."
+            )
+
+        review_workflow = await save_stage_checkpoint(
+            review_workflow,
+            ReviewStage.FINAL_REVIEW,
+            StageCheckpoint(
+                summary=review.message,
+                key_findings=[review.state_change_summary] if review.state_change_summary else [],
+                carry_forward=carry_forward,
+            ),
+        )
+        review_workflow = await update_review_stage_state(
+            review_workflow,
+            workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            current_stage=ReviewStage.FINAL_REVIEW,
+            stage_status=StageStatus.AWAITING_FEEDBACK,
+        )
+
+        return review_workflow, review
+    except Exception as error:
+        if review_workflow is not None:
+            try:
+                await update_review_stage_state(
+                    review_workflow,
+                    workflow_status=ReviewWorkflowStatus.FAILED,
+                )
+            except Exception as update_error:
+                capture_sentry_exception(
+                    update_error,
+                    component="review_manager",
+                    operation="start_weekly_review_workflow_mark_failed",
+                    message="Failed to mark a Sunday review workflow as failed after start-up review execution broke.",
+                    tags={"review_id": review_workflow.id},
+                )
+
+        capture_sentry_exception(
+            error,
+            component="review_manager",
+            operation="start_weekly_review_workflow",
+            message="Failed to start the Sunday review workflow.",
+            tags={"review_id": review_workflow.id if review_workflow is not None else "unknown"},
+        )
+        raise
+
+
+async def apply_weekly_state_feedback(
+    review_id: str,
+    *,
+    accepted: bool,
+    proposal_expired: bool = False,
+    has_pending_event_feedback: bool = False,
+) -> Optional[ReviewWorkflowRecord]:
+    """
+    Applies the current bridge-era weekly-state feedback to the review workflow.
+
+    Weekly-state confirmation is only one feedback surface inside the Sunday
+    review. The workflow should remain open if the user rejected the state,
+    the proposal expired, or weekly-review event confirmations are still
+    outstanding.
+    """
+    record = await load_review_workflow(review_id)
+    if record is None:
+        return None
+
+    if proposal_expired or not accepted:
+        return await update_review_stage_state(
+            record,
+            workflow_status=ReviewWorkflowStatus.ACTIVE,
+            current_stage=ReviewStage.FINAL_REVIEW,
+            stage_status=StageStatus.IN_REVISION,
+        )
+
+    if has_pending_event_feedback:
+        return await update_review_stage_state(
+            record,
+            workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            current_stage=ReviewStage.FINAL_REVIEW,
+            stage_status=StageStatus.AWAITING_FEEDBACK,
+        )
+
+    return await update_review_stage_state(
+        record,
+        workflow_status=ReviewWorkflowStatus.COMPLETED,
+        current_stage=ReviewStage.FINAL_REVIEW,
+        stage_status=StageStatus.COMPLETED,
+        last_completed_stage=ReviewStage.FINAL_REVIEW,
+    )
+
+
+async def apply_weekly_review_event_feedback(
+    review_id: str,
+    *,
+    has_pending_weekly_state_feedback: bool,
+) -> Optional[ReviewWorkflowRecord]:
+    """
+    Applies the last-event feedback transition for the current Sunday review.
+
+    This helper assumes it is called after the final queued weekly-review
+    event proposal has been resolved. If weekly-state feedback is still open,
+    the review remains in `AWAITING_FEEDBACK`; otherwise it is complete.
+    """
+    record = await load_review_workflow(review_id)
+    if record is None:
+        return None
+
+    if has_pending_weekly_state_feedback:
+        return await update_review_stage_state(
+            record,
+            workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            current_stage=ReviewStage.FINAL_REVIEW,
+            stage_status=StageStatus.AWAITING_FEEDBACK,
+        )
+
+    return await update_review_stage_state(
+        record,
+        workflow_status=ReviewWorkflowStatus.COMPLETED,
+        current_stage=ReviewStage.FINAL_REVIEW,
+        stage_status=StageStatus.COMPLETED,
+        last_completed_stage=ReviewStage.FINAL_REVIEW,
+    )
 
 def run_sunday_review(tg_context: ContextTypes.DEFAULT_TYPE = None) -> SundayReviewResponse:
     """
@@ -24,12 +407,8 @@ def run_sunday_review(tg_context: ContextTypes.DEFAULT_TYPE = None) -> SundayRev
         if not past_events_raw:
             past_events_block = "No events found in the past week."
         else:
-            lines = []
-            for event in past_events_raw:
-                start_time = event['start'].get('dateTime', event['start'].get('date'))
-                summary = event.get('summary', 'Busy / No Title')
-                lines.append(f"- [{start_time}] {summary}")
-            past_events_block = "\n".join(lines)
+            lines = _format_past_event_lines(past_events_raw)
+            past_events_block = "\n".join(f"- {line}" for line in lines)
 
         review = generate_sunday_review(context_block, past_events_block)
         return review

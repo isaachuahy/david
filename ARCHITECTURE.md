@@ -1,244 +1,248 @@
 # David — Architecture
 
-*Companion to the design document. Three diagrams at increasing levels of detail.*
-
----
+Companion to [DESIGN_DOC.md](./DESIGN_DOC.md). End-state runtime architecture only.
 
 ## 1. System Context
 
-The highest-level view. David sits between Isaac and three external systems: Telegram (interface), Google Calendar (integration), and the Gemini API (reasoning). Everything else is internal.
+David sits between Isaac and three external systems:
+- Telegram for interaction
+- Google Calendar for read/write scheduling
+- an LLM API for reasoning and synthesis
 
 ```mermaid
 C4Context
     title David — System Context
 
-    Person(isaac, "Isaac", "Single user. Interacts via Telegram on mobile or desktop.")
+    Person(isaac, "Isaac", "Single user. Interacts through Telegram.")
 
-    System(david, "David", "Personal executive assistant. Manages calendar, holds context, supports reasoning and planning.")
+    System(david, "David", "Personal executive assistant. Holds context, reviews the week, proposes plans, and manages calendar changes.")
 
-    System_Ext(telegram, "Telegram", "Message interface. Delivers check-ins, receives commands, surfaces confirmation buttons.")
-    System_Ext(gcal, "Google Calendar", "Source of truth for scheduled time. David reads all calendars and writes confirmed blocks.")
-    System_Ext(gemini, "Gemini API (Google)", "Reasoning layer. Flash for daily/ad hoc, and session synthesis. Pro for weekly review.")
-    System_Ext(langfuse, "Langfuse", "LLM observability. Traces every call with token counts and cost.")
-    System_Ext(sentry, "Sentry", "Error alerting. Catches unhandled exceptions.")
-    System_Ext(b2, "Backblaze B2", "Off-site backup. Daily snapshot of SQLite + context files.")
+    System_Ext(telegram, "Telegram", "Message interface and confirmation surface.")
+    System_Ext(gcal, "Google Calendar", "Source of truth for scheduled time.")
+    System_Ext(llm, "LLM API", "Reasoning, synthesis, and review stages.")
 
-    Rel(isaac, telegram, "Sends messages and confirms proposals")
-    Rel(telegram, david, "Delivers inbound messages")
-    Rel(david, telegram, "Sends responses and proposals")
-    Rel(david, gcal, "Reads events; writes confirmed blocks")
-    Rel(david, gemini, "Sends assembled context; receives reasoning")
-    Rel(david, langfuse, "Streams LLM call traces")
-    Rel(david, sentry, "Reports exceptions")
-    Rel(david, b2, "Daily backup via rclone")
+    Rel(isaac, telegram, "Sends messages and feedback")
+    Rel(telegram, david, "Delivers messages and button actions")
+    Rel(david, telegram, "Sends responses, drafts, and confirmations")
+    Rel(david, gcal, "Reads availability and writes confirmed changes")
+    Rel(david, llm, "Sends structured prompts and receives structured outputs")
 ```
 
----
+## 2. Normal Interaction Flow
 
-## 2. Reasoning & Message Data Flow
+Normal conversation stays lightweight and selective.
 
-How a message moves through the system from receipt to response, using thinking budget routing.
+- The router classifies each turn as `operational` or `strategic`.
+- The router also detects whether the turn needs calendar context, strategy context, or both.
+- The context builder selects the smallest valid context profile.
+- Calendar proposals enter a revision-aware proposal thread.
+- Only a confirmed proposal is executed against Google Calendar.
 
 ```mermaid
 flowchart TD
-    A(["📨 Inbound message
-    (Telegram)"])
+    A["Inbound Telegram message"] --> B["RoutingDecision
+    intent + context flags"]
+    B --> C["ContextBuilder
+    select smallest profile"]
+    C --> D["LLM call"]
+    D --> E{"Response contains
+    calendar proposal?"}
 
-    A --> B{"SessionManager
-    What is current state?"}
+    E -- "No" --> F["Reply to user"]
+    E -- "Yes" --> G["Proposal thread
+    create or revise draft"]
+    G --> H["Show draft for feedback"]
+    H --> I{"User response"}
 
-    B -- "IDLE or ACTIVE" --> C["MessageRouter
-    Classify intent & assign budget"]
-    B -- "ACTIVE session
-    scheduled trigger fires" --> D{"Conflict resolution"}
+    I -- "Revise" --> G
+    I -- "Confirm" --> J["Execute confirmed calendar change"]
+    I -- "Reject" --> K["Mark thread rejected"]
 
-    D -- "Daily check-in" --> D1["Queue check-in
-    Deliver after session close"]
-    D -- "Sunday review" --> D2["Send nudge to user
-    Wait for /start_review"]
-
-    C -- "OPERATIONAL (No budget)" --> E
-    C -- "BRAINSTORM (Low budget)" --> E
-    C -- "GOAL_REVIEW (High budget)" --> E
-
-    E["ContextBuilder
-    Assemble prompt
-    + session history (always)"] --> G["Gemini Flash
-    Returns structured FlashResponse
-    {message, proposed_calendar_action}"]
-
-    G --> J{"Session closing?
-    /done or 30min timeout"}
-
-    J -- "False
-    still active" --> P{"Contains calendar
-    actions?"}
-    J -- "True
-    closing" --> M["Send full transcript
-    to Gemini Flash (High Budget)
-    for synthesis"]
-
-    M --> N["Gemini Flash
-    (Session synthesis)"]
-
-    N --> O["Update decision_log.md"]
-
-    P -- "No" --> K["Send response
-    to Telegram"]
-    P -- "Yes" --> Q["ConfirmationQueue
-    Write pending row to
-    calendar_writes table"]
-
-    Q --> R["Send proposal
-    to Telegram
-    with confirm buttons"]
-
-    R --> S{"User response"}
-
-    S -- "Confirmed" --> T["Execute write
-    Google Calendar API
-    Update row: confirmed"]
-    S -- "Rejected / adjusted" --> U["Discard or re-propose
-    Log outcome"]
-
-    T --> K
-    U --> K
-
-    K --> V(["📤 Response delivered"])
-
-    style N fill:#c8e6c9
-    style G fill:#fff9c4
-    style Q fill:#ffe0b2
-    style T fill:#c8e6c9
+    J --> F
+    K --> F
 ```
 
-### Key invariants
+### Context Profiles
 
-Every calendar write passes through `ConfirmationQueue` — there is no path from a model response to a Google Calendar write that bypasses user confirmation.
+David uses four context profiles:
+- `lean`
+- `calendar_context`
+- `priority_strategy`
+- `full`
 
-Flash always returns a typed `FlashResponse` object. The `MessageRouter` assigns a thinking budget based on intent classification (`OPERATIONAL`, `BRAINSTORM`, `GOAL_REVIEW`) via keyword heuristics. Because an operational query can seamlessly evolve into a brainstorm, chat history is maintained and injected into the context for all modes. This simplifies the architecture by keeping all ad hoc reasoning on a single model while scaling compute dynamically.
+The router chooses the smallest profile that can answer the turn correctly.
 
-Session synthesis goes to Flash with a high thinking budget. Pro is reserved for the Sunday weekly review.
+The system also runs two scheduled routines:
+- daily check-in, which reuses the normal interaction flow with scheduled initiation
+- Sunday review, which uses the staged workflow below
 
----
+## 3. Sunday Review Workflow
 
-## 3. Detailed Component Flowchart
+Sunday review is a durable staged workflow.
 
-Full internal architecture showing all components, data stores, and external services.
+It runs as a sequential pipeline:
+1. `week_review`
+2. `goals_audit`
+3. `memory_audit`
+4. `weekly_plan`
+5. `scheduling_pass`
+6. `final_review`
+
+Each stage consumes:
+- the frozen `SourceSnapshot`
+- committed outputs from earlier stages
+- active proposal and revision state when relevant
 
 ```mermaid
 flowchart TD
-%% ─────────────────────────────────────────
-%% EXTERNAL
-%% ─────────────────────────────────────────
-USER(["👤 Isaac
-(Telegram)"])
-GCAL[("📅 Google Calendar
-All Calendars")]
-LANGFUSE["📊 Langfuse
-LLM Traces + Cost"]
-SENTRY["🚨 Sentry
-Error Alerting"]
+    A["Start Sunday review"] --> B["Freeze SourceSnapshot"]
+    B --> C["week_review"]
+    C --> D["goals_audit"]
+    D --> E["memory_audit"]
+    E --> F["weekly_plan"]
+    F --> G["scheduling_pass"]
+    G --> H["final_review"]
+    H --> I{"User feedback?"}
 
-subgraph INTERFACE["📱 Telegram Interface"]
-    TG["python-telegram-bot
-    async message + button handlers"]
-end
-
-subgraph ORCH["⚙️ Orchestration Layer"]
-    SM["SessionManager
-    IDLE → ACTIVE → CLOSING → IDLE"]
-    MR["MessageRouter
-        Intent: Operational, Brainstorm, Goal Review
-        Assigns thinking budget"]
-    CB["ContextBuilder
-    goals + weekly_state +
-        decision_log + calendar
-        + session history"]
-    CQ["ConfirmationQueue
-    pending calendar writes
-    status: pending → confirmed"]
-    TS["TriggerScheduler
-    APScheduler
-    daily 7–9am + Sunday 10am
-    conflict resolution"]
-end
-
-subgraph REASONING["🧠 Reasoning Layer"]
-    FLASH["Gemini Flash
-
-    Daily check-ins
-    Ad hoc operational
-    Brainstorm turns
-    Session synthesis
-    Returns typed FlashResponse
-    ~$0.50/$3 per 1M tokens"]
-    PRO["Gemini Pro
-
-    Sunday review
-    Receives full context
-    ~$2/$12 per 1M tokens"]
-end
-
-subgraph CONTEXT["📄 Context Layer"]
-    GOALS["goals.md
-    long / medium / short term
-    human-edited"]
-    WEEKLY["weekly_state.md
-    current week priorities
-    overwritten every Sunday"]
-    DLOG["decision_log.md
-    rationale trail
-    appended daily, synthesised weekly"]
-end
-
-subgraph PERSIST["🗄️ Persistence — SQLite"]
-    T_SESS["sessions"]
-    T_DEC["decisions"]
-    T_CAL["calendar_writes"]
-    T_SNAP["weekly_snapshots"]
-end
-
-subgraph OBS["🔍 Observability"]
-    LOGURU["loguru / app.log"]
-end
-
-subgraph INFRA["🖥️ AWS Lightsail"]
-    SYSTEMD["systemd — auto-restart"]
-    BACKUP["rclone → Backblaze B2"]
-end
-
-USER -- "message / button" --> TG
-TG --> SM --> MR
-    MR --> CB
-
-CB --> GOALS & WEEKLY & DLOG & GCAL
-CB --> FLASH
-
-    FLASH --> TG
-    FLASH --> DLOG
-PRO --> TG
-PRO --> DLOG & WEEKLY
-
-FLASH & PRO --> CQ
-CQ -- "proposal" --> TG
-TG -- "confirm" --> CQ
-CQ -- "write" --> GCAL
-
-TS -- "daily" --> CB
-TS -- "Sunday" --> PRO
-TS -- "conflict" --> SM
-
-SM --> T_SESS
-CQ --> T_CAL
-CB --> T_DEC
-PRO --> T_SNAP
-
-FLASH & PRO --> LANGFUSE
-SM --> LOGURU
-CQ --> LOGURU
-
-SYSTEMD -.-> ORCH
-BACKUP -.-> PERSIST & CONTEXT
-SENTRY -.-> ORCH & REASONING
+    I -- "Revise weekly plan" --> F
+    I -- "Revise schedule" --> G
+    I -- "Approve" --> J["Commit artifact updates
+    and confirm selected events"]
 ```
+
+### Sunday Review Guarantees
+
+- Later stages must respect constraints learned earlier in the review.
+- Review progress is persisted after each stage.
+- A restart resumes the active stage rather than restarting the workflow.
+- Review proposals remain revision-aware through feedback loops.
+
+## 4. Persistent State Model
+
+The architecture uses four kinds of durable state:
+- markdown artifacts
+- a frozen review snapshot
+- compact workflow state
+- proposal threads and revisions
+
+```mermaid
+flowchart LR
+    subgraph Artifacts["Managed Artifacts"]
+        G["goals.md"]
+        W["weekly_state.md"]
+        D["decision_log.md"]
+    end
+
+    subgraph Review["Review Workflow State"]
+        S["SourceSnapshot"]
+        R["ReviewState
+        current_stage
+        stage_status
+        stage_outputs"]
+        C["ArtifactChangeSets
+        additions / deletions / modifications"]
+    end
+
+    subgraph Proposals["Proposal Lifecycle"]
+        T["ProposalThread"]
+        V["ProposalRevision
+        active / superseded"]
+    end
+
+    subgraph Calendar["Execution"]
+        Q["Confirmed write queue"]
+        GC["Google Calendar"]
+    end
+
+    G --> S
+    W --> S
+    D --> S
+    S --> R
+    R --> C
+    R --> T
+    T --> V
+    T --> Q
+    Q --> GC
+```
+
+### Source Snapshot
+
+Each review freezes one `SourceSnapshot` containing:
+- `goals.md`
+- `weekly_state.md`
+- `decision_log.md`
+- past-week calendar data
+- upcoming calendar context when needed
+
+The snapshot is stored once per workflow and reused by all stages.
+
+### ReviewState
+
+`ReviewState` is the source of truth for review recovery. It stores:
+- workflow status
+- current stage
+- stage status
+- source snapshot reference
+- compact stage outputs
+- artifact change sets
+- active proposal threads
+
+Chat history may support the workflow, but it is never the authoritative state.
+
+### Stage Outputs
+
+Each stage writes a compact structured result, typically:
+- `summary`
+- `key_findings`
+- `constraints`
+- `carry_forward`
+- final artifact text when that stage directly produces one
+
+These outputs are concise and behavior-driving. They are not transcript dumps.
+
+### Artifact Change Sets
+
+Managed markdown files are updated through semantic change sets rather than raw line diffs.
+
+Each change set records:
+- additions
+- deletions
+- modifications
+- a short summary
+
+Full markdown is the final rendered artifact, not the only stored form.
+
+## 5. Proposal Lifecycle
+
+Calendar work uses proposal threads with revisions.
+
+Thread states:
+- `draft`
+- `in_revision`
+- `ready_for_confirmation`
+- `confirmed`
+- `rejected`
+- `executed`
+
+Revision states:
+- `active`
+- `superseded`
+
+Rules:
+- `superseded` applies to an older revision that was replaced.
+- `rejected` applies to the thread as a whole.
+- calendar `cancel` remains an event action, not a proposal lifecycle state.
+- only confirmed proposals enter the execution queue.
+
+## 6. Recovery And Restart Behavior
+
+Review workflows are durable and resumable.
+
+The system guarantees:
+- stale-session cleanup does not discard active reviews
+- each stage has a commit boundary
+- stage outputs are persisted before advancing the workflow
+- the system resumes from the exact active stage and interaction state
+- important progress is never stored only in chat history
+
+Normal ad hoc conversations may be lightweight. Sunday review is not.
