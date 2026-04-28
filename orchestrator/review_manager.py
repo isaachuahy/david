@@ -1,8 +1,11 @@
 import asyncio
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from string import Template
+from typing import Optional, Type, TypeVar
+from google import genai
 from loguru import logger
+from pydantic import BaseModel
 from telegram.ext import ContextTypes
 
 from observability.sentry import capture_exception as capture_sentry_exception
@@ -22,9 +25,21 @@ from persistence.review_workflows import (
     load_review_workflow_sync,
     save_review_workflow_sync,
 )
+from reasoning.parser import parse_model_response
 from reasoning.pro_client import generate_sunday_review, SundayReviewResponse
+from reasoning.schemas import WeekReviewResponse
 from runtime_paths import get_context_dir
 
+
+GEMINI_FLASH_MODEL = "gemini-3-flash-preview"
+GEMINI_PRO_MODEL = "gemini-3-pro-preview"
+REVIEW_SYSTEM_INSTRUCTION = (
+    "You are a precise structured reasoning engine for David's weekly review workflow. "
+    "Follow the stage prompt and populate the response schema faithfully."
+)
+REVIEW_PROMPTS_DIR = get_context_dir().parent / "reasoning" / "prompts"
+
+StructuredResponseT = TypeVar("StructuredResponseT", bound=BaseModel)
 
 _REVIEW_STAGE_FIELD_BY_STAGE = {
     ReviewStage.WEEK_REVIEW: "week_review",
@@ -72,6 +87,121 @@ def _format_past_event_lines(past_events_raw: list[dict]) -> list[str]:
         lines.append(f"[{start_time}] {summary}")
 
     return lines
+
+
+def _format_snapshot_events_for_prompt(event_lines: list[str]) -> str:
+    """Formats frozen snapshot events for prompt injection."""
+    if not event_lines:
+        return "No events found in the past week."
+    return "\n".join(f"- {line}" for line in event_lines)
+
+
+def _render_review_prompt(filename: str, **values: str) -> str:
+    """Renders a Sunday-review stage prompt template with explicit values."""
+    path = REVIEW_PROMPTS_DIR / filename
+    template = Template(path.read_text(encoding="utf-8"))
+    return template.safe_substitute(**values)
+
+
+def _render_week_review_prompt(snapshot: SourceSnapshot) -> str:
+    """
+    Renders the week-review stage prompt from the frozen source snapshot.
+
+    The snapshot, not live files, anchors this stage so restarts and retries
+    reason from the same baseline instead of drifting across workflow turns.
+    """
+    return _render_review_prompt(
+        "week_review.txt",
+        goals_markdown=snapshot.goals_markdown,
+        weekly_state_markdown=snapshot.weekly_state_markdown,
+        decision_log_markdown=snapshot.decision_log_markdown,
+        past_events_block=_format_snapshot_events_for_prompt(snapshot.past_week_events),
+    )
+
+
+def _select_review_model(
+    stage: ReviewStage,
+    *,
+    context_chars: int,
+    retry_count: int = 0,
+) -> str:
+    """
+    Chooses the review model for a stage using a small, explicit heuristic.
+
+    Flash is the default because stage prompts are narrow. Pro is reserved for
+    retries or larger synthesis-heavy inputs where the extra reasoning budget
+    is more likely to matter.
+    """
+    if retry_count > 0:
+        return GEMINI_PRO_MODEL
+
+    if stage == ReviewStage.WEEK_REVIEW and context_chars > 20_000:
+        return GEMINI_PRO_MODEL
+
+    if stage in {ReviewStage.MEMORY_AUDIT, ReviewStage.WEEKLY_PLAN} and context_chars > 12_000:
+        return GEMINI_PRO_MODEL
+
+    return GEMINI_FLASH_MODEL
+
+
+def _generate_review_structured(
+    *,
+    prompt: str,
+    response_schema: Type[StructuredResponseT],
+    model: str,
+    operation: str,
+    system_instruction: str = REVIEW_SYSTEM_INSTRUCTION,
+) -> StructuredResponseT:
+    """
+    Sends one rendered review-stage prompt to Gemini and validates the schema.
+
+    This helper is intentionally local to the review manager for now: the model
+    choice and prompt composition are review-workflow concerns, not generic
+    reasoning-client behavior yet.
+    """
+    logger.info("Sending {} review-stage request to {}.", operation, model)
+    client = genai.Client()
+    config = {
+        "response_mime_type": "application/json",
+        "response_schema": response_schema,
+        "temperature": 1.0,
+    }
+    if system_instruction:
+        config["system_instruction"] = system_instruction
+
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=config,
+        )
+        return parse_model_response(response, response_schema)
+    except Exception as error:
+        logger.error("{} review-stage request failed: {}", operation, error)
+        capture_sentry_exception(
+            error,
+            component="review_manager",
+            operation=operation,
+            message="Gemini review-stage structured generation failed.",
+            tags={"model": model},
+        )
+        raise
+
+
+def _response_to_stage_checkpoint(response: BaseModel) -> StageCheckpoint:
+    """
+    Maps a checkpoint-shaped LLM response into the durable checkpoint shape.
+
+    Stage-specific schemas may evolve independently, but any stage that exposes
+    these four fields can persist through the same compact ReviewWorkflowRecord
+    checkpoint model.
+    """
+    return StageCheckpoint(
+        summary=getattr(response, "summary"),
+        key_findings=getattr(response, "key_findings"),
+        constraints=getattr(response, "constraints"),
+        carry_forward=getattr(response, "carry_forward"),
+    )
 
 
 async def build_review_source_snapshot() -> SourceSnapshot:
@@ -218,6 +348,48 @@ async def save_stage_checkpoint(
     return await save_review_workflow(record)
 
 
+async def run_week_review_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowRecord:
+    """
+    Runs and checkpoints the week-review stage from the frozen source snapshot.
+
+    This is the first real staged review step. It persists a compact
+    StageCheckpoint before the current bridge continues into the older one-shot
+    Sunday review flow.
+    """
+    prompt = _render_week_review_prompt(record.source_snapshot)
+    model = _select_review_model(
+        ReviewStage.WEEK_REVIEW,
+        context_chars=len(prompt),
+    )
+
+    try:
+        response = await asyncio.to_thread(
+            _generate_review_structured,
+            prompt=prompt,
+            response_schema=WeekReviewResponse,
+            model=model,
+            operation="week_review",
+        )
+    except Exception:
+        if model == GEMINI_PRO_MODEL:
+            raise
+
+        logger.warning("Retrying week_review with {} after {} failed.", GEMINI_PRO_MODEL, model)
+        response = await asyncio.to_thread(
+            _generate_review_structured,
+            prompt=prompt,
+            response_schema=WeekReviewResponse,
+            model=GEMINI_PRO_MODEL,
+            operation="week_review_retry",
+        )
+
+    return await save_stage_checkpoint(
+        record,
+        ReviewStage.WEEK_REVIEW,
+        _response_to_stage_checkpoint(response),
+    )
+
+
 async def reconcile_review_workflows() -> list[ReviewWorkflowRecord]:
     """
     Returns persisted reviews that should survive startup reconciliation.
@@ -264,6 +436,16 @@ async def start_weekly_review_workflow(
         review_workflow = await update_review_stage_state(
             review_workflow,
             current_stage=ReviewStage.WEEK_REVIEW,
+            stage_status=StageStatus.RUNNING,
+        )
+        review_workflow = await run_week_review_stage(review_workflow)
+
+        # Bridge: the downstream review still uses the legacy one-shot call
+        # until goals audit, memory audit, weekly plan, and scheduling pass are
+        # split into their own checkpointed stages.
+        review_workflow = await update_review_stage_state(
+            review_workflow,
+            current_stage=ReviewStage.FINAL_REVIEW,
             stage_status=StageStatus.RUNNING,
         )
         review = await asyncio.to_thread(run_sunday_review, tg_context)

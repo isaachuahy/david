@@ -63,3 +63,38 @@ class ProposedEvent(BaseModel):
         default=None,
         description="Resolved canonical calendar ID containing target_event_id.",
     )
+
+
+class WeekReviewResponse(BaseModel):
+    """
+    LLM-facing schema for the week review stage of the Sunday review workflow.
+
+    This schema describes what Gemini should populate. The orchestrator for review_manager maps it
+    into the durable, generic StageCheckpoint stored on ReviewWorkflowRecord.
+    """
+
+    summary: str = Field(
+        description="One to three sentences summarizing what actually happened during the past week.",
+    )
+    key_findings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Three to six compact findings later review stages should account "
+            "for when auditing goals, auditing memory, planning the next week, "
+            "or proposing calendar blocks."
+        ),
+    )
+    constraints: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Current constraints, recurring friction, or learned scheduling and "
+            "energy limits that should shape later review stages."
+        ),
+    )
+    carry_forward: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Unresolved items, meaningful rejections, open loops, or priorities "
+            "that should be considered by later review stages."
+        ),
+    )
