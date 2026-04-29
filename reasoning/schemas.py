@@ -98,3 +98,40 @@ class WeekReviewResponse(BaseModel):
             "that should be considered by later review stages."
         ),
     )
+
+
+class GoalsAuditResponse(BaseModel):
+    """
+    LLM-facing schema for the goals audit stage of the Sunday review workflow.
+
+    The orchestrator maps this stage-specific response into a generic
+    StageCheckpoint while preserving the stage identity on ReviewWorkflowRecord.
+    """
+
+    summary: str = Field(
+        description=(
+            "One to three sentences assessing whether the durable goals and "
+            "operating principles still appear accurate and useful."
+        ),
+    )
+    key_findings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Compact findings about goals or principles that still hold, may be "
+            "stale, need clarification, or appear misaligned with this week's evidence."
+        ),
+    )
+    constraints: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Goal-related constraints, tensions, or tradeoffs that later review "
+            "stages should respect when planning the next week."
+        ),
+    )
+    carry_forward: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Goal questions, possible emphasis shifts, or reconfirmation points "
+            "that should be carried into memory audit, weekly planning, or final review."
+        ),
+    )

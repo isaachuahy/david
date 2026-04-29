@@ -4,6 +4,7 @@ import pytest
 
 from orchestrator.review_manager import (
     execute_weekly_state_update,
+    run_goals_audit_stage,
     run_sunday_review,
     run_week_review_stage,
     start_weekly_review_workflow,
@@ -13,10 +14,11 @@ from persistence.models import (
     ReviewWorkflowRecord,
     ReviewWorkflowStatus,
     SourceSnapshot,
+    StageCheckpoint,
     StageStatus,
 )
 from reasoning.pro_client import SundayReviewResponse
-from reasoning.schemas import WeekReviewResponse
+from reasoning.schemas import GoalsAuditResponse, WeekReviewResponse
 
 
 @patch("orchestrator.review_manager.get_db")
@@ -104,6 +106,78 @@ async def test_run_week_review_stage_persists_week_review_checkpoint(
 
 
 @pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
+async def test_run_goals_audit_stage_persists_goals_audit_checkpoint(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """
+    Tests that goals_audit consumes an existing week_review checkpoint and
+    persists its own durable checkpoint.
+    """
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        week_review=StageCheckpoint(
+            summary="The week progressed but left a prioritization question.",
+            key_findings=["MVP work moved forward."],
+            constraints=["Evenings were lower-energy."],
+            carry_forward=["Clarify job-search emphasis."],
+        ),
+    )
+    mock_generate_review_structured.return_value = GoalsAuditResponse(
+        summary="The goals still hold, but job-search emphasis should be reconfirmed.",
+        key_findings=["MVP and job-search goals both remain relevant."],
+        constraints=["Weekly planning should not overload evenings."],
+        carry_forward=["Ask whether job-search volume should increase next week."],
+    )
+
+    updated_record = await run_goals_audit_stage(record)
+
+    assert updated_record.goals_audit is not None
+    assert updated_record.goals_audit.summary == (
+        "The goals still hold, but job-search emphasis should be reconfirmed."
+    )
+    assert updated_record.goals_audit.key_findings == [
+        "MVP and job-search goals both remain relevant.",
+    ]
+    assert updated_record.goals_audit.constraints == [
+        "Weekly planning should not overload evenings.",
+    ]
+    assert updated_record.goals_audit.carry_forward == [
+        "Ask whether job-search volume should increase next week.",
+    ]
+    assert updated_record.last_completed_stage == ReviewStage.GOALS_AUDIT
+    mock_generate_review_structured.assert_called_once()
+    mock_save_review_workflow_sync.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_goals_audit_stage_requires_week_review_checkpoint():
+    """Tests that goals_audit cannot run before week_review has produced evidence."""
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="week_review is checkpointed"):
+        await run_goals_audit_stage(record)
+
+
+@pytest.mark.asyncio
 @patch("orchestrator.review_manager.run_sunday_review")
 @patch("orchestrator.review_manager._generate_review_structured")
 @patch("orchestrator.review_manager.build_review_source_snapshot")
@@ -124,12 +198,20 @@ async def test_start_weekly_review_workflow_checkpoints_week_review_before_bridg
         decision_log_markdown="# Decision Log",
         past_week_events=["[2026-04-27T09:00:00-04:00] Deep Work"],
     )
-    mock_generate_review_structured.return_value = WeekReviewResponse(
-        summary="The week had useful progress.",
-        key_findings=["Context routing advanced."],
-        constraints=[],
-        carry_forward=["Carry context cleanup forward."],
-    )
+    mock_generate_review_structured.side_effect = [
+        WeekReviewResponse(
+            summary="The week had useful progress.",
+            key_findings=["Context routing advanced."],
+            constraints=[],
+            carry_forward=["Carry context cleanup forward."],
+        ),
+        GoalsAuditResponse(
+            summary="The durable goals still look accurate.",
+            key_findings=["MVP goal remains active."],
+            constraints=[],
+            carry_forward=["Keep goal emphasis unchanged."],
+        ),
+    ]
     sunday_review = SundayReviewResponse(
         message="Sunday review summary.",
         state_change_summary="Weekly state was updated.",
@@ -143,6 +225,8 @@ async def test_start_weekly_review_workflow_checkpoints_week_review_before_bridg
     assert review == sunday_review
     assert record.week_review is not None
     assert record.week_review.summary == "The week had useful progress."
+    assert record.goals_audit is not None
+    assert record.goals_audit.summary == "The durable goals still look accurate."
     assert record.final_review is not None
     assert record.final_review.summary == "Sunday review summary."
     assert record.final_review.key_findings == ["Weekly state was updated."]
@@ -150,7 +234,8 @@ async def test_start_weekly_review_workflow_checkpoints_week_review_before_bridg
     assert record.current_stage == ReviewStage.FINAL_REVIEW
     assert record.stage_status == StageStatus.AWAITING_FEEDBACK
     assert record.last_completed_stage == ReviewStage.FINAL_REVIEW
-    assert mock_save_review_workflow_sync.call_count >= 5
+    assert mock_generate_review_structured.call_count == 2
+    assert mock_save_review_workflow_sync.call_count >= 7
 
 
 @patch("orchestrator.review_manager.capture_sentry_exception")

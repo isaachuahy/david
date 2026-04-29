@@ -27,7 +27,7 @@ from persistence.review_workflows import (
 )
 from reasoning.parser import parse_model_response
 from reasoning.pro_client import generate_sunday_review, SundayReviewResponse
-from reasoning.schemas import WeekReviewResponse
+from reasoning.schemas import GoalsAuditResponse, WeekReviewResponse
 from runtime_paths import get_context_dir, get_prompt_path
 
 
@@ -94,6 +94,21 @@ def _format_snapshot_events_for_prompt(event_lines: list[str]) -> str:
     return "\n".join(f"- {line}" for line in event_lines)
 
 
+def _format_checkpoint_for_prompt(checkpoint: StageCheckpoint) -> str:
+    """Formats a persisted checkpoint for use as compact downstream context."""
+    lines = [f"Summary: {checkpoint.summary}"]
+    if checkpoint.key_findings:
+        lines.append("Key findings:")
+        lines.extend(f"- {finding}" for finding in checkpoint.key_findings)
+    if checkpoint.constraints:
+        lines.append("Constraints:")
+        lines.extend(f"- {constraint}" for constraint in checkpoint.constraints)
+    if checkpoint.carry_forward:
+        lines.append("Carry forward:")
+        lines.extend(f"- {item}" for item in checkpoint.carry_forward)
+    return "\n".join(lines)
+
+
 def _render_review_prompt(filename: str, **values: str) -> str:
     """Renders a Sunday-review stage prompt template with explicit values."""
     path = get_prompt_path(filename)
@@ -114,6 +129,25 @@ def _render_week_review_prompt(snapshot: SourceSnapshot) -> str:
         weekly_state_markdown=snapshot.weekly_state_markdown,
         decision_log_markdown=snapshot.decision_log_markdown,
         past_events_block=_format_snapshot_events_for_prompt(snapshot.past_week_events),
+    )
+
+
+def _render_goals_audit_prompt(record: ReviewWorkflowRecord) -> str:
+    """
+    Renders the goals-audit stage prompt from the frozen snapshot and week review.
+
+    The goals audit consumes the week-review checkpoint as evidence, rather
+    than independently re-summarizing the week from scratch.
+    """
+    if record.week_review is None:
+        raise ValueError("Cannot run goals_audit before week_review is checkpointed.")
+
+    return _render_review_prompt(
+        "goals_audit.txt",
+        goals_markdown=record.source_snapshot.goals_markdown,
+        week_review_checkpoint=_format_checkpoint_for_prompt(record.week_review),
+        weekly_state_markdown=record.source_snapshot.weekly_state_markdown,
+        decision_log_markdown=record.source_snapshot.decision_log_markdown,
     )
 
 
@@ -199,6 +233,52 @@ def _response_to_stage_checkpoint(response: BaseModel) -> StageCheckpoint:
         key_findings=getattr(response, "key_findings"),
         constraints=getattr(response, "constraints"),
         carry_forward=getattr(response, "carry_forward"),
+    )
+
+
+async def _run_checkpoint_stage(
+    *,
+    record: ReviewWorkflowRecord,
+    stage: ReviewStage,
+    prompt: str,
+    response_schema: Type[StructuredResponseT],
+    operation: str,
+) -> ReviewWorkflowRecord:
+    """
+    Runs one checkpoint-shaped review stage and persists its durable output.
+
+    Most review stages share the same operational pattern: choose a model,
+    request structured output, retry with Pro when Flash fails, then store the
+    parsed response in the stage-specific checkpoint field.
+    """
+    model = _select_review_model(stage, context_chars=len(prompt))
+
+    try:
+        response = await asyncio.to_thread(
+            _generate_review_structured,
+            prompt=prompt,
+            response_schema=response_schema,
+            model=model,
+            operation=operation,
+        )
+    except Exception:
+        if model == GEMINI_PRO_MODEL:
+            raise
+
+        retry_operation = f"{operation}_retry"
+        logger.warning("Retrying {} with {} after {} failed.", operation, GEMINI_PRO_MODEL, model)
+        response = await asyncio.to_thread(
+            _generate_review_structured,
+            prompt=prompt,
+            response_schema=response_schema,
+            model=GEMINI_PRO_MODEL,
+            operation=retry_operation,
+        )
+
+    return await save_stage_checkpoint(
+        record,
+        stage,
+        _response_to_stage_checkpoint(response),
     )
 
 
@@ -355,36 +435,32 @@ async def run_week_review_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowR
     Sunday review flow.
     """
     prompt = _render_week_review_prompt(record.source_snapshot)
-    model = _select_review_model(
-        ReviewStage.WEEK_REVIEW,
-        context_chars=len(prompt),
+
+    return await _run_checkpoint_stage(
+        record=record,
+        stage=ReviewStage.WEEK_REVIEW,
+        prompt=prompt,
+        response_schema=WeekReviewResponse,
+        operation="week_review",
     )
 
-    try:
-        response = await asyncio.to_thread(
-            _generate_review_structured,
-            prompt=prompt,
-            response_schema=WeekReviewResponse,
-            model=model,
-            operation="week_review",
-        )
-    except Exception:
-        if model == GEMINI_PRO_MODEL:
-            raise
 
-        logger.warning("Retrying week_review with {} after {} failed.", GEMINI_PRO_MODEL, model)
-        response = await asyncio.to_thread(
-            _generate_review_structured,
-            prompt=prompt,
-            response_schema=WeekReviewResponse,
-            model=GEMINI_PRO_MODEL,
-            operation="week_review_retry",
-        )
+async def run_goals_audit_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowRecord:
+    """
+    Runs and checkpoints the goals-audit stage using the completed week review.
 
-    return await save_stage_checkpoint(
-        record,
-        ReviewStage.WEEK_REVIEW,
-        _response_to_stage_checkpoint(response),
+    This stage evaluates durable goals and principles without rewriting them;
+    later workflow steps can use its checkpoint when planning or asking for
+    explicit confirmation.
+    """
+    prompt = _render_goals_audit_prompt(record)
+
+    return await _run_checkpoint_stage(
+        record=record,
+        stage=ReviewStage.GOALS_AUDIT,
+        prompt=prompt,
+        response_schema=GoalsAuditResponse,
+        operation="goals_audit",
     )
 
 
@@ -437,6 +513,12 @@ async def start_weekly_review_workflow(
             stage_status=StageStatus.RUNNING,
         )
         review_workflow = await run_week_review_stage(review_workflow)
+        review_workflow = await update_review_stage_state(
+            review_workflow,
+            current_stage=ReviewStage.GOALS_AUDIT,
+            stage_status=StageStatus.RUNNING,
+        )
+        review_workflow = await run_goals_audit_stage(review_workflow)
 
         # Bridge: the downstream review still uses the legacy one-shot call
         # until goals audit, memory audit, weekly plan, and scheduling pass are
