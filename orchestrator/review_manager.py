@@ -28,7 +28,7 @@ from persistence.review_workflows import (
 from reasoning.parser import parse_model_response
 from reasoning.pro_client import generate_sunday_review, SundayReviewResponse
 from reasoning.schemas import WeekReviewResponse
-from runtime_paths import get_context_dir
+from runtime_paths import get_context_dir, get_prompt_path
 
 
 GEMINI_FLASH_MODEL = "gemini-3-flash-preview"
@@ -37,8 +37,6 @@ REVIEW_SYSTEM_INSTRUCTION = (
     "You are a precise structured reasoning engine for David's weekly review workflow. "
     "Follow the stage prompt and populate the response schema faithfully."
 )
-REVIEW_PROMPTS_DIR = get_context_dir().parent / "reasoning" / "prompts"
-
 StructuredResponseT = TypeVar("StructuredResponseT", bound=BaseModel)
 
 _REVIEW_STAGE_FIELD_BY_STAGE = {
@@ -98,7 +96,7 @@ def _format_snapshot_events_for_prompt(event_lines: list[str]) -> str:
 
 def _render_review_prompt(filename: str, **values: str) -> str:
     """Renders a Sunday-review stage prompt template with explicit values."""
-    path = REVIEW_PROMPTS_DIR / filename
+    path = get_prompt_path(filename)
     template = Template(path.read_text(encoding="utf-8"))
     return template.safe_substitute(**values)
 

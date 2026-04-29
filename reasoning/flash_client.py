@@ -1,4 +1,3 @@
-import os
 from string import Template
 from typing import Optional
 from pydantic import BaseModel, Field
@@ -8,10 +7,10 @@ from observability.sentry import capture_exception as capture_sentry_exception
 
 from reasoning.parser import parse_model_response
 from reasoning.schemas import ProposedEvent
+from runtime_paths import DEFAULT_PROMPTS_DIR, get_prompt_path
 
-# Resolve paths for the prompt template
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PROMPTS_DIR = os.path.join(BASE_DIR, "reasoning", "prompts")
+# Kept for existing tests and diagnostics; prompt reads use get_prompt_path.
+PROMPTS_DIR = str(DEFAULT_PROMPTS_DIR)
 
 class FlashResponse(BaseModel):
     message: str = Field(
@@ -29,9 +28,9 @@ class SessionSynthesisResponse(BaseModel):
 
 def _read_prompt_template(prompt_filename: str) -> str:
     """Reads a prompt template from the prompts directory."""
-    prompt_path = os.path.join(PROMPTS_DIR, prompt_filename)
+    prompt_path = get_prompt_path(prompt_filename)
     try:
-        with open(prompt_path, "r", encoding="utf-8") as f:
+        with open(str(prompt_path), "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception as e:
         logger.error(f"Failed to read {prompt_filename}: {e}")

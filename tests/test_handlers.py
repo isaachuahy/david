@@ -21,7 +21,7 @@ from orchestrator.session_manager import (
 from reasoning.flash_client import FlashResponse
 from reasoning.pro_client import SundayReviewResponse
 from reasoning.schemas import ProposedEvent
-from persistence.models import CalendarWriteStatus
+from persistence.models import CalendarWriteStatus, ReviewWorkflowRecord, SourceSnapshot
 
 @pytest.mark.asyncio
 @patch('bot.handlers.start_session')
@@ -218,11 +218,11 @@ async def test_handle_start_trigger_daily(mock_consume_trigger):
 
 @pytest.mark.asyncio
 @patch('bot.handlers.send_calendar_proposal', new_callable=AsyncMock)
-@patch('bot.handlers.run_sunday_review')
+@patch('bot.handlers.start_weekly_review_workflow', new_callable=AsyncMock)
 @patch('bot.handlers.consume_trigger')
 async def test_handle_start_trigger_weekly_queues_one_event_at_a_time(
     mock_consume_trigger,
-    mock_run_sunday_review,
+    mock_start_weekly_review_workflow,
     mock_send_calendar_proposal,
 ):
     update = MagicMock()
@@ -250,17 +250,30 @@ async def test_handle_start_trigger_weekly_queues_one_event_at_a_time(
         end_time="2026-03-31T19:00:00-04:00",
         description="Strength training.",
     )
-    mock_run_sunday_review.return_value = SundayReviewResponse(
+    review_workflow = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+    )
+    review = SundayReviewResponse(
         message="Strong week overall.",
         state_change_summary="Updated priorities for next week.",
         weekly_state_content="# Weekly State",
         proposed_events=[second_event, first_event],
     )
+    mock_start_weekly_review_workflow.return_value = (review_workflow, review)
     mock_send_calendar_proposal.return_value = "cw_first"
 
     await handle_start_trigger(update, context)
 
     mock_consume_trigger.assert_called_once_with(context, "weekly_review")
+    mock_start_weekly_review_workflow.assert_awaited_once_with(context)
+    assert context.user_data["active_review_workflow_id"] == "review_test"
     assert context.user_data["weekly_review_event_queue"] == [second_event]
     assert context.user_data["weekly_review_total_events"] == 2
     assert context.user_data["weekly_review_processed_events"] == 0
@@ -541,7 +554,8 @@ async def test_send_calendar_proposal_displays_toronto_time(
     mock_track_confirmation_message.assert_called_once_with(context, "cw_123", 999)
 
 @pytest.mark.asyncio
-async def test_handle_reject_weekly_state():
+@patch('bot.handlers.apply_weekly_state_feedback', new_callable=AsyncMock)
+async def test_handle_reject_weekly_state(mock_apply_weekly_state_feedback):
     update = MagicMock()
     update.effective_user.id = 123
     update.callback_query = MagicMock()
@@ -549,13 +563,25 @@ async def test_handle_reject_weekly_state():
     update.callback_query.edit_message_text = AsyncMock()
     
     context = MagicMock()
-    context.user_data = {'proposed_weekly_state': {'content': 'test', 'timestamp': '2026-03-22T10:00:00Z'}}
+    context.user_data = {
+        'proposed_weekly_state': {
+            'content': 'test',
+            'timestamp': '2026-03-22T10:00:00Z',
+            'review_id': 'review_test',
+        }
+    }
     context.bot_data = {"allowed_user_id": 123}
     
     await handle_reject_weekly_state(update, context)
     
     update.callback_query.answer.assert_awaited_once()
     assert 'proposed_weekly_state' not in context.user_data
+    mock_apply_weekly_state_feedback.assert_awaited_once_with(
+        "review_test",
+        accepted=False,
+        has_pending_event_feedback=False,
+    )
     update.callback_query.edit_message_text.assert_awaited_once_with(
-        "🚫 *Weekly state update rejected.*", parse_mode="Markdown"
+        "🚫 *Weekly state update rejected. The Sunday review remains open for revision.*",
+        parse_mode="Markdown",
     )

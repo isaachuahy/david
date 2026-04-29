@@ -1,4 +1,3 @@
-import os
 from typing import List
 from string import Template
 from pydantic import BaseModel, Field
@@ -8,10 +7,10 @@ from observability.sentry import capture_exception as capture_sentry_exception
 
 from reasoning.parser import parse_model_response
 from reasoning.schemas import ProposedEvent
+from runtime_paths import DEFAULT_PROMPTS_DIR, get_prompt_path
 
-# Resolve paths for the prompt template
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PROMPTS_DIR = os.path.join(BASE_DIR, "reasoning", "prompts")
+# Kept for existing tests and diagnostics; prompt reads use get_prompt_path.
+PROMPTS_DIR = str(DEFAULT_PROMPTS_DIR)
 
 class SundayReviewResponse(BaseModel):
     message: str = Field(description="A direct message to the user summarising the analysis.")
@@ -26,9 +25,9 @@ def generate_sunday_review(context_block: str, past_events_block: str) -> Sunday
     """
     logger.info("Sending Sunday Review request to Gemini Pro...")
     
-    prompt_path = os.path.join(PROMPTS_DIR, "sunday_review.txt")
+    prompt_path = get_prompt_path("sunday_review.txt")
     try:
-        with open(prompt_path, "r", encoding="utf-8") as f:
+        with open(str(prompt_path), "r", encoding="utf-8") as f:
             template = Template(f.read())
     except Exception as e:
         logger.error(f"Failed to read sunday_review.txt: {e}")
