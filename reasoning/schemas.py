@@ -135,3 +135,41 @@ class GoalsAuditResponse(BaseModel):
             "that should be carried into memory audit, weekly planning, or final review."
         ),
     )
+
+
+class MemoryAuditResponse(BaseModel):
+    """
+    LLM-facing schema for the memory audit stage of the Sunday review workflow.
+
+    This response captures memory-quality findings for the orchestrator to store
+    as a durable checkpoint before later stages propose concrete artifact edits.
+    """
+
+    summary: str = Field(
+        description=(
+            "One to three sentences assessing whether rolling memory and recent "
+            "decisions remain accurate, useful, and non-duplicative."
+        ),
+    )
+    key_findings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Compact findings about durable memory that should be kept, stale "
+            "or duplicated memory, useful recent decisions, meaningful rejections, "
+            "or unresolved loops."
+        ),
+    )
+    constraints: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Memory-related constraints, risks, or interpretation boundaries "
+            "that later review stages should respect."
+        ),
+    )
+    carry_forward: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Memory edits, compaction candidates, or reconfirmation questions "
+            "that should be considered by weekly planning or final review."
+        ),
+    )

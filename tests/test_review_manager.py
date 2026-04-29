@@ -5,6 +5,7 @@ import pytest
 from orchestrator.review_manager import (
     execute_weekly_state_update,
     run_goals_audit_stage,
+    run_memory_audit_stage,
     run_sunday_review,
     run_week_review_stage,
     start_weekly_review_workflow,
@@ -18,7 +19,7 @@ from persistence.models import (
     StageStatus,
 )
 from reasoning.pro_client import SundayReviewResponse
-from reasoning.schemas import GoalsAuditResponse, WeekReviewResponse
+from reasoning.schemas import GoalsAuditResponse, MemoryAuditResponse, WeekReviewResponse
 
 
 @patch("orchestrator.review_manager.get_db")
@@ -178,6 +179,82 @@ async def test_run_goals_audit_stage_requires_week_review_checkpoint():
 
 
 @pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
+async def test_run_memory_audit_stage_persists_memory_audit_checkpoint(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """
+    Tests that memory_audit consumes prior checkpoints and persists its own
+    durable checkpoint without rewriting memory yet.
+    """
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        week_review=StageCheckpoint(
+            summary="The week surfaced a recurring evening-energy constraint.",
+        ),
+        goals_audit=StageCheckpoint(
+            summary="The goals still hold, with job-search emphasis to reconfirm.",
+        ),
+    )
+    mock_generate_review_structured.return_value = MemoryAuditResponse(
+        summary="Rolling memory is mostly useful, but evening constraints should be made durable.",
+        key_findings=["The decision log should preserve the recurring evening-energy pattern."],
+        constraints=["Avoid treating one-off schedule details as durable memory."],
+        carry_forward=["Consider adding a compact evening-energy preference to rolling context."],
+    )
+
+    updated_record = await run_memory_audit_stage(record)
+
+    assert updated_record.memory_audit is not None
+    assert updated_record.memory_audit.summary == (
+        "Rolling memory is mostly useful, but evening constraints should be made durable."
+    )
+    assert updated_record.memory_audit.key_findings == [
+        "The decision log should preserve the recurring evening-energy pattern.",
+    ]
+    assert updated_record.memory_audit.constraints == [
+        "Avoid treating one-off schedule details as durable memory.",
+    ]
+    assert updated_record.memory_audit.carry_forward == [
+        "Consider adding a compact evening-energy preference to rolling context.",
+    ]
+    assert updated_record.last_completed_stage == ReviewStage.MEMORY_AUDIT
+    mock_generate_review_structured.assert_called_once()
+    mock_save_review_workflow_sync.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_memory_audit_stage_requires_prior_checkpoints():
+    """Tests that memory_audit waits for both week_review and goals_audit."""
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="week_review is checkpointed"):
+        await run_memory_audit_stage(record)
+
+    record.week_review = StageCheckpoint(summary="Week review exists.")
+    with pytest.raises(ValueError, match="goals_audit is checkpointed"):
+        await run_memory_audit_stage(record)
+
+
+@pytest.mark.asyncio
 @patch("orchestrator.review_manager.run_sunday_review")
 @patch("orchestrator.review_manager._generate_review_structured")
 @patch("orchestrator.review_manager.build_review_source_snapshot")
@@ -211,6 +288,12 @@ async def test_start_weekly_review_workflow_checkpoints_week_review_before_bridg
             constraints=[],
             carry_forward=["Keep goal emphasis unchanged."],
         ),
+        MemoryAuditResponse(
+            summary="Rolling memory remains useful.",
+            key_findings=["Keep the current durable preference signal."],
+            constraints=[],
+            carry_forward=["No major memory changes needed."],
+        ),
     ]
     sunday_review = SundayReviewResponse(
         message="Sunday review summary.",
@@ -227,6 +310,8 @@ async def test_start_weekly_review_workflow_checkpoints_week_review_before_bridg
     assert record.week_review.summary == "The week had useful progress."
     assert record.goals_audit is not None
     assert record.goals_audit.summary == "The durable goals still look accurate."
+    assert record.memory_audit is not None
+    assert record.memory_audit.summary == "Rolling memory remains useful."
     assert record.final_review is not None
     assert record.final_review.summary == "Sunday review summary."
     assert record.final_review.key_findings == ["Weekly state was updated."]
@@ -234,8 +319,8 @@ async def test_start_weekly_review_workflow_checkpoints_week_review_before_bridg
     assert record.current_stage == ReviewStage.FINAL_REVIEW
     assert record.stage_status == StageStatus.AWAITING_FEEDBACK
     assert record.last_completed_stage == ReviewStage.FINAL_REVIEW
-    assert mock_generate_review_structured.call_count == 2
-    assert mock_save_review_workflow_sync.call_count >= 7
+    assert mock_generate_review_structured.call_count == 3
+    assert mock_save_review_workflow_sync.call_count >= 9
 
 
 @patch("orchestrator.review_manager.capture_sentry_exception")

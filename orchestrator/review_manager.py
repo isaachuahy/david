@@ -27,7 +27,7 @@ from persistence.review_workflows import (
 )
 from reasoning.parser import parse_model_response
 from reasoning.pro_client import generate_sunday_review, SundayReviewResponse
-from reasoning.schemas import GoalsAuditResponse, WeekReviewResponse
+from reasoning.schemas import GoalsAuditResponse, MemoryAuditResponse, WeekReviewResponse
 from runtime_paths import get_context_dir, get_prompt_path
 
 
@@ -148,6 +148,27 @@ def _render_goals_audit_prompt(record: ReviewWorkflowRecord) -> str:
         week_review_checkpoint=_format_checkpoint_for_prompt(record.week_review),
         weekly_state_markdown=record.source_snapshot.weekly_state_markdown,
         decision_log_markdown=record.source_snapshot.decision_log_markdown,
+    )
+
+
+def _render_memory_audit_prompt(record: ReviewWorkflowRecord) -> str:
+    """
+    Renders the memory-audit stage prompt from prior checkpoints and memory.
+
+    The memory audit uses week-review evidence and goals-audit interpretation
+    to assess rolling memory quality without rewriting the decision log yet.
+    """
+    if record.week_review is None:
+        raise ValueError("Cannot run memory_audit before week_review is checkpointed.")
+    if record.goals_audit is None:
+        raise ValueError("Cannot run memory_audit before goals_audit is checkpointed.")
+
+    return _render_review_prompt(
+        "memory_audit.txt",
+        decision_log_markdown=record.source_snapshot.decision_log_markdown,
+        week_review_checkpoint=_format_checkpoint_for_prompt(record.week_review),
+        goals_audit_checkpoint=_format_checkpoint_for_prompt(record.goals_audit),
+        weekly_state_markdown=record.source_snapshot.weekly_state_markdown,
     )
 
 
@@ -502,6 +523,24 @@ async def run_goals_audit_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowR
     )
 
 
+async def run_memory_audit_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowRecord:
+    """
+    Runs and checkpoints the memory-audit stage using prior review evidence.
+
+    This stage surfaces memory quality and compaction signals while leaving
+    concrete decision-log edits for a later user-facing artifact step.
+    """
+    prompt = _render_memory_audit_prompt(record)
+
+    return await _run_checkpoint_stage(
+        record=record,
+        stage=ReviewStage.MEMORY_AUDIT,
+        prompt=prompt,
+        response_schema=MemoryAuditResponse,
+        operation="memory_audit",
+    )
+
+
 async def reconcile_review_workflows() -> list[ReviewWorkflowRecord]:
     """
     Returns persisted reviews that should survive startup reconciliation.
@@ -557,10 +596,16 @@ async def start_weekly_review_workflow(
             stage_status=StageStatus.RUNNING,
         )
         review_workflow = await run_goals_audit_stage(review_workflow)
+        review_workflow = await transition_review_stage(
+            review_workflow,
+            stage=ReviewStage.MEMORY_AUDIT,
+            stage_status=StageStatus.RUNNING,
+        )
+        review_workflow = await run_memory_audit_stage(review_workflow)
 
         # Bridge: the downstream review still uses the legacy one-shot call
-        # until goals audit, memory audit, weekly plan, and scheduling pass are
-        # split into their own checkpointed stages.
+        # until weekly plan and scheduling pass are split into checkpointed
+        # stages with their own confirmation/revision loops.
         review_workflow = await transition_review_stage(
             review_workflow,
             stage=ReviewStage.FINAL_REVIEW,
