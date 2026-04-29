@@ -554,8 +554,8 @@ async def test_send_calendar_proposal_displays_toronto_time(
     mock_track_confirmation_message.assert_called_once_with(context, "cw_123", 999)
 
 @pytest.mark.asyncio
-@patch('bot.handlers.apply_weekly_state_feedback', new_callable=AsyncMock)
-async def test_handle_reject_weekly_state(mock_apply_weekly_state_feedback):
+@patch('bot.handlers.apply_bridge_weekly_state_feedback', new_callable=AsyncMock)
+async def test_handle_reject_weekly_state(mock_apply_bridge_weekly_state_feedback):
     update = MagicMock()
     update.effective_user.id = 123
     update.callback_query = MagicMock()
@@ -576,7 +576,7 @@ async def test_handle_reject_weekly_state(mock_apply_weekly_state_feedback):
     
     update.callback_query.answer.assert_awaited_once()
     assert 'proposed_weekly_state' not in context.user_data
-    mock_apply_weekly_state_feedback.assert_awaited_once_with(
+    mock_apply_bridge_weekly_state_feedback.assert_awaited_once_with(
         "review_test",
         accepted=False,
         has_pending_event_feedback=False,

@@ -383,7 +383,7 @@ async def create_review_workflow(snapshot: Optional[SourceSnapshot] = None) -> R
         raise
 
 
-async def update_review_stage_state(
+async def _update_review_workflow_state(
     record: ReviewWorkflowRecord,
     *,
     workflow_status: Optional[ReviewWorkflowStatus] = None,
@@ -392,11 +392,10 @@ async def update_review_stage_state(
     last_completed_stage: Optional[ReviewStage] = None,
 ) -> ReviewWorkflowRecord:
     """
-    Applies a review-stage transition and persists it.
+    Applies explicit workflow-state field updates and persists the record.
 
-    The caller controls the transition explicitly so the persistence layer stays
-    predictable: stage boundaries and feedback pauses are committed only when
-    the orchestrator decides the workflow has truly advanced.
+    This is the low-level mutation primitive. It intentionally avoids transition
+    policy so higher-level helpers can make stage semantics explicit.
     """
     if workflow_status is not None:
         record.workflow_status = workflow_status
@@ -408,6 +407,45 @@ async def update_review_stage_state(
         record.last_completed_stage = last_completed_stage
 
     return await save_review_workflow(record)
+
+
+async def transition_review_stage(
+    record: ReviewWorkflowRecord,
+    *,
+    stage: ReviewStage,
+    stage_status: StageStatus,
+    workflow_status: Optional[ReviewWorkflowStatus] = None,
+    last_completed_stage: Optional[ReviewStage] = None,
+) -> ReviewWorkflowRecord:
+    """
+    Moves the workflow into a target stage/status using normal review semantics.
+
+    ReviewWorkflowStatus is the outer lifecycle, ReviewStage is the pipeline
+    location, and StageStatus is the local state inside that stage. `stage` is
+    the target stage the workflow should enter or remain in after this
+    transition.
+    """
+    if workflow_status is None:
+        if stage_status == StageStatus.AWAITING_FEEDBACK:
+            workflow_status = ReviewWorkflowStatus.AWAITING_FEEDBACK
+        elif stage_status in {
+            StageStatus.NOT_STARTED,
+            StageStatus.RUNNING,
+            StageStatus.IN_REVISION,
+        }:
+            workflow_status = ReviewWorkflowStatus.ACTIVE
+        else:
+            raise ValueError(
+                "workflow_status is required when completing a review stage."
+            )
+
+    return await _update_review_workflow_state(
+        record,
+        workflow_status=workflow_status,
+        current_stage=stage,
+        stage_status=stage_status,
+        last_completed_stage=last_completed_stage,
+    )
 
 
 async def save_stage_checkpoint(
@@ -507,15 +545,15 @@ async def start_weekly_review_workflow(
 
     try:
         review_workflow = await create_review_workflow()
-        review_workflow = await update_review_stage_state(
+        review_workflow = await transition_review_stage(
             review_workflow,
-            current_stage=ReviewStage.WEEK_REVIEW,
+            stage=ReviewStage.WEEK_REVIEW,
             stage_status=StageStatus.RUNNING,
         )
         review_workflow = await run_week_review_stage(review_workflow)
-        review_workflow = await update_review_stage_state(
+        review_workflow = await transition_review_stage(
             review_workflow,
-            current_stage=ReviewStage.GOALS_AUDIT,
+            stage=ReviewStage.GOALS_AUDIT,
             stage_status=StageStatus.RUNNING,
         )
         review_workflow = await run_goals_audit_stage(review_workflow)
@@ -523,9 +561,9 @@ async def start_weekly_review_workflow(
         # Bridge: the downstream review still uses the legacy one-shot call
         # until goals audit, memory audit, weekly plan, and scheduling pass are
         # split into their own checkpointed stages.
-        review_workflow = await update_review_stage_state(
+        review_workflow = await transition_review_stage(
             review_workflow,
-            current_stage=ReviewStage.FINAL_REVIEW,
+            stage=ReviewStage.FINAL_REVIEW,
             stage_status=StageStatus.RUNNING,
         )
         review = await asyncio.to_thread(run_sunday_review, tg_context)
@@ -545,10 +583,10 @@ async def start_weekly_review_workflow(
                 carry_forward=carry_forward,
             ),
         )
-        review_workflow = await update_review_stage_state(
+        review_workflow = await transition_review_stage(
             review_workflow,
             workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
-            current_stage=ReviewStage.FINAL_REVIEW,
+            stage=ReviewStage.FINAL_REVIEW,
             stage_status=StageStatus.AWAITING_FEEDBACK,
         )
 
@@ -556,7 +594,7 @@ async def start_weekly_review_workflow(
     except Exception as error:
         if review_workflow is not None:
             try:
-                await update_review_stage_state(
+                await _update_review_workflow_state(
                     review_workflow,
                     workflow_status=ReviewWorkflowStatus.FAILED,
                 )
@@ -579,7 +617,7 @@ async def start_weekly_review_workflow(
         raise
 
 
-async def apply_weekly_state_feedback(
+async def apply_bridge_weekly_state_feedback(
     review_id: str,
     *,
     accepted: bool,
@@ -599,31 +637,29 @@ async def apply_weekly_state_feedback(
         return None
 
     if proposal_expired or not accepted:
-        return await update_review_stage_state(
+        return await transition_review_stage(
             record,
-            workflow_status=ReviewWorkflowStatus.ACTIVE,
-            current_stage=ReviewStage.FINAL_REVIEW,
+            stage=ReviewStage.FINAL_REVIEW,
             stage_status=StageStatus.IN_REVISION,
         )
 
     if has_pending_event_feedback:
-        return await update_review_stage_state(
+        return await transition_review_stage(
             record,
-            workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
-            current_stage=ReviewStage.FINAL_REVIEW,
+            stage=ReviewStage.FINAL_REVIEW,
             stage_status=StageStatus.AWAITING_FEEDBACK,
         )
 
-    return await update_review_stage_state(
+    return await transition_review_stage(
         record,
         workflow_status=ReviewWorkflowStatus.COMPLETED,
-        current_stage=ReviewStage.FINAL_REVIEW,
+        stage=ReviewStage.FINAL_REVIEW,
         stage_status=StageStatus.COMPLETED,
         last_completed_stage=ReviewStage.FINAL_REVIEW,
     )
 
 
-async def apply_weekly_review_event_feedback(
+async def apply_bridge_event_feedback(
     review_id: str,
     *,
     has_pending_weekly_state_feedback: bool,
@@ -640,20 +676,20 @@ async def apply_weekly_review_event_feedback(
         return None
 
     if has_pending_weekly_state_feedback:
-        return await update_review_stage_state(
+        return await transition_review_stage(
             record,
-            workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
-            current_stage=ReviewStage.FINAL_REVIEW,
+            stage=ReviewStage.FINAL_REVIEW,
             stage_status=StageStatus.AWAITING_FEEDBACK,
         )
 
-    return await update_review_stage_state(
+    return await transition_review_stage(
         record,
         workflow_status=ReviewWorkflowStatus.COMPLETED,
-        current_stage=ReviewStage.FINAL_REVIEW,
+        stage=ReviewStage.FINAL_REVIEW,
         stage_status=StageStatus.COMPLETED,
         last_completed_stage=ReviewStage.FINAL_REVIEW,
     )
+
 
 def run_sunday_review(tg_context: ContextTypes.DEFAULT_TYPE = None) -> SundayReviewResponse:
     """

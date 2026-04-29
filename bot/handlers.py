@@ -15,8 +15,8 @@ from orchestrator.session_manager import (
     untrack_confirmation_message, clear_tracked_confirmation_messages
 )
 from orchestrator.review_manager import (
-    apply_weekly_review_event_feedback,
-    apply_weekly_state_feedback,
+    apply_bridge_event_feedback,
+    apply_bridge_weekly_state_feedback,
     execute_weekly_state_update,
     start_weekly_review_workflow,
 )
@@ -332,7 +332,7 @@ async def advance_weekly_review_event_queue(
     clear_weekly_review_event_queue(context)
     review_id = context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
     review_workflow = (
-        await apply_weekly_review_event_feedback(
+        await apply_bridge_event_feedback(
             review_id,
             has_pending_weekly_state_feedback=has_pending_weekly_state_feedback(context),
         )
@@ -560,7 +560,7 @@ async def handle_confirm_weekly_state(update: Update, context: ContextTypes.DEFA
     if datetime.now(timezone.utc) - proposal_time > timedelta(hours=2):
         del context.user_data['proposed_weekly_state']
         if review_id:
-            await apply_weekly_state_feedback(
+            await apply_bridge_weekly_state_feedback(
                 review_id,
                 accepted=False,
                 proposal_expired=True,
@@ -575,7 +575,7 @@ async def handle_confirm_weekly_state(update: Update, context: ContextTypes.DEFA
     
     if success:
         if review_id:
-            review_workflow = await apply_weekly_state_feedback(
+            review_workflow = await apply_bridge_weekly_state_feedback(
                 review_id,
                 accepted=True,
                 has_pending_event_feedback=has_pending_weekly_review_event_feedback(context),
@@ -606,7 +606,7 @@ async def handle_reject_weekly_state(update: Update, context: ContextTypes.DEFAU
         del context.user_data['proposed_weekly_state']
 
     if review_id:
-        await apply_weekly_state_feedback(
+        await apply_bridge_weekly_state_feedback(
             review_id,
             accepted=False,
             has_pending_event_feedback=has_pending_weekly_review_event_feedback(context),
