@@ -28,7 +28,13 @@ from persistence.review_workflows import (
 )
 from reasoning.parser import parse_model_response
 from reasoning.pro_client import generate_sunday_review, SundayReviewResponse
-from reasoning.schemas import GoalsAuditResponse, MemoryAuditResponse, WeekReviewResponse, WeeklyPlanResponse
+from reasoning.schemas import (
+    GoalsAuditResponse,
+    MemoryAuditResponse,
+    SchedulingPassResponse,
+    WeekReviewResponse,
+    WeeklyPlanResponse,
+)
 from runtime_paths import get_context_dir, get_prompt_path
 
 
@@ -210,6 +216,41 @@ def _render_weekly_plan_prompt(record: ReviewWorkflowRecord) -> str:
         goals_audit_checkpoint=_format_checkpoint_for_prompt(record.goals_audit),
         memory_audit_checkpoint=_format_checkpoint_for_prompt(record.memory_audit),
         decision_log_markdown=record.source_snapshot.decision_log_markdown,
+    )
+
+
+def _render_scheduling_pass_prompt(record: ReviewWorkflowRecord) -> str:
+    """
+    Renders the scheduling-pass prompt from completed review checkpoints.
+
+    This stage proposes calendar actions from the reviewed weekly plan. It does
+    not write to the proposal queue yet; that integration belongs to the
+    confirmation layer shared with normal conversation sessions.
+    """
+    if record.week_review is None:
+        raise ValueError("Cannot run scheduling_pass before week_review is checkpointed.")
+    if record.goals_audit is None:
+        raise ValueError("Cannot run scheduling_pass before goals_audit is checkpointed.")
+    if record.memory_audit is None:
+        raise ValueError("Cannot run scheduling_pass before memory_audit is checkpointed.")
+    if record.weekly_plan is None:
+        raise ValueError("Cannot run scheduling_pass before weekly_plan is checkpointed.")
+    if record.weekly_state_changes is None or not record.weekly_state_changes.proposed_markdown:
+        raise ValueError("Cannot run scheduling_pass before proposed weekly state is available.")
+
+    upcoming_events_block = _format_snapshot_events_for_prompt(record.source_snapshot.upcoming_events)
+
+    return _render_review_prompt(
+        "scheduling_pass.txt",
+        weekly_state_markdown=record.source_snapshot.weekly_state_markdown,
+        proposed_weekly_state_markdown=record.weekly_state_changes.proposed_markdown,
+        goals_markdown=record.source_snapshot.goals_markdown,
+        week_review_checkpoint=_format_checkpoint_for_prompt(record.week_review),
+        goals_audit_checkpoint=_format_checkpoint_for_prompt(record.goals_audit),
+        memory_audit_checkpoint=_format_checkpoint_for_prompt(record.memory_audit),
+        weekly_plan_checkpoint=_format_checkpoint_for_prompt(record.weekly_plan),
+        past_events_block=_format_snapshot_events_for_prompt(record.source_snapshot.past_week_events),
+        upcoming_events_block=upcoming_events_block,
     )
 
 
@@ -658,6 +699,25 @@ async def run_weekly_plan_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowR
     return await save_review_workflow(record)
 
 
+async def run_scheduling_pass_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowRecord:
+    """
+    Runs and checkpoints scheduling recommendations for the reviewed week.
+
+    Proposed events stay in the structured response for this stage today. A
+    later pass should translate them into the shared calendar proposal queue so
+    Sunday review and normal chat sessions use the same confirmation path.
+    """
+    prompt = _render_scheduling_pass_prompt(record)
+
+    return await _run_checkpoint_stage(
+        record=record,
+        stage=ReviewStage.SCHEDULING_PASS,
+        prompt=prompt,
+        response_schema=SchedulingPassResponse,
+        operation="scheduling_pass",
+    )
+
+
 async def reconcile_review_workflows() -> list[ReviewWorkflowRecord]:
     """
     Returns persisted reviews that should survive startup reconciliation.
@@ -725,6 +785,12 @@ async def start_weekly_review_workflow(
             stage_status=StageStatus.RUNNING,
         )
         review_workflow = await run_weekly_plan_stage(review_workflow)
+        review_workflow = await transition_review_stage(
+            review_workflow,
+            stage=ReviewStage.SCHEDULING_PASS,
+            stage_status=StageStatus.RUNNING,
+        )
+        review_workflow = await run_scheduling_pass_stage(review_workflow)
 
         # Bridge: the downstream review still uses the legacy one-shot call
         # for user-facing confirmation and scheduling until those handlers

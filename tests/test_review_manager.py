@@ -6,12 +6,14 @@ from orchestrator.review_manager import (
     execute_weekly_state_update,
     run_goals_audit_stage,
     run_memory_audit_stage,
+    run_scheduling_pass_stage,
     run_sunday_review,
     run_week_review_stage,
     run_weekly_plan_stage,
     start_weekly_review_workflow,
 )
 from persistence.models import (
+    ArtifactChangeSummary,
     ReviewStage,
     ReviewWorkflowRecord,
     ReviewWorkflowStatus,
@@ -20,7 +22,13 @@ from persistence.models import (
     StageStatus,
 )
 from reasoning.pro_client import SundayReviewResponse
-from reasoning.schemas import GoalsAuditResponse, MemoryAuditResponse, WeekReviewResponse, WeeklyPlanResponse
+from reasoning.schemas import (
+    GoalsAuditResponse,
+    MemoryAuditResponse,
+    SchedulingPassResponse,
+    WeekReviewResponse,
+    WeeklyPlanResponse,
+)
 
 
 VALID_WEEKLY_STATE_MARKDOWN = """# Weekly State
@@ -354,6 +362,96 @@ async def test_run_weekly_plan_stage_requires_prior_checkpoints():
 
 
 @pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
+async def test_run_scheduling_pass_stage_persists_scheduling_checkpoint(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """
+    Tests that scheduling_pass consumes the reviewed weekly plan and stores a
+    durable checkpoint without writing calendar proposals yet.
+    """
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+            decision_log_markdown="# Decision Log",
+            past_week_events=["[2026-04-27T09:00:00-04:00] Deep Work"],
+            upcoming_events=["[2026-05-01T10:00:00-04:00] Existing Meeting"],
+        ),
+        week_review=StageCheckpoint(summary="The week moved implementation forward."),
+        goals_audit=StageCheckpoint(summary="Goals remain accurate."),
+        memory_audit=StageCheckpoint(summary="Memory needs only light cleanup."),
+        weekly_plan=StageCheckpoint(summary="Next week should focus on finishing the workflow."),
+        weekly_state_changes=ArtifactChangeSummary(
+            proposed_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+        ),
+    )
+    mock_generate_review_structured.return_value = SchedulingPassResponse(
+        summary="One focus block would support the reviewed weekly plan.",
+        key_findings=["A morning block best matches the stated constraints."],
+        constraints=["Avoid late-evening event proposals."],
+        carry_forward=[],
+        proposed_events=[],
+        scheduling_rationale="A single focused implementation block is enough for now.",
+    )
+
+    updated_record = await run_scheduling_pass_stage(record)
+
+    assert updated_record.scheduling_pass is not None
+    assert updated_record.scheduling_pass.summary == (
+        "One focus block would support the reviewed weekly plan."
+    )
+    assert updated_record.scheduling_pass.key_findings == [
+        "A morning block best matches the stated constraints.",
+    ]
+    assert updated_record.scheduling_pass.constraints == [
+        "Avoid late-evening event proposals.",
+    ]
+    assert updated_record.last_completed_stage == ReviewStage.SCHEDULING_PASS
+    mock_generate_review_structured.assert_called_once()
+    mock_save_review_workflow_sync.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_scheduling_pass_stage_requires_reviewed_weekly_plan():
+    """Tests that scheduling_pass waits for checkpoints and proposed weekly state."""
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+            decision_log_markdown="# Decision Log",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="week_review is checkpointed"):
+        await run_scheduling_pass_stage(record)
+
+    record.week_review = StageCheckpoint(summary="Week review exists.")
+    with pytest.raises(ValueError, match="goals_audit is checkpointed"):
+        await run_scheduling_pass_stage(record)
+
+    record.goals_audit = StageCheckpoint(summary="Goals audit exists.")
+    with pytest.raises(ValueError, match="memory_audit is checkpointed"):
+        await run_scheduling_pass_stage(record)
+
+    record.memory_audit = StageCheckpoint(summary="Memory audit exists.")
+    with pytest.raises(ValueError, match="weekly_plan is checkpointed"):
+        await run_scheduling_pass_stage(record)
+
+    record.weekly_plan = StageCheckpoint(summary="Weekly plan exists.")
+    with pytest.raises(ValueError, match="proposed weekly state is available"):
+        await run_scheduling_pass_stage(record)
+
+
+@pytest.mark.asyncio
 @patch("orchestrator.review_manager.run_sunday_review")
 @patch("orchestrator.review_manager._generate_review_structured")
 @patch("orchestrator.review_manager.build_review_source_snapshot")
@@ -401,6 +499,14 @@ async def test_start_weekly_review_workflow_checkpoints_week_review_before_bridg
             state_change_summary="Updated weekly state around staged review work.",
             weekly_state_content=VALID_WEEKLY_STATE_MARKDOWN,
         ),
+        SchedulingPassResponse(
+            summary="One focus block would support the staged review work.",
+            key_findings=["A morning implementation block fits the constraints."],
+            constraints=["Do not overfill evenings."],
+            carry_forward=[],
+            proposed_events=[],
+            scheduling_rationale="A single focus block supports the weekly plan without overcommitting.",
+        ),
     ]
     sunday_review = SundayReviewResponse(
         message="Sunday review summary.",
@@ -423,6 +529,8 @@ async def test_start_weekly_review_workflow_checkpoints_week_review_before_bridg
     assert record.weekly_plan.summary == "The next week should focus on review-workflow implementation."
     assert record.weekly_state_changes is not None
     assert record.weekly_state_changes.proposed_markdown == VALID_WEEKLY_STATE_MARKDOWN
+    assert record.scheduling_pass is not None
+    assert record.scheduling_pass.summary == "One focus block would support the staged review work."
     assert record.final_review is not None
     assert record.final_review.summary == "Sunday review summary."
     assert record.final_review.key_findings == ["Weekly state was updated."]
@@ -430,8 +538,8 @@ async def test_start_weekly_review_workflow_checkpoints_week_review_before_bridg
     assert record.current_stage == ReviewStage.FINAL_REVIEW
     assert record.stage_status == StageStatus.AWAITING_FEEDBACK
     assert record.last_completed_stage == ReviewStage.FINAL_REVIEW
-    assert mock_generate_review_structured.call_count == 4
-    assert mock_save_review_workflow_sync.call_count >= 12
+    assert mock_generate_review_structured.call_count == 5
+    assert mock_save_review_workflow_sync.call_count >= 14
 
 
 @patch("orchestrator.review_manager.capture_sentry_exception")

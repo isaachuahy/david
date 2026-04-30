@@ -219,3 +219,35 @@ class WeeklyPlanResponse(BaseModel):
             "be ready for user confirmation before application."
         ),
     )
+
+
+class SchedulingPassResponse(BaseModel):
+    """
+    LLM-facing schema for the scheduling pass stage of the Sunday review workflow.
+
+    This stage proposes calendar actions for later confirmation while also
+    persisting a compact checkpoint for restart safety and downstream review.
+    """
+
+    summary: str = Field(
+        description="One to three sentences summarizing the scheduling recommendation.",
+    )
+    key_findings: list[str] = Field(
+        default_factory=list,
+        description="Compact findings that explain the most important scheduling choices.",
+    )
+    constraints: list[str] = Field(
+        default_factory=list,
+        description="Scheduling constraints that shaped the proposed events or lack of events.",
+    )
+    carry_forward: list[str] = Field(
+        default_factory=list,
+        description="Scheduling questions or unresolved items to preserve for later review.",
+    )
+    proposed_events: list[ProposedEvent] = Field(
+        default_factory=list,
+        description="Calendar actions proposed for later user confirmation.",
+    )
+    scheduling_rationale: str = Field(
+        description="A concise explanation of why the proposed calendar actions make sense as a set.",
+    )
