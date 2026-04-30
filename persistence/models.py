@@ -122,12 +122,14 @@ class ArtifactChangeSummary(BaseModel):
 
     These fields capture the high-signal intent of the change so the workflow
     can resume and reason about pending edits without persisting bulky raw
-    line-by-line diffs at every stage.
+    line-by-line diffs at every stage. `proposed_markdown` stores the full
+    rendered candidate artifact when a stage produces one for confirmation.
     """
 
     additions: list[str] = Field(default_factory=list)
     deletions: list[str] = Field(default_factory=list)
     modifications: list[str] = Field(default_factory=list)
+    proposed_markdown: Optional[str] = None
 
 
 class ReviewWorkflowRecord(BaseModel):

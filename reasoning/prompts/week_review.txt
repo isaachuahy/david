@@ -19,7 +19,7 @@ Do not:
 
 Prefer evidence from the weekly state, recent decisions, and past-week calendar. Treat durable goals and rolling context as relevance signals, not as things to rewrite in this step.
 
-Populate the response schema with a compact weekly review checkpoint.
+Produce a compact weekly review checkpoint for later review steps.
 
 <GOALS>
 $goals_markdown

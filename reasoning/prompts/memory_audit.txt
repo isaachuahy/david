@@ -19,7 +19,7 @@ Do not:
 
 Prefer explicit evidence from the week review, goals audit, and decision log. Do not restate prior checkpoints except when a specific finding supports a memory-level assessment.
 
-Populate the response schema with a compact memory audit checkpoint.
+Produce a compact memory audit checkpoint for later review steps.
 
 <DECISION_LOG>
 $decision_log_markdown

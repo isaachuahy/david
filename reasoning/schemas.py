@@ -173,3 +173,49 @@ class MemoryAuditResponse(BaseModel):
             "that should be considered by weekly planning or final review."
         ),
     )
+
+
+class WeeklyPlanResponse(BaseModel):
+    """
+    LLM-facing schema for the weekly plan stage of the Sunday review workflow.
+
+    This stage produces both a compact checkpoint and the full proposed
+    weekly_state.md markdown for later user confirmation.
+    """
+
+    summary: str = Field(
+        description="One to three sentences summarizing the proposed next-week operating plan.",
+    )
+    key_findings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Compact planning findings that explain the most important priority, "
+            "carryover, or tradeoff choices."
+        ),
+    )
+    constraints: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Current-week constraints that should shape scheduling, prioritization, "
+            "or revision of the proposed weekly plan."
+        ),
+    )
+    carry_forward: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Important unresolved items or active carryover that should remain "
+            "visible after this planning stage."
+        ),
+    )
+    state_change_summary: str = Field(
+        description=(
+            "A concise human-readable summary of how the proposed weekly state "
+            "differs from the current weekly state."
+        ),
+    )
+    weekly_state_content: str = Field(
+        description=(
+            "The full proposed markdown content for weekly_state.md. This should "
+            "be ready for user confirmation before application."
+        ),
+    )

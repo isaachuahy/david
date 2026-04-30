@@ -20,7 +20,7 @@ Do not:
 
 Prefer explicit evidence from the week review, recent decisions, and weekly state. Treat the decision log as memory context, not as a source of automatic goal edits.
 
-Populate the response schema with a compact goals audit checkpoint.
+Produce a compact goals audit checkpoint for later review steps.
 
 <GOALS>
 $goals_markdown

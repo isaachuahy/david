@@ -13,6 +13,7 @@ from orchestrator.context_builder import build_context
 from integrations.calendar import get_past_events
 from persistence.database import get_db
 from persistence.models import (
+    ArtifactChangeSummary,
     ReviewStage,
     ReviewWorkflowRecord,
     ReviewWorkflowStatus,
@@ -27,7 +28,7 @@ from persistence.review_workflows import (
 )
 from reasoning.parser import parse_model_response
 from reasoning.pro_client import generate_sunday_review, SundayReviewResponse
-from reasoning.schemas import GoalsAuditResponse, MemoryAuditResponse, WeekReviewResponse
+from reasoning.schemas import GoalsAuditResponse, MemoryAuditResponse, WeekReviewResponse, WeeklyPlanResponse
 from runtime_paths import get_context_dir, get_prompt_path
 
 
@@ -47,6 +48,21 @@ _REVIEW_STAGE_FIELD_BY_STAGE = {
     ReviewStage.SCHEDULING_PASS: "scheduling_pass",
     ReviewStage.FINAL_REVIEW: "final_review",
 }
+
+_WEEKLY_STATE_REQUIRED_MARKERS = (
+    "# Weekly State",
+    "## This Week",
+    "### Top Priorities",
+    "### Carryover",
+    "### Constraints",
+    "### Execution Focus",
+)
+_WEEKLY_STATE_FORBIDDEN_MARKERS = (
+    "# Goals",
+    "# Decision Log",
+    "## Current Rolling Context",
+    "## Recent Decisions",
+)
 
 
 def _utc_now_iso() -> str:
@@ -170,6 +186,64 @@ def _render_memory_audit_prompt(record: ReviewWorkflowRecord) -> str:
         goals_audit_checkpoint=_format_checkpoint_for_prompt(record.goals_audit),
         weekly_state_markdown=record.source_snapshot.weekly_state_markdown,
     )
+
+
+def _render_weekly_plan_prompt(record: ReviewWorkflowRecord) -> str:
+    """
+    Renders the weekly-plan prompt from the frozen snapshot and checkpoints.
+
+    This stage turns review evidence into a proposed `weekly_state.md` artifact,
+    so it depends on the three upstream checkpoints being durable first.
+    """
+    if record.week_review is None:
+        raise ValueError("Cannot run weekly_plan before week_review is checkpointed.")
+    if record.goals_audit is None:
+        raise ValueError("Cannot run weekly_plan before goals_audit is checkpointed.")
+    if record.memory_audit is None:
+        raise ValueError("Cannot run weekly_plan before memory_audit is checkpointed.")
+
+    return _render_review_prompt(
+        "weekly_plan.txt",
+        weekly_state_markdown=record.source_snapshot.weekly_state_markdown,
+        goals_markdown=record.source_snapshot.goals_markdown,
+        week_review_checkpoint=_format_checkpoint_for_prompt(record.week_review),
+        goals_audit_checkpoint=_format_checkpoint_for_prompt(record.goals_audit),
+        memory_audit_checkpoint=_format_checkpoint_for_prompt(record.memory_audit),
+        decision_log_markdown=record.source_snapshot.decision_log_markdown,
+    )
+
+
+def validate_weekly_state_markdown(content: str) -> None:
+    """
+    Performs deterministic sanity checks before persisting proposed weekly state.
+
+    The schema captures the model contract; this validator catches artifact-level
+    mistakes like empty markdown, missing weekly-state shape, or cross-file
+    leakage before the proposal reaches user confirmation.
+    """
+    stripped = content.strip()
+    if not stripped:
+        raise ValueError("Weekly state markdown cannot be empty.")
+
+    missing_markers = [
+        marker for marker in _WEEKLY_STATE_REQUIRED_MARKERS
+        if marker not in stripped
+    ]
+    if missing_markers:
+        raise ValueError(
+            "Weekly state markdown is missing required section(s): "
+            + ", ".join(missing_markers)
+        )
+
+    forbidden_markers = [
+        marker for marker in _WEEKLY_STATE_FORBIDDEN_MARKERS
+        if marker in stripped
+    ]
+    if forbidden_markers:
+        raise ValueError(
+            "Weekly state markdown appears to include another artifact: "
+            + ", ".join(forbidden_markers)
+        )
 
 
 def _select_review_model(
@@ -541,6 +615,49 @@ async def run_memory_audit_stage(record: ReviewWorkflowRecord) -> ReviewWorkflow
     )
 
 
+async def run_weekly_plan_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowRecord:
+    """
+    Runs the weekly-plan stage and stores the proposed weekly-state artifact.
+
+    Unlike checkpoint-only stages, this preserves both a compact checkpoint and
+    the full proposed markdown that can later be shown to the user or written
+    after confirmation.
+    """
+    prompt = _render_weekly_plan_prompt(record)
+    model = _select_review_model(ReviewStage.WEEKLY_PLAN, context_chars=len(prompt))
+
+    try:
+        response = await asyncio.to_thread(
+            _generate_review_structured,
+            prompt=prompt,
+            response_schema=WeeklyPlanResponse,
+            model=model,
+            operation="weekly_plan",
+        )
+    except Exception:
+        if model == GEMINI_PRO_MODEL:
+            raise
+
+        logger.warning("Retrying weekly_plan with {} after {} failed.", GEMINI_PRO_MODEL, model)
+        response = await asyncio.to_thread(
+            _generate_review_structured,
+            prompt=prompt,
+            response_schema=WeeklyPlanResponse,
+            model=GEMINI_PRO_MODEL,
+            operation="weekly_plan_retry",
+        )
+
+    validate_weekly_state_markdown(response.weekly_state_content)
+
+    record.weekly_plan = _response_to_stage_checkpoint(response)
+    record.weekly_state_changes = ArtifactChangeSummary(
+        modifications=[response.state_change_summary] if response.state_change_summary else [],
+        proposed_markdown=response.weekly_state_content,
+    )
+    record.last_completed_stage = ReviewStage.WEEKLY_PLAN
+    return await save_review_workflow(record)
+
+
 async def reconcile_review_workflows() -> list[ReviewWorkflowRecord]:
     """
     Returns persisted reviews that should survive startup reconciliation.
@@ -602,10 +719,16 @@ async def start_weekly_review_workflow(
             stage_status=StageStatus.RUNNING,
         )
         review_workflow = await run_memory_audit_stage(review_workflow)
+        review_workflow = await transition_review_stage(
+            review_workflow,
+            stage=ReviewStage.WEEKLY_PLAN,
+            stage_status=StageStatus.RUNNING,
+        )
+        review_workflow = await run_weekly_plan_stage(review_workflow)
 
         # Bridge: the downstream review still uses the legacy one-shot call
-        # until weekly plan and scheduling pass are split into checkpointed
-        # stages with their own confirmation/revision loops.
+        # for user-facing confirmation and scheduling until those handlers
+        # consume staged artifacts directly.
         review_workflow = await transition_review_stage(
             review_workflow,
             stage=ReviewStage.FINAL_REVIEW,
