@@ -35,6 +35,7 @@ def init_db():
     if "calendar_writes" not in db.table_names():
         db["calendar_writes"].create({
             "id": str,
+            "proposal_item_id": str,
             "action_type": str,
             "summary": str,
             "start_time": str,  # ISO format
@@ -70,6 +71,9 @@ def init_db():
         if "created_event_calendar_id" not in existing_columns:
             table.add_column("created_event_calendar_id", str)
             logger.info("Added column calendar_writes.created_event_calendar_id")
+        if "proposal_item_id" not in existing_columns:
+            table.add_column("proposal_item_id", str)
+            logger.info("Added column calendar_writes.proposal_item_id")
 
     # 2. Sessions
     if "sessions" not in db.table_names():
@@ -121,6 +125,43 @@ def init_db():
         if "state_json" not in existing_columns:
             table.add_column("state_json", str, not_null_default="{}")
             logger.info("Added column review_workflows.state_json")
+
+    # 6. Proposal Threads
+    if "proposal_threads" not in db.table_names():
+        db["proposal_threads"].create({
+            "id": str,
+            "source_type": str,
+            "source_id": str,
+            "title": str,
+            "status": str,
+            "active_item_id": str,
+            "created_at": str,
+            "updated_at": str,
+        }, pk="id")
+        logger.info("Created table: proposal_threads")
+
+    # 7. Proposal Items
+    if "proposal_items" not in db.table_names():
+        db["proposal_items"].create({
+            "id": str,
+            "thread_id": str,
+            "item_type": str,
+            "status": str,
+            "sequence_index": int,
+            "revision_count": int,
+            "last_feedback": str,
+            "action_type": str,
+            "summary": str,
+            "start_time": str,
+            "end_time": str,
+            "description": str,
+            "calendar_id": str,
+            "target_event_id": str,
+            "target_event_calendar_id": str,
+            "created_at": str,
+            "updated_at": str,
+        }, pk="id")
+        logger.info("Created table: proposal_items")
 
     logger.info("Database initialization complete.")
 

@@ -15,8 +15,32 @@ class CalendarWriteStatus(str, Enum):
     REJECTED = "rejected"
     EXPIRED = "expired"
 
+
+class ProposalThreadStatus(str, Enum):
+    """Lifecycle for a group of related proposal items."""
+
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+
+class ProposalItemStatus(str, Enum):
+    """Lifecycle for one draft item inside a proposal thread."""
+
+    QUEUED = "queued"
+    ACTIVE = "active"
+    IN_REVISION = "in_revision"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+
 class CalendarWriteRecord(BaseModel):
+    """Executable calendar write created after user confirmation."""
+
     id: str
+    proposal_item_id: Optional[str] = None
     action_type: str = "schedule"
     summary: str
     start_time: str
@@ -29,6 +53,54 @@ class CalendarWriteRecord(BaseModel):
     created_at: str
     created_event_id: Optional[str] = None
     created_event_calendar_id: Optional[str] = None
+
+
+class ProposalThreadRecord(BaseModel):
+    """
+    Durable scope for one related proposal flow.
+
+    A chat session or Sunday review can create multiple threads. Each thread
+    owns its own queue of proposal items so feedback can revise the active item
+    without confusing it with unrelated calendar topics in the same session.
+    """
+
+    id: str
+    source_type: str
+    source_id: Optional[str] = None
+    title: str = ""
+    status: ProposalThreadStatus
+    active_item_id: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class ProposalItemRecord(BaseModel):
+    """
+    Durable draft for one proposed action inside a proposal thread.
+
+    Calendar fields intentionally mirror CalendarWriteRecord. Keeping the draft
+    flat makes SQLite inspection and future migrations easier while preserving a
+    direct path from accepted proposal item to executable calendar write.
+    """
+
+    id: str
+    thread_id: str
+    item_type: str = "calendar_write"
+    status: ProposalItemStatus
+    sequence_index: int = 0
+    revision_count: int = 0
+    last_feedback: Optional[str] = None
+    action_type: str = "schedule"
+    summary: str
+    start_time: str
+    end_time: str
+    description: str
+    calendar_id: str = "primary"
+    target_event_id: Optional[str] = None
+    target_event_calendar_id: Optional[str] = None
+    created_at: str
+    updated_at: str
+
 
 class SessionRecord(BaseModel):
     id: str
@@ -159,5 +231,4 @@ class ReviewWorkflowRecord(BaseModel):
     goals_changes: Optional[ArtifactChangeSummary] = None
     weekly_state_changes: Optional[ArtifactChangeSummary] = None
     decision_log_changes: Optional[ArtifactChangeSummary] = None
-    active_proposal_write_ids: list[str] = Field(default_factory=list)
     feedback_history: list[str] = Field(default_factory=list)

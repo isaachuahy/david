@@ -6,7 +6,7 @@ from loguru import logger
 from observability.sentry import capture_exception as capture_sentry_exception
 
 from reasoning.parser import parse_model_response
-from reasoning.schemas import ProposedEvent
+from reasoning.schemas import CalendarPlanningMode, ProposalThreadDraft, ProposedEvent
 from runtime_paths import DEFAULT_PROMPTS_DIR, get_prompt_path
 
 # Kept for existing tests and diagnostics; prompt reads use get_prompt_path.
@@ -16,9 +16,27 @@ class FlashResponse(BaseModel):
     message: str = Field(
         description="The text response to send directly back to the user."
     )
+    calendar_planning_mode: CalendarPlanningMode = Field(
+        default="none",
+        description=(
+            "Calendar planning mode for this turn: none for no calendar flow, "
+            "discuss for clarification or brainstorming without concrete events, "
+            "or propose for a concrete proposal thread."
+        ),
+    )
+    proposal_thread: Optional[ProposalThreadDraft] = Field(
+        default=None,
+        description=(
+            "Concrete related calendar proposal items for later confirmation. "
+            "Populate only when calendar_planning_mode is propose."
+        ),
+    )
     proposed_calendar_action: Optional[ProposedEvent] = Field(
         default=None,
-        description="If the user's request implies a calendar action (scheduling, modifying, or deleting an event), populate this field. Otherwise, leave it null."
+        description=(
+            "Deprecated compatibility field for a single calendar action. "
+            "Prefer proposal_thread when proposing concrete calendar items."
+        ),
     )
 
 class SessionSynthesisResponse(BaseModel):

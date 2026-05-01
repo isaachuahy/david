@@ -2,6 +2,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 CalendarActionType = Literal["schedule", "reschedule", "cancel"]
+CalendarPlanningMode = Literal["none", "discuss", "propose"]
 
 
 class ProposedEvent(BaseModel):
@@ -62,6 +63,27 @@ class ProposedEvent(BaseModel):
     target_event_calendar_id: Optional[str] = Field(
         default=None,
         description="Resolved canonical calendar ID containing target_event_id.",
+    )
+
+
+class ProposalThreadDraft(BaseModel):
+    """
+    LLM-facing draft for one related set of calendar proposals.
+
+    A single user turn may produce zero, one, or multiple calendar items, but
+    related items should stay under one thread so the application can confirm
+    or revise them one at a time without losing their shared intent.
+    """
+
+    title: str = Field(
+        description="Short title for the proposal thread, such as 'Moving house schedule'.",
+    )
+    rationale: str = Field(
+        description="Concise explanation of why these proposed events belong together.",
+    )
+    proposed_events: list[ProposedEvent] = Field(
+        default_factory=list,
+        description="Concrete calendar actions proposed for later confirmation.",
     )
 
 

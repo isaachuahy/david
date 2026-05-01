@@ -1,11 +1,11 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-def build_calendar_confirmation_keyboard(write_id: str) -> InlineKeyboardMarkup:
-    """Builds the Confirm/Reject inline keyboard for calendar proposals."""
+def build_proposal_item_keyboard(item_id: str) -> InlineKeyboardMarkup:
+    """Builds the Confirm/Reject inline keyboard for one proposal item."""
     keyboard = [
         [
-            InlineKeyboardButton("Confirm", callback_data=f"confirm_{write_id}"),
-            InlineKeyboardButton("Reject", callback_data=f"reject_{write_id}")
+            InlineKeyboardButton("Confirm", callback_data=f"confirm_item_{item_id}"),
+            InlineKeyboardButton("Reject", callback_data=f"reject_item_{item_id}")
         ]
     ]
     return InlineKeyboardMarkup(keyboard)

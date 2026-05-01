@@ -6,7 +6,20 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from orchestrator.router import process_message
-from orchestrator.confirmation_queue import add_pending_write, confirm_write, reject_write, get_pending_write
+from orchestrator.confirmation_queue import (
+    accept_proposal_item,
+    activate_next_proposal_item,
+    add_proposal_item,
+    confirm_write,
+    create_proposal_thread,
+    get_pending_write,
+    get_proposal_item,
+    mark_proposal_item_in_revision,
+    mark_proposal_item_accepted,
+    reject_proposal_item,
+    reject_write,
+    revise_proposal_item,
+)
 from orchestrator.trigger_scheduler import queue_trigger, consume_trigger
 from integrations.calendar import resolve_calendar_reference, get_upcoming_events
 from orchestrator.session_manager import (
@@ -23,17 +36,16 @@ from orchestrator.review_manager import (
 from orchestrator.time_utils import USER_TIMEZONE, calendar_event_sort_key, parse_iso, parse_user_datetime, format_user_datetime
 from persistence.models import (
     CalendarWriteStatus,
+    ProposalItemRecord,
+    ProposalItemStatus,
     ReviewWorkflowStatus,
     SessionStatus,
 )
-from reasoning.schemas import ProposedEvent
-from bot.keyboards import build_calendar_confirmation_keyboard, build_weekly_state_keyboard
+from reasoning.flash_client import FlashResponse
+from reasoning.schemas import ProposalThreadDraft, ProposedEvent
+from bot.keyboards import build_proposal_item_keyboard, build_weekly_state_keyboard
 from observability.sentry import capture_exception as capture_sentry_exception
 
-WEEKLY_REVIEW_EVENT_QUEUE_KEY = "weekly_review_event_queue"
-WEEKLY_REVIEW_TOTAL_EVENTS_KEY = "weekly_review_total_events"
-WEEKLY_REVIEW_PROCESSED_EVENTS_KEY = "weekly_review_processed_events"
-WEEKLY_REVIEW_CURRENT_WRITE_ID_KEY = "weekly_review_current_write_id"
 ACTIVE_REVIEW_WORKFLOW_ID_KEY = "active_review_workflow_id"
 UNAUTHORIZED_CALLBACK_TEXT = "This action is not available."
 CALENDAR_AUTH_ERROR_TEXT = (
@@ -120,27 +132,18 @@ def authorized_only(handler):
     return wrapper
 
 
-def clear_weekly_review_event_queue(context: ContextTypes.DEFAULT_TYPE):
-    """Clears the in-memory weekly review event queue state."""
-    context.user_data.pop(WEEKLY_REVIEW_EVENT_QUEUE_KEY, None)
-    context.user_data.pop(WEEKLY_REVIEW_TOTAL_EVENTS_KEY, None)
-    context.user_data.pop(WEEKLY_REVIEW_PROCESSED_EVENTS_KEY, None)
-    context.user_data.pop(WEEKLY_REVIEW_CURRENT_WRITE_ID_KEY, None)
-
-
 def has_pending_weekly_review_event_feedback(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Returns whether the weekly review still has event proposals awaiting feedback.
 
     Weekly state confirmation is only one part of the review flow. The review
     should remain open if calendar proposals from that same Sunday review are
-    still queued or currently waiting for confirmation.
+    still waiting for confirmation.
     """
-    if context.user_data.get(WEEKLY_REVIEW_CURRENT_WRITE_ID_KEY):
-        return True
-
-    queued_events = context.user_data.get(WEEKLY_REVIEW_EVENT_QUEUE_KEY, [])
-    return bool(queued_events)
+    return any(
+        pending_id.startswith("pi_")
+        for pending_id, _message_id in get_tracked_confirmation_messages(context)
+    )
 
 
 def has_pending_weekly_state_feedback(context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -154,14 +157,75 @@ def has_pending_weekly_state_feedback(context: ContextTypes.DEFAULT_TYPE) -> boo
     return isinstance(proposed_state, dict)
 
 
-async def send_calendar_proposal(context: ContextTypes.DEFAULT_TYPE, chat_id: int, action, prefix_text: str = "") -> str:
+async def _send_proposal_item_confirmation(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    item: ProposalItemRecord,
+    *,
+    prefix_text: str = "",
+    calendar_display_name: str | None = None,
+) -> str:
     """
-    Resolves calendar metadata once, then queues and presents a proposal.
+    Presents one active proposal item with confirmation controls.
 
-    This keeps the Google Calendar ID authoritative for the rest of the flow
-    while still surfacing a human-readable calendar name in the confirmation UI.
+    The buttons point at the proposal item, not a calendar write. Calendar
+    writes are created only after the user confirms the active item.
     """
-    # Used both for ad-hoc calendar proposals from the LLM and for proposed events generated during the Sunday Review process.
+    start_dt = parse_user_datetime(item.start_time)
+    end_dt = parse_user_datetime(item.end_time)
+    reply_markup = build_proposal_item_keyboard(item.id)
+
+    display_name = calendar_display_name or item.calendar_id
+    calendar_line = (
+        f"Calendar: {display_name} (`{item.calendar_id}`)"
+        if display_name != item.calendar_id
+        else f"Calendar ID: `{item.calendar_id}`"
+    )
+
+    full_text = f"{prefix_text}\n\n" if prefix_text else ""
+    if item.action_type == "cancel":
+        full_text += (
+            f"🗓️ *Proposed Cancellation:*\n*{item.summary}*\n_{item.description}_\n\n"
+            f"{calendar_line}\n"
+            f"Current Start: {format_user_datetime(start_dt)}\n"
+            f"Current End: {format_user_datetime(end_dt)}"
+        )
+    elif item.action_type == "reschedule":
+        full_text += (
+            f"🗓️ *Proposed Reschedule:*\n*{item.summary}*\n_{item.description}_\n\n"
+            f"{calendar_line}\n"
+            f"New Start: {format_user_datetime(start_dt)}\n"
+            f"New End: {format_user_datetime(end_dt)}"
+        )
+    else:
+        full_text += (
+            f"🗓️ *Proposed Event:*\n*{item.summary}*\n_{item.description}_\n\n"
+            f"{calendar_line}\n"
+            f"Start: {format_user_datetime(start_dt)}\n"
+            f"End: {format_user_datetime(end_dt)}"
+        )
+
+    message = await context.bot.send_message(
+        chat_id=chat_id,
+        text=full_text.strip(),
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+    track_confirmation_message(context, item.id, message.message_id)
+    return item.id
+
+
+async def _normalize_calendar_action(
+    context: ContextTypes.DEFAULT_TYPE,
+    action: ProposedEvent,
+) -> ProposedEvent:
+    """
+    Resolves and normalizes one proposed calendar action before persistence.
+
+    This keeps initial proposals and revised proposals on the same path: both
+    get canonical calendar metadata, target-event matching, and ISO datetime
+    normalization before becoming durable ProposalItemRecord data.
+    """
     resolved_calendar = await asyncio.to_thread(
         resolve_calendar_reference,
         action.requested_calendar_text,
@@ -185,56 +249,221 @@ async def send_calendar_proposal(context: ContextTypes.DEFAULT_TYPE, chat_id: in
 
     start_dt = parse_user_datetime(action.start_time)
     end_dt = parse_user_datetime(action.end_time)
-    
-    write_id = add_pending_write(
-        action.summary,
-        start_dt,
-        end_dt,
-        action.description,
-        action.calendar_id,
-        action_type=action.action_type,
-        target_event_id=action.target_event_id,
-        target_event_calendar_id=action.target_event_calendar_id,
-    )
-    reply_markup = build_calendar_confirmation_keyboard(write_id)
-    
-    calendar_line = (
-        f"Calendar: {action.calendar_display_name} (`{action.calendar_id}`)"
-        if action.calendar_display_name != action.calendar_id
-        else f"Calendar ID: `{action.calendar_id}`"
+    action.start_time = start_dt.isoformat()
+    action.end_time = end_dt.isoformat()
+    return action
+
+
+def _extract_revised_calendar_action(response: FlashResponse) -> ProposedEvent | None:
+    """
+    Extracts the concrete revised event from a Flash response, if present.
+
+    The proposal-thread field is the new contract. The deprecated single-action
+    field remains as a compatibility fallback while handlers finish migrating.
+    """
+    if response.proposal_thread and response.proposal_thread.proposed_events:
+        return response.proposal_thread.proposed_events[0]
+    return response.proposed_calendar_action
+
+
+def _format_revision_request(item: ProposalItemRecord, feedback: str) -> str:
+    """
+    Builds an explicit revision turn for the router.
+
+    The message includes the active draft because chat history alone is not a
+    durable enough source of truth for multi-turn proposal-item revisions.
+    """
+    return (
+        "Revise the active calendar proposal using this feedback. "
+        "Return a concrete revised proposal only if it is ready for confirmation; "
+        "otherwise ask a clarifying question.\n\n"
+        "<ACTIVE_PROPOSAL_ITEM>\n"
+        f"Action: {item.action_type}\n"
+        f"Summary: {item.summary}\n"
+        f"Start: {item.start_time}\n"
+        f"End: {item.end_time}\n"
+        f"Description: {item.description}\n"
+        f"Calendar ID: {item.calendar_id}\n"
+        "</ACTIVE_PROPOSAL_ITEM>\n\n"
+        f"<USER_FEEDBACK>\n{feedback}\n</USER_FEEDBACK>"
     )
 
-    full_text = f"{prefix_text}\n\n" if prefix_text else ""
-    if action.action_type == "cancel":
-        full_text += (
-            f"🗓️ *Proposed Cancellation:*\n*{action.summary}*\n_{action.description}_\n\n"
-            f"{calendar_line}\n"
-            f"Current Start: {format_user_datetime(start_dt)}\n"
-            f"Current End: {format_user_datetime(end_dt)}"
+
+async def _revise_active_proposal_item(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    item_id: str,
+    message_id: int,
+    feedback: str,
+) -> bool:
+    """
+    Revises one active proposal item in place from user feedback.
+
+    The old confirmation message is retired before reasoning starts so stale
+    buttons cannot confirm an outdated proposal while the revision is underway.
+    """
+    item = get_proposal_item(item_id)
+    if not item or item.status not in {
+        ProposalItemStatus.ACTIVE,
+        ProposalItemStatus.IN_REVISION,
+    }:
+        return False
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="Revision requested. Retiring this proposal while I update it.",
         )
-    elif action.action_type == "reschedule":
-        full_text += (
-            f"🗓️ *Proposed Reschedule:*\n*{action.summary}*\n_{action.description}_\n\n"
-            f"{calendar_line}\n"
-            f"New Start: {format_user_datetime(start_dt)}\n"
-            f"New End: {format_user_datetime(end_dt)}"
-        )
-    else:
-        full_text += (
-            f"🗓️ *Proposed Event:*\n*{action.summary}*\n_{action.description}_\n\n"
-            f"{calendar_line}\n"
-            f"Start: {format_user_datetime(start_dt)}\n"
-            f"End: {format_user_datetime(end_dt)}"
-        )
-    
-    message = await context.bot.send_message(
-        chat_id=chat_id,
-        text=full_text.strip(),
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
+    except Exception as error:
+        logger.error(f"Failed to retire proposal item UI for {item_id}: {error}")
+
+    mark_proposal_item_in_revision(item_id, feedback=feedback)
+    untrack_confirmation_message(context, item_id)
+
+    revision_request = _format_revision_request(item, feedback)
+    response = await process_message(revision_request, context)
+    revised_action = _extract_revised_calendar_action(response)
+
+    if revised_action is None:
+        await context.bot.send_message(chat_id=chat_id, text=response.message)
+        return True
+
+    normalized_action = await _normalize_calendar_action(context, revised_action)
+    revised_item = revise_proposal_item(
+        item_id,
+        normalized_action,
+        feedback=feedback,
     )
-    track_confirmation_message(context, write_id, message.message_id)
-    return write_id
+    if revised_item is None:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="I couldn't update the active proposal. Please try again.",
+        )
+        return True
+
+    await _send_proposal_item_confirmation(
+        context,
+        chat_id,
+        revised_item,
+        prefix_text=response.message,
+        calendar_display_name=normalized_action.calendar_display_name,
+    )
+    return True
+
+
+async def _advance_proposal_thread_after_item_resolution(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    item: ProposalItemRecord,
+    *,
+    outcome_text: str,
+) -> bool:
+    """
+    Presents the next queued item after one proposal item is resolved.
+
+    This advances exactly one step. The next item still needs its own
+    confirm/reject/revision turn, so the queue depletes through user decisions
+    rather than a single handler call.
+    """
+    next_item = activate_next_proposal_item(item.thread_id)
+    if next_item is None:
+        return False
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"{outcome_text}. Sending the next related proposal now.",
+    )
+    await _send_proposal_item_confirmation(
+        context,
+        chat_id,
+        next_item,
+    )
+    return True
+
+
+async def send_calendar_proposal(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    action,
+    prefix_text: str = "",
+    *,
+    source_type: str = "conversation",
+    source_id: str | None = None,
+    thread_title: str | None = None,
+) -> str:
+    """
+    Compatibility wrapper for one-item calendar proposals.
+
+    New code should prefer send_proposal_thread. This helper keeps older call
+    sites working while routing through the same durable proposal-thread path.
+    """
+    proposal_thread = ProposalThreadDraft(
+        title=thread_title or action.summary,
+        rationale="Single calendar action proposed from the current conversation turn.",
+        proposed_events=[action],
+    )
+    item_id = await send_proposal_thread(
+        context,
+        chat_id,
+        proposal_thread,
+        prefix_text=prefix_text,
+        source_type=source_type,
+        source_id=source_id,
+    )
+    if item_id is None:
+        raise RuntimeError("Failed to create a proposal item for the calendar action.")
+    return item_id
+
+
+async def send_proposal_thread(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    proposal_thread,
+    *,
+    prefix_text: str = "",
+    source_type: str = "conversation",
+    source_id: str | None = None,
+) -> str | None:
+    """
+    Persists a proposed thread and presents its first proposal item.
+
+    calendar_planning_mode is a per-turn model decision; this durable thread is
+    the longer-lived state that lets later turns discuss, revise, or confirm
+    individual items without losing the shared proposal scope.
+    """
+    if not proposal_thread.proposed_events:
+        return None
+
+    thread = create_proposal_thread(
+        source_type=source_type,
+        source_id=source_id or context.user_data.get("current_session_id"),
+        title=proposal_thread.title,
+    )
+
+    first_display_name: str | None = None
+    for index, action in enumerate(proposal_thread.proposed_events):
+        normalized_action = await _normalize_calendar_action(context, action)
+        if index == 0:
+            first_display_name = normalized_action.calendar_display_name
+        add_proposal_item(
+            thread.id,
+            normalized_action,
+            sequence_index=index,
+            status=ProposalItemStatus.QUEUED,
+        )
+
+    item = activate_next_proposal_item(thread.id)
+    if item is None:
+        raise RuntimeError("Failed to activate the first item in the proposal thread.")
+
+    return await _send_proposal_item_confirmation(
+        context,
+        chat_id,
+        item,
+        prefix_text=prefix_text,
+        calendar_display_name=first_display_name,
+    )
 
 
 def _match_existing_event(cached_events: list[dict], action: ProposedEvent):
@@ -278,78 +507,6 @@ def _match_existing_event(cached_events: list[dict], action: ProposedEvent):
     return best_event
 
 
-async def send_next_weekly_review_event(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Sends the next queued weekly review proposal, if one remains."""
-    queue = context.user_data.get(WEEKLY_REVIEW_EVENT_QUEUE_KEY)
-    if not queue:
-        clear_weekly_review_event_queue(context)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Weekly review calendar proposals are complete.",
-        )
-        return
-
-    total = context.user_data.get(WEEKLY_REVIEW_TOTAL_EVENTS_KEY, len(queue))
-    processed = context.user_data.get(WEEKLY_REVIEW_PROCESSED_EVENTS_KEY, 0)
-    next_position = processed + 1
-    next_event = queue.pop(0)
-    write_id = await send_calendar_proposal(
-        context=context,
-        chat_id=chat_id,
-        action=next_event,
-        prefix_text=(
-            f"📅 *Weekly Review Proposal {next_position} of {total}*\n"
-            "Please confirm or reject this event before I move to the next one."
-        ),
-    )
-    context.user_data[WEEKLY_REVIEW_CURRENT_WRITE_ID_KEY] = write_id
-
-
-async def advance_weekly_review_event_queue(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    write_id: str,
-    outcome_text: str,
-):
-    """Advances the queued weekly review proposals after the current one is resolved."""
-    current_write_id = context.user_data.get(WEEKLY_REVIEW_CURRENT_WRITE_ID_KEY)
-    if current_write_id != write_id:
-        return
-
-    total = context.user_data.get(WEEKLY_REVIEW_TOTAL_EVENTS_KEY, 0)
-    processed = context.user_data.get(WEEKLY_REVIEW_PROCESSED_EVENTS_KEY, 0) + 1
-    context.user_data[WEEKLY_REVIEW_PROCESSED_EVENTS_KEY] = processed
-    remaining_queue = context.user_data.get(WEEKLY_REVIEW_EVENT_QUEUE_KEY, [])
-
-    if remaining_queue:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"{outcome_text} weekly review proposal {processed} of {total}. Sending the next proposal now.",
-        )
-        await send_next_weekly_review_event(context, chat_id)
-        return
-
-    clear_weekly_review_event_queue(context)
-    review_id = context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
-    review_workflow = (
-        await apply_bridge_event_feedback(
-            review_id,
-            has_pending_weekly_state_feedback=has_pending_weekly_state_feedback(context),
-        )
-        if review_id
-        else None
-    )
-    if (
-        review_workflow is not None
-        and review_workflow.workflow_status == ReviewWorkflowStatus.COMPLETED
-    ):
-        context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"{outcome_text} weekly review proposal {processed} of {total}. Weekly review calendar proposals are complete.",
-    )
-
 # Handlers for Telegram bot commands and messages.
 # These are the entry points for all user interactions, and they delegate to the Router and other orchestrator components to handle the logic and state management. 
 # The handlers also manage session state and ensure that the user experience is smooth and responsive, even when waiting for LLM responses or handling confirmations.
@@ -386,13 +543,71 @@ async def test_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @authorized_only
 async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles confirmation of a proposed calendar write."""
+    """Handles confirmation of a proposed calendar item or legacy calendar write."""
     query = update.callback_query
     await query.answer()
-    
+
+    if query.data.startswith("confirm_item_"):
+        item_id = query.data.split("confirm_item_")[1]
+        untrack_confirmation_message(context, item_id)
+
+        item = get_proposal_item(item_id)
+        if not item or item.status != ProposalItemStatus.ACTIVE:
+            await query.edit_message_text(text="❌ *This proposal is no longer valid or has already been processed.*", parse_mode="Markdown")
+            return
+
+        write_id = accept_proposal_item(item_id)
+        created_event = await asyncio.to_thread(confirm_write, write_id) if write_id else None
+        if created_event:
+            mark_proposal_item_accepted(item_id)
+            action_label = item.action_type.capitalize()
+            text = f"{query.message.text}\n\n✅ *{action_label} confirmed and executed.*"
+            if 'cached_events' not in context.user_data:
+                context.user_data['cached_events'] = []
+            if item.action_type == "cancel":
+                context.user_data['cached_events'] = [
+                    event
+                    for event in context.user_data['cached_events']
+                    if event.get("id") != item.target_event_id
+                ]
+            elif item.action_type == "reschedule":
+                existing = [
+                    event for event in context.user_data['cached_events']
+                    if event.get("id") != item.target_event_id
+                ]
+                existing.append(created_event)
+                context.user_data['cached_events'] = existing
+            else:
+                context.user_data['cached_events'].append(created_event)
+            context.user_data['cached_events'].sort(key=calendar_event_sort_key)
+        else:
+            text = f"{query.message.text}\n\n❌ *Failed to execute calendar action.*"
+
+        await query.edit_message_text(text=text, parse_mode="Markdown")
+        if created_event:
+            advanced_thread = await _advance_proposal_thread_after_item_resolution(
+                context=context,
+                chat_id=query.message.chat_id,
+                outcome_text="Confirmed",
+                item=item,
+            )
+            if not advanced_thread:
+                review_id = context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
+                if review_id:
+                    review_workflow = await apply_bridge_event_feedback(
+                        review_id,
+                        has_pending_weekly_state_feedback=has_pending_weekly_state_feedback(context),
+                    )
+                    if (
+                        review_workflow is not None
+                        and review_workflow.workflow_status == ReviewWorkflowStatus.COMPLETED
+                    ):
+                        context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
+        return
+
     write_id = query.data.split("confirm_")[1]
     untrack_confirmation_message(context, write_id)
-        
+
     record = get_pending_write(write_id)
     if not record or record.status != CalendarWriteStatus.PENDING:
         await query.edit_message_text(text="❌ *This request is no longer valid or has already been processed.*", parse_mode="Markdown")
@@ -433,20 +648,51 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"{query.message.text}\n\n❌ *Failed to execute calendar action.*"
         
     await query.edit_message_text(text=text, parse_mode="Markdown")
-    if created_event:
-        await advance_weekly_review_event_queue(
-            context=context,
-            chat_id=query.message.chat_id,
-            write_id=write_id,
-            outcome_text="Confirmed",
-        )
 
 @authorized_only
 async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles rejection of a proposed calendar write."""
+    """Handles rejection of a proposed calendar item or legacy calendar write."""
     query = update.callback_query
     await query.answer()
-    
+
+    if query.data.startswith("reject_item_"):
+        item_id = query.data.split("reject_item_")[1]
+        untrack_confirmation_message(context, item_id)
+
+        item = get_proposal_item(item_id)
+        if not item or item.status != ProposalItemStatus.ACTIVE:
+            await query.edit_message_text(text="❌ *This proposal is no longer valid or has already been processed.*", parse_mode="Markdown")
+            return
+
+        rejected_item = reject_proposal_item(item_id)
+        action_label = item.action_type.capitalize()
+        text = (
+            f"{query.message.text}\n\n🚫 *{action_label} rejected.*"
+            if rejected_item
+            else f"{query.message.text}\n\n❌ *Failed to reject calendar action.*"
+        )
+        await query.edit_message_text(text=text, parse_mode="Markdown")
+        if rejected_item:
+            advanced_thread = await _advance_proposal_thread_after_item_resolution(
+                context=context,
+                chat_id=query.message.chat_id,
+                outcome_text="Rejected",
+                item=item,
+            )
+            if not advanced_thread:
+                review_id = context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
+                if review_id:
+                    review_workflow = await apply_bridge_event_feedback(
+                        review_id,
+                        has_pending_weekly_state_feedback=has_pending_weekly_state_feedback(context),
+                    )
+                    if (
+                        review_workflow is not None
+                        and review_workflow.workflow_status == ReviewWorkflowStatus.COMPLETED
+                    ):
+                        context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
+        return
+
     write_id = query.data.split("reject_")[1]
     untrack_confirmation_message(context, write_id)
         
@@ -459,13 +705,6 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action_label = record.action_type.capitalize()
     text = f"{query.message.text}\n\n🚫 *{action_label} rejected.*" if success else f"{query.message.text}\n\n❌ *Failed to reject calendar action.*"
     await query.edit_message_text(text=text, parse_mode="Markdown")
-    if success:
-        await advance_weekly_review_event_queue(
-            context=context,
-            chat_id=query.message.chat_id,
-            write_id=write_id,
-            outcome_text="Rejected",
-        )
 
 @authorized_only
 async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -506,16 +745,27 @@ async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
                 parse_mode="Markdown"
             )
             
-            clear_weekly_review_event_queue(context)
             if review.proposed_events:
                 sorted_events = sorted(
                     review.proposed_events,
                     key=lambda event: parse_user_datetime(event.start_time),
                 )
-                context.user_data[WEEKLY_REVIEW_EVENT_QUEUE_KEY] = sorted_events
-                context.user_data[WEEKLY_REVIEW_TOTAL_EVENTS_KEY] = len(review.proposed_events)
-                context.user_data[WEEKLY_REVIEW_PROCESSED_EVENTS_KEY] = 0
-                await send_next_weekly_review_event(context, update.effective_chat.id)
+                await send_proposal_thread(
+                    context=context,
+                    chat_id=update.effective_chat.id,
+                    proposal_thread=ProposalThreadDraft(
+                        title="Weekly review calendar proposals",
+                        rationale="Calendar proposals generated from the Sunday review.",
+                        proposed_events=sorted_events,
+                    ),
+                    prefix_text=(
+                        "📅 *Weekly Review Proposal 1 of "
+                        f"{len(sorted_events)}*\n"
+                        "Please confirm, reject, or send feedback on this event before I move to the next one."
+                    ),
+                    source_type="weekly_review",
+                    source_id=review_workflow.id,
+                )
             else:
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
@@ -638,10 +888,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ *I am currently synthesizing our last session. Please give me a moment...*", parse_mode="Markdown")
         return
 
-    # Check if a text message was sent while a write is waiting for confirmation    
-    pending_writes = get_tracked_confirmation_messages(context)
-    if pending_writes:
-        for write_id, message_id in pending_writes:
+    # Check if a text message was sent while a proposal is waiting for confirmation.
+    pending_confirmations = get_tracked_confirmation_messages(context)
+    if pending_confirmations:
+        active_items = [
+            (item_id, message_id)
+            for item_id, message_id in pending_confirmations
+            if item_id.startswith("pi_")
+        ]
+        if active_items:
+            revised = await _revise_active_proposal_item(
+                context,
+                update.effective_chat.id,
+                active_items[0][0],
+                active_items[0][1],
+                update.message.text,
+            )
+            if not revised:
+                await update.message.reply_text("That proposal is no longer available for revision.")
+            return
+
+        for write_id, message_id in pending_confirmations:
             record = get_pending_write(write_id)
             if record and record.status == CalendarWriteStatus.PENDING:
                 logger.info(f"New message received. Auto-rejecting interrupted write {write_id}.")
@@ -661,8 +928,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         response = await process_message(text, context)
-        
-        if response.proposed_calendar_action:
+
+        if (
+            response.calendar_planning_mode == "propose"
+            and response.proposal_thread
+            and response.proposal_thread.proposed_events
+        ):
+            await send_proposal_thread(
+                context=context,
+                chat_id=update.effective_chat.id,
+                proposal_thread=response.proposal_thread,
+                prefix_text=response.message,
+            )
+        elif response.proposed_calendar_action:
             await send_calendar_proposal(
                 context=context,
                 chat_id=update.effective_chat.id,

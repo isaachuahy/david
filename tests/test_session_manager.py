@@ -82,11 +82,11 @@ async def test_invalidate_restart_volatile_user_data_clears_cached_events_only()
     application.user_data = {
         123: {
             "cached_events": [{"summary": "Stale cached event"}],
-            "pending_writes": [("cw_123", 999)],
+            "pending_confirmations": [("cw_123", 999)],
             "chat_history": [{"role": "user", "content": "Keep me"}],
         },
         456: {
-            "pending_writes": [("cw_456", 111)],
+            "pending_confirmations": [("cw_456", 111)],
         },
     }
     application.mark_data_for_update_persistence = MagicMock()
@@ -95,9 +95,9 @@ async def test_invalidate_restart_volatile_user_data_clears_cached_events_only()
     await invalidate_restart_volatile_user_data(application)
 
     assert "cached_events" not in application.user_data[123]
-    assert application.user_data[123]["pending_writes"] == [("cw_123", 999)]
+    assert application.user_data[123]["pending_confirmations"] == [("cw_123", 999)]
     assert application.user_data[123]["chat_history"] == [{"role": "user", "content": "Keep me"}]
-    assert application.user_data[456]["pending_writes"] == [("cw_456", 111)]
+    assert application.user_data[456]["pending_confirmations"] == [("cw_456", 111)]
     application.mark_data_for_update_persistence.assert_called_once_with(user_ids=[123])
     application.update_persistence.assert_awaited_once_with()
 
@@ -105,7 +105,7 @@ async def test_invalidate_restart_volatile_user_data_clears_cached_events_only()
 async def test_invalidate_restart_volatile_user_data_noops_when_nothing_to_clear():
     application = MagicMock()
     application.user_data = {
-        123: {"pending_writes": [("cw_123", 999)]},
+        123: {"pending_confirmations": [("cw_123", 999)]},
     }
     application.mark_data_for_update_persistence = MagicMock()
     application.update_persistence = AsyncMock()
@@ -233,11 +233,11 @@ async def test_execute_synthesis_task_notifies_on_failure_and_finalizes_state(
     mock_prompt_next_trigger.assert_awaited_once_with(context, 789)
 
 @pytest.mark.asyncio
-@patch('orchestrator.session_manager.cancel_pending_writes', new_callable=AsyncMock)
+@patch('orchestrator.session_manager.cancel_pending_confirmations', new_callable=AsyncMock)
 @patch('orchestrator.session_manager.get_db')
 async def test_end_session_schedules_synthesis_with_chat_history_snapshot(
     mock_get_db,
-    mock_cancel_pending_writes,
+    mock_cancel_pending_confirmations,
 ):
     context = MagicMock()
     context.user_data = {
@@ -254,7 +254,7 @@ async def test_end_session_schedules_synthesis_with_chat_history_snapshot(
         chat_id=456,
         text="Session closed. Synthesizing decisions in the background..."
     )
-    mock_cancel_pending_writes.assert_awaited_once_with(context, 456)
+    mock_cancel_pending_confirmations.assert_awaited_once_with(context, 456)
     context.job_queue.run_once.assert_called_once_with(
         execute_synthesis_task,
         0,
@@ -286,7 +286,7 @@ async def test_end_session_rejects_pending_writes_and_updates_ui(
         "current_session_id": "sess_pending",
         "session_state": SessionStatus.ACTIVE,
         "chat_history": [],
-        "pending_writes": [("cw_123", 999)],
+        "pending_confirmations": [("cw_123", 999)],
     }
     context.bot.send_message = AsyncMock()
     context.bot.edit_message_text = AsyncMock()
@@ -300,4 +300,4 @@ async def test_end_session_rejects_pending_writes_and_updates_ui(
         text="🚫 *Event cancelled because the session closed before confirmation.*",
         parse_mode="Markdown"
     )
-    assert context.user_data["pending_writes"] == []
+    assert context.user_data["pending_confirmations"] == []

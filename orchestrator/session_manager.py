@@ -16,6 +16,8 @@ from runtime_paths import get_context_dir
 SESSION_INACTIVITY_TIMEOUT = timedelta(minutes=30)
 SESSION_TIMEOUT_JOB_PREFIX = "session_inactivity_timeout"
 SESSION_READY_MESSAGE = "Session synthesis is done. I'm ready for your next message."
+PENDING_CONFIRMATIONS_KEY = "pending_confirmations"
+LEGACY_PENDING_WRITES_KEY = "pending_writes"
 
 # Keys in user_data that should be cleared on restart to avoid stale state issues. 
 # Cached calendar events are the main culprit since they can easily become out of sync with the real calendar state after a restart.
@@ -80,23 +82,33 @@ def append_chat_history(context: ContextTypes.DEFAULT_TYPE, role: str, content: 
 def track_confirmation_message(context: ContextTypes.DEFAULT_TYPE, write_id: str, message_id: int):
     """Appends the UI state of a pending calendar write to the list."""
     user_data = _user_data(context)
-    if 'pending_writes' not in user_data:
-        user_data['pending_writes'] = []
-    user_data['pending_writes'].append((write_id, message_id))
+    if PENDING_CONFIRMATIONS_KEY not in user_data:
+        user_data[PENDING_CONFIRMATIONS_KEY] = []
+    user_data[PENDING_CONFIRMATIONS_KEY].append((write_id, message_id))
 
 def get_tracked_confirmation_messages(context: ContextTypes.DEFAULT_TYPE) -> List[Tuple[str, int]]:
-    """Retrieves the list of pending calendar write UI states."""
-    return _user_data(context).get('pending_writes', [])
+    """Retrieves pending confirmation UI states for proposal items or legacy writes."""
+    user_data = _user_data(context)
+    confirmations = user_data.get(PENDING_CONFIRMATIONS_KEY)
+    if confirmations is not None:
+        return confirmations
+    return user_data.get(LEGACY_PENDING_WRITES_KEY, [])
 
 def untrack_confirmation_message(context: ContextTypes.DEFAULT_TYPE, write_id: str):
-    """Removes a specific pending write from the UI state tracking."""
+    """Removes a specific pending confirmation from UI state tracking."""
     user_data = _user_data(context)
-    writes = user_data.get('pending_writes', [])
-    user_data['pending_writes'] = [w for w in writes if w[0] != write_id]
+    confirmations = get_tracked_confirmation_messages(context)
+    user_data[PENDING_CONFIRMATIONS_KEY] = [
+        confirmation for confirmation in confirmations
+        if confirmation[0] != write_id
+    ]
+    user_data.pop(LEGACY_PENDING_WRITES_KEY, None)
 
 def clear_tracked_confirmation_messages(context: ContextTypes.DEFAULT_TYPE):
-    """Clears all pending calendar write UI states."""
-    _user_data(context)['pending_writes'] = []
+    """Clears all pending confirmation UI states."""
+    user_data = _user_data(context)
+    user_data[PENDING_CONFIRMATIONS_KEY] = []
+    user_data.pop(LEGACY_PENDING_WRITES_KEY, None)
 
 def get_session_timeout_job_name(user_id: int) -> str:
     """Builds a stable job name for a user's inactivity timeout."""
@@ -211,8 +223,8 @@ def persist_decision(session_id: str, content: str):
         )
         raise
 
-async def cancel_pending_writes(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Rejects any pending calendar confirmations when a session closes."""
+async def cancel_pending_confirmations(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Rejects any legacy pending write confirmations when a session closes."""
     for write_id, message_id in get_tracked_confirmation_messages(context):
         record = get_pending_write(write_id)
         if record and record.status == CalendarWriteStatus.PENDING:
@@ -230,7 +242,7 @@ async def cancel_pending_writes(context: ContextTypes.DEFAULT_TYPE, chat_id: int
                 capture_sentry_exception(
                     e,
                     component="session_manager",
-                    operation="cancel_pending_writes",
+                    operation="cancel_pending_confirmations",
                 )
     clear_tracked_confirmation_messages(context)
 
@@ -359,7 +371,7 @@ async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: 
             tags={"session_id": session_id} if session_id is not None else None,
         )
 
-    await cancel_pending_writes(context, chat_id)
+    await cancel_pending_confirmations(context, chat_id)
 
     # Schedule the synthesis task to run immediately without blocking the UI.
     # Passing user_id ensures PTB binds the same user_data into the job callback
