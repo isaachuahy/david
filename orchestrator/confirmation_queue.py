@@ -17,10 +17,11 @@ from persistence.models import (
 )
 from reasoning.schemas import ProposedEvent
 
-# This module manages the confirmation queue for proposed calendar writes.
-# When Gemini Flash identifies a message that requires calendar modification, it will create a pending write in the database.
-# The user can then confirm or reject these pending writes through the Telegram bot interface, which will call the confirm_write or reject_write functions.
-# Confirmation queue is necessary to ensure that David does not make any calendar changes without explicit user approval, adding a layer of safety and control.
+# This module manages revision-aware calendar proposal threads.
+# Model-generated proposals are stored as ProposalItemRecord drafts first, so
+# user feedback can revise the active item without creating a calendar write.
+# CalendarWriteRecord is created only after the user confirms a proposal item;
+# confirm_write/reject_write remain the execution layer for accepted writes.
 
 def add_pending_write(
     summary: str,

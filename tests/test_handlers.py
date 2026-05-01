@@ -117,12 +117,6 @@ async def test_handle_message_uses_proposal_thread_when_present(
         message="I drafted a moving-house schedule.",
         calendar_planning_mode="propose",
         proposal_thread=proposal_thread,
-        proposed_calendar_action=ProposedEvent(
-            summary="Deprecated fallback should not be used",
-            start_time="2026-03-31T12:00:00-04:00",
-            end_time="2026-03-31T13:00:00-04:00",
-            description="Compatibility fallback.",
-        ),
     )
 
     update = MagicMock()
@@ -145,51 +139,6 @@ async def test_handle_message_uses_proposal_thread_when_present(
         prefix_text="I drafted a moving-house schedule.",
     )
     mock_send_calendar_proposal.assert_not_awaited()
-    update.message.reply_text.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@patch('bot.handlers.send_calendar_proposal', new_callable=AsyncMock)
-@patch('bot.handlers.send_proposal_thread', new_callable=AsyncMock)
-@patch('bot.handlers.start_session')
-@patch('bot.handlers.process_message', new_callable=AsyncMock)
-async def test_handle_message_keeps_deprecated_single_action_fallback(
-    mock_process_message,
-    mock_start_session,
-    mock_send_proposal_thread,
-    mock_send_calendar_proposal,
-):
-    action = ProposedEvent(
-        summary="Coffee Chat",
-        start_time="2026-03-31T09:00:00-04:00",
-        end_time="2026-03-31T09:30:00-04:00",
-        description="Catch up with Alex.",
-    )
-    mock_process_message.return_value = FlashResponse(
-        message="Want me to schedule this?",
-        proposed_calendar_action=action,
-    )
-
-    update = MagicMock()
-    update.effective_chat.id = 456
-    update.effective_user.id = 123
-    update.message.text = "Schedule coffee with Alex"
-    update.message.reply_text = AsyncMock()
-
-    context = MagicMock()
-    context.user_data = {}
-    context.bot_data = {"allowed_user_id": 123}
-    context.job_queue.get_jobs_by_name.return_value = ()
-
-    await handle_message(update, context)
-
-    mock_send_proposal_thread.assert_not_awaited()
-    mock_send_calendar_proposal.assert_awaited_once_with(
-        context=context,
-        chat_id=456,
-        action=action,
-        prefix_text="Want me to schedule this?",
-    )
     update.message.reply_text.assert_not_awaited()
 
 

@@ -258,12 +258,12 @@ def _extract_revised_calendar_action(response: FlashResponse) -> ProposedEvent |
     """
     Extracts the concrete revised event from a Flash response, if present.
 
-    The proposal-thread field is the new contract. The deprecated single-action
-    field remains as a compatibility fallback while handlers finish migrating.
+    Proposal threads are the only calendar proposal contract; revision turns
+    use the first proposed event as the replacement for the active item.
     """
     if response.proposal_thread and response.proposal_thread.proposed_events:
         return response.proposal_thread.proposed_events[0]
-    return response.proposed_calendar_action
+    return None
 
 
 def _format_revision_request(item: ProposalItemRecord, feedback: str) -> str:
@@ -939,13 +939,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=update.effective_chat.id,
                 proposal_thread=response.proposal_thread,
                 prefix_text=response.message,
-            )
-        elif response.proposed_calendar_action:
-            await send_calendar_proposal(
-                context=context,
-                chat_id=update.effective_chat.id,
-                action=response.proposed_calendar_action,
-                prefix_text=response.message
             )
         else:
             await update.message.reply_text(response.message)

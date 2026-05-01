@@ -30,11 +30,12 @@ def main():
         response = generate_flash_response(user_message=test_message, context_block=dummy_context, chat_history=dummy_history)
         print("\n--- Response Received ---")
         print(f"Message: {response.message}")
-        print(f"Proposed Calendar Action: {response.proposed_calendar_action}")
+        print(f"Calendar Planning Mode: {response.calendar_planning_mode}")
+        print(f"Proposal Thread: {response.proposal_thread}")
         print("-------------------------")
         
-        if response.proposed_calendar_action:
-            print("\nSuccess! The model returned a structured calendar proposal.")
+        if response.proposal_thread and response.proposal_thread.proposed_events:
+            print("\nSuccess! The model returned a structured proposal thread.")
         else:
             print("\nWarning: The model did not return a structured calendar proposal for this scheduling request.")
             

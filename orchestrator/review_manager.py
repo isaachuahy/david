@@ -224,8 +224,8 @@ def _render_scheduling_pass_prompt(record: ReviewWorkflowRecord) -> str:
     Renders the scheduling-pass prompt from completed review checkpoints.
 
     This stage proposes calendar actions from the reviewed weekly plan. It does
-    not write to the proposal queue yet; that integration belongs to the
-    confirmation layer shared with normal conversation sessions.
+    not create proposal threads yet; that handoff belongs to the confirmation
+    layer shared with normal conversation sessions.
     """
     if record.week_review is None:
         raise ValueError("Cannot run scheduling_pass before week_review is checkpointed.")
@@ -704,8 +704,8 @@ async def run_scheduling_pass_stage(record: ReviewWorkflowRecord) -> ReviewWorkf
     Runs and checkpoints scheduling recommendations for the reviewed week.
 
     Proposed events stay in the structured response for this stage today. A
-    later pass should translate them into the shared calendar proposal queue so
-    Sunday review and normal chat sessions use the same confirmation path.
+    later pass should source Sunday-review proposal threads directly from this
+    checkpoint instead of the legacy one-shot bridge.
     """
     prompt = _render_scheduling_pass_prompt(record)
 
@@ -805,7 +805,7 @@ async def start_weekly_review_workflow(
         carry_forward = ["Weekly state proposal is awaiting confirmation."]
         if review.proposed_events:
             carry_forward.append(
-                f"{len(review.proposed_events)} calendar proposal(s) are queued for confirmation."
+                f"{len(review.proposed_events)} legacy calendar proposal candidate(s) will be handed off for confirmation."
             )
 
         review_workflow = await save_stage_checkpoint(
@@ -901,8 +901,8 @@ async def apply_bridge_event_feedback(
     """
     Applies the last-event feedback transition for the current Sunday review.
 
-    This helper assumes it is called after the final queued weekly-review
-    event proposal has been resolved. If weekly-state feedback is still open,
+    This helper assumes it is called after the final weekly-review proposal
+    item has been resolved. If weekly-state feedback is still open,
     the review remains in `AWAITING_FEEDBACK`; otherwise it is complete.
     """
     record = await load_review_workflow(review_id)
