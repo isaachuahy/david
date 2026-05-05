@@ -19,16 +19,21 @@ from orchestrator.session_manager import (
     timeout_inactive_session
 )
 from reasoning.flash_client import FlashResponse
-from reasoning.pro_client import SundayReviewResponse
 from reasoning.schemas import ProposalThreadDraft, ProposedEvent
 from persistence.models import (
+    ArtifactChangeSummary,
     CalendarWriteStatus,
     ProposalItemRecord,
     ProposalItemStatus,
     ProposalThreadRecord,
     ProposalThreadStatus,
+    ReviewStage,
     ReviewWorkflowRecord,
+    ReviewWorkflowStatus,
+    SchedulingPassArtifact,
     SourceSnapshot,
+    StageCheckpoint,
+    StageStatus,
 )
 
 @pytest.mark.asyncio
@@ -435,7 +440,7 @@ async def test_handle_start_trigger_daily(mock_consume_trigger):
 @patch('bot.handlers.send_proposal_thread', new_callable=AsyncMock)
 @patch('bot.handlers.start_weekly_review_workflow', new_callable=AsyncMock)
 @patch('bot.handlers.consume_trigger')
-async def test_handle_start_trigger_weekly_queues_one_event_at_a_time(
+async def test_handle_start_trigger_weekly_pauses_at_weekly_plan_confirmation(
     mock_consume_trigger,
     mock_start_weekly_review_workflow,
     mock_send_proposal_thread,
@@ -453,6 +458,70 @@ async def test_handle_start_trigger_weekly_queues_one_event_at_a_time(
     context.bot_data = {"allowed_user_id": 123}
     context.bot.send_message = AsyncMock()
 
+    review_workflow = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        weekly_plan=StageCheckpoint(summary="Strong week overall."),
+        weekly_state_changes=ArtifactChangeSummary(
+            modifications=["Updated priorities for next week."],
+            proposed_markdown="# Weekly State",
+        ),
+    )
+    mock_start_weekly_review_workflow.return_value = review_workflow
+    mock_send_proposal_thread.return_value = "pi_first"
+
+    await handle_start_trigger(update, context)
+
+    mock_consume_trigger.assert_called_once_with(context, "weekly_review")
+    mock_start_weekly_review_workflow.assert_awaited_once_with()
+    assert context.user_data["active_review_workflow_id"] == "review_test"
+    mock_send_proposal_thread.assert_not_awaited()
+    assert context.user_data["proposed_weekly_state"]["content"] == "# Weekly State"
+    sent_messages = context.bot.send_message.await_args_list
+    assert sent_messages[0].kwargs["text"] == (
+        "**Sunday Review Weekly Plan Ready**\n\nStrong week overall."
+    )
+    assert "Updated priorities for next week." in sent_messages[1].kwargs["text"]
+    assert "Do you want to apply these changes?" in sent_messages[1].kwargs["text"]
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers.send_proposal_thread', new_callable=AsyncMock)
+@patch('bot.handlers.advance_review_from_current_stage', new_callable=AsyncMock)
+@patch('bot.handlers.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
+@patch('bot.handlers.execute_weekly_state_update')
+async def test_handle_confirm_weekly_state_advances_and_sends_scheduling_proposals(
+    mock_execute,
+    mock_load_review_workflow,
+    mock_transition_review_stage,
+    mock_advance_review_from_current_stage,
+    mock_send_proposal_thread,
+):
+    update = MagicMock()
+    update.effective_chat.id = 456
+    update.effective_user.id = 123
+    update.callback_query = MagicMock()
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {
+        'active_review_workflow_id': 'review_test',
+        'proposed_weekly_state': {
+            'content': '# Updated Weekly State',
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'review_id': 'review_test',
+        }
+    }
+    context.bot_data = {"allowed_user_id": 123}
+    context.bot.send_message = AsyncMock()
     first_event = ProposedEvent(
         summary="Deep Work Block",
         start_time="2026-03-31T09:00:00-04:00",
@@ -465,7 +534,7 @@ async def test_handle_start_trigger_weekly_queues_one_event_at_a_time(
         end_time="2026-03-31T19:00:00-04:00",
         description="Strength training.",
     )
-    review_workflow = ReviewWorkflowRecord(
+    loaded_record = ReviewWorkflowRecord(
         id="review_test",
         created_at="2026-04-29T00:00:00+00:00",
         updated_at="2026-04-29T00:00:00+00:00",
@@ -475,33 +544,50 @@ async def test_handle_start_trigger_weekly_queues_one_event_at_a_time(
             decision_log_markdown="# Decision Log",
         ),
     )
-    review = SundayReviewResponse(
-        message="Strong week overall.",
-        state_change_summary="Updated priorities for next week.",
-        weekly_state_content="# Weekly State",
-        proposed_events=[second_event, first_event],
+    advanced_record = loaded_record.model_copy(
+        update={
+            "workflow_status": ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            "current_stage": ReviewStage.FINAL_REVIEW,
+            "stage_status": StageStatus.AWAITING_FEEDBACK,
+            "scheduling_proposals": SchedulingPassArtifact(
+                proposed_events=[
+                    second_event.model_dump(mode="json"),
+                    first_event.model_dump(mode="json"),
+                ],
+                scheduling_rationale="Protect deep work first, then schedule recovery.",
+            ),
+        }
     )
-    mock_start_weekly_review_workflow.return_value = (review_workflow, review)
-    mock_send_proposal_thread.return_value = "pi_first"
+    mock_execute.return_value = True
+    mock_load_review_workflow.return_value = loaded_record
+    mock_transition_review_stage.return_value = loaded_record
+    mock_advance_review_from_current_stage.return_value = advanced_record
 
-    await handle_start_trigger(update, context)
+    await handle_confirm_weekly_state(update, context)
 
-    mock_consume_trigger.assert_called_once_with(context, "weekly_review")
-    mock_start_weekly_review_workflow.assert_awaited_once_with(context)
-    assert context.user_data["active_review_workflow_id"] == "review_test"
+    update.callback_query.answer.assert_awaited_once()
+    mock_execute.assert_called_once_with('# Updated Weekly State')
+    mock_load_review_workflow.assert_awaited_once_with("review_test")
+    mock_transition_review_stage.assert_awaited_once_with(
+        loaded_record,
+        workflow_status=ReviewWorkflowStatus.ACTIVE,
+        stage=ReviewStage.WEEKLY_PLAN,
+        stage_status=StageStatus.COMPLETED,
+        last_completed_stage=ReviewStage.WEEKLY_PLAN,
+    )
+    mock_advance_review_from_current_stage.assert_awaited_once_with(loaded_record)
     mock_send_proposal_thread.assert_awaited_once()
     kwargs = mock_send_proposal_thread.await_args.kwargs
-    assert kwargs["context"] is context
-    assert kwargs["chat_id"] == 456
-    assert kwargs["source_type"] == "weekly_review"
-    assert kwargs["source_id"] == "review_test"
     assert [event.summary for event in kwargs["proposal_thread"].proposed_events] == [
         "Deep Work Block",
         "Workout",
     ]
-    assert kwargs["prefix_text"] == (
-        "📅 *Weekly Review Proposal 1 of 2*\n"
-        "Please confirm, reject, or send feedback on this event before I move to the next one."
+    assert kwargs["proposal_thread"].rationale == "Protect deep work first, then schedule recovery."
+    assert 'proposed_weekly_state' not in context.user_data
+    update.callback_query.edit_message_text.assert_awaited_once_with(
+        "✅ *Weekly State successfully updated and backed up.*\n\n"
+        "I’ll now prepare any calendar proposals from the accepted weekly plan.",
+        parse_mode="Markdown",
     )
 
 
@@ -609,7 +695,7 @@ async def test_handle_confirm_keeps_cached_events_in_chronological_order(
     ]
 
 @pytest.mark.asyncio
-@patch('bot.handlers.apply_bridge_event_feedback', new_callable=AsyncMock)
+@patch('bot.handlers.complete_review_after_event_feedback', new_callable=AsyncMock)
 @patch('bot.handlers.activate_next_proposal_item')
 @patch('bot.handlers.reject_proposal_item')
 @patch('bot.handlers.get_proposal_item')
@@ -619,7 +705,7 @@ async def test_handle_reject_completes_weekly_review_proposal_thread(
     mock_get_item,
     mock_reject_proposal_item,
     mock_activate_next_proposal_item,
-    mock_apply_bridge_event_feedback,
+    mock_complete_review_after_event_feedback,
 ):
     update = MagicMock()
     update.effective_user.id = 123
@@ -646,7 +732,7 @@ async def test_handle_reject_completes_weekly_review_proposal_thread(
     await handle_reject(update, context)
 
     mock_activate_next_proposal_item.assert_called_once_with("pt_123")
-    mock_apply_bridge_event_feedback.assert_awaited_once_with(
+    mock_complete_review_after_event_feedback.assert_awaited_once_with(
         "review_test",
         has_pending_weekly_state_feedback=False,
     )
@@ -670,8 +756,9 @@ async def test_handle_delay_trigger():
     )
 
 @pytest.mark.asyncio
+@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
 @patch('bot.handlers.execute_weekly_state_update')
-async def test_handle_confirm_weekly_state(mock_execute):
+async def test_handle_confirm_weekly_state_without_review_id(mock_execute, mock_load_review_workflow):
     update = MagicMock()
     update.effective_user.id = 123
     update.callback_query = MagicMock()
@@ -692,8 +779,10 @@ async def test_handle_confirm_weekly_state(mock_execute):
     update.callback_query.answer.assert_awaited_once()
     mock_execute.assert_called_once_with('# Updated Weekly State')
     assert 'proposed_weekly_state' not in context.user_data
+    mock_load_review_workflow.assert_not_awaited()
     update.callback_query.edit_message_text.assert_awaited_once_with(
-        "✅ *Weekly State successfully updated and backed up.*",
+        "✅ *Weekly State successfully updated and backed up.*\n\n"
+        "I’ll now prepare any calendar proposals from the accepted weekly plan.",
         parse_mode="Markdown"
     )
 
@@ -790,8 +879,12 @@ async def test_send_calendar_proposal_displays_toronto_time(
     mock_track_confirmation_message.assert_called_once_with(context, "pi_123", 999)
 
 @pytest.mark.asyncio
-@patch('bot.handlers.apply_bridge_weekly_state_feedback', new_callable=AsyncMock)
-async def test_handle_reject_weekly_state(mock_apply_bridge_weekly_state_feedback):
+@patch('bot.handlers.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
+async def test_handle_reject_weekly_state_marks_weekly_plan_in_revision(
+    mock_load_review_workflow,
+    mock_transition_review_stage,
+):
     update = MagicMock()
     update.effective_user.id = 123
     update.callback_query = MagicMock()
@@ -807,15 +900,27 @@ async def test_handle_reject_weekly_state(mock_apply_bridge_weekly_state_feedbac
         }
     }
     context.bot_data = {"allowed_user_id": 123}
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+    )
+    mock_load_review_workflow.return_value = record
     
     await handle_reject_weekly_state(update, context)
     
     update.callback_query.answer.assert_awaited_once()
     assert 'proposed_weekly_state' not in context.user_data
-    mock_apply_bridge_weekly_state_feedback.assert_awaited_once_with(
-        "review_test",
-        accepted=False,
-        has_pending_event_feedback=False,
+    mock_load_review_workflow.assert_awaited_once_with("review_test")
+    mock_transition_review_stage.assert_awaited_once_with(
+        record,
+        stage=ReviewStage.WEEKLY_PLAN,
+        stage_status=StageStatus.IN_REVISION,
     )
     update.callback_query.edit_message_text.assert_awaited_once_with(
         "🚫 *Weekly state update rejected. The Sunday review remains open for revision.*",

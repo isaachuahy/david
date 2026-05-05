@@ -3,11 +3,13 @@ from unittest.mock import patch
 import pytest
 
 from orchestrator.review_manager import (
+    advance_review_from_current_stage,
+    build_final_review_message,
+    build_weekly_state_change_summary,
     execute_weekly_state_update,
     run_goals_audit_stage,
     run_memory_audit_stage,
     run_scheduling_pass_stage,
-    run_sunday_review,
     run_week_review_stage,
     run_weekly_plan_stage,
     start_weekly_review_workflow,
@@ -21,10 +23,10 @@ from persistence.models import (
     StageCheckpoint,
     StageStatus,
 )
-from reasoning.pro_client import SundayReviewResponse
 from reasoning.schemas import (
     GoalsAuditResponse,
     MemoryAuditResponse,
+    ProposedEvent,
     SchedulingPassResponse,
     WeekReviewResponse,
     WeeklyPlanResponse,
@@ -69,26 +71,6 @@ def test_execute_weekly_state_update_persists_snapshot_and_writes_file(
     snapshot_row = mock_get_db.return_value["weekly_snapshots"].insert.call_args.args[0]
     assert snapshot_row["weekly_state_content"] == "# Updated Weekly State"
     assert snapshot_row["id"].startswith("wsnap_")
-
-
-@patch("orchestrator.review_manager.capture_sentry_exception")
-@patch("orchestrator.review_manager.generate_sunday_review", side_effect=RuntimeError("Sunday review failed"))
-@patch("orchestrator.review_manager.get_past_events", return_value=[])
-@patch("orchestrator.review_manager.build_context", return_value="<CONTEXT>")
-def test_run_sunday_review_reports_failures(
-    mock_build_context,
-    mock_get_past_events,
-    mock_generate_sunday_review,
-    mock_capture_exception,
-):
-    with pytest.raises(RuntimeError, match="Sunday review failed"):
-        run_sunday_review()
-
-    mock_capture_exception.assert_called_once_with(
-        mock_generate_sunday_review.side_effect,
-        component="review_manager",
-        operation="run_sunday_review",
-    )
 
 
 @pytest.mark.asyncio
@@ -391,12 +373,18 @@ async def test_run_scheduling_pass_stage_persists_scheduling_checkpoint(
             proposed_markdown=VALID_WEEKLY_STATE_MARKDOWN,
         ),
     )
+    proposed_event = ProposedEvent(
+        summary="Workflow Implementation Block",
+        start_time="2026-05-01T09:00:00-04:00",
+        end_time="2026-05-01T11:00:00-04:00",
+        description="Focused work on the staged Sunday review workflow.",
+    )
     mock_generate_review_structured.return_value = SchedulingPassResponse(
         summary="One focus block would support the reviewed weekly plan.",
         key_findings=["A morning block best matches the stated constraints."],
         constraints=["Avoid late-evening event proposals."],
         carry_forward=[],
-        proposed_events=[],
+        proposed_events=[proposed_event],
         scheduling_rationale="A single focused implementation block is enough for now.",
     )
 
@@ -411,6 +399,13 @@ async def test_run_scheduling_pass_stage_persists_scheduling_checkpoint(
     ]
     assert updated_record.scheduling_pass.constraints == [
         "Avoid late-evening event proposals.",
+    ]
+    assert updated_record.scheduling_proposals is not None
+    assert updated_record.scheduling_proposals.scheduling_rationale == (
+        "A single focused implementation block is enough for now."
+    )
+    assert updated_record.scheduling_proposals.proposed_events == [
+        proposed_event.model_dump(mode="json"),
     ]
     assert updated_record.last_completed_stage == ReviewStage.SCHEDULING_PASS
     mock_generate_review_structured.assert_called_once()
@@ -452,19 +447,17 @@ async def test_run_scheduling_pass_stage_requires_reviewed_weekly_plan():
 
 
 @pytest.mark.asyncio
-@patch("orchestrator.review_manager.run_sunday_review")
 @patch("orchestrator.review_manager._generate_review_structured")
 @patch("orchestrator.review_manager.build_review_source_snapshot")
 @patch("orchestrator.review_manager.save_review_workflow_sync")
-async def test_start_weekly_review_workflow_checkpoints_week_review_before_bridge(
+async def test_start_weekly_review_workflow_pauses_at_weekly_plan_feedback(
     mock_save_review_workflow_sync,
     mock_build_review_source_snapshot,
     mock_generate_review_structured,
-    mock_run_sunday_review,
 ):
     """
-    Tests the bridge workflow: week_review is checkpointed first, then the
-    legacy one-shot Sunday review produces the user-facing final-review state.
+    Tests that the initial workflow pauses at the weekly-plan confirmation gate
+    before downstream scheduling is allowed to run.
     """
     mock_build_review_source_snapshot.return_value = SourceSnapshot(
         goals_markdown="# Goals",
@@ -499,26 +492,9 @@ async def test_start_weekly_review_workflow_checkpoints_week_review_before_bridg
             state_change_summary="Updated weekly state around staged review work.",
             weekly_state_content=VALID_WEEKLY_STATE_MARKDOWN,
         ),
-        SchedulingPassResponse(
-            summary="One focus block would support the staged review work.",
-            key_findings=["A morning implementation block fits the constraints."],
-            constraints=["Do not overfill evenings."],
-            carry_forward=[],
-            proposed_events=[],
-            scheduling_rationale="A single focus block supports the weekly plan without overcommitting.",
-        ),
     ]
-    sunday_review = SundayReviewResponse(
-        message="Sunday review summary.",
-        state_change_summary="Weekly state was updated.",
-        weekly_state_content="# Weekly State\n\nUpdated.",
-        proposed_events=[],
-    )
-    mock_run_sunday_review.return_value = sunday_review
+    record = await start_weekly_review_workflow()
 
-    record, review = await start_weekly_review_workflow()
-
-    assert review == sunday_review
     assert record.week_review is not None
     assert record.week_review.summary == "The week had useful progress."
     assert record.goals_audit is not None
@@ -529,17 +505,107 @@ async def test_start_weekly_review_workflow_checkpoints_week_review_before_bridg
     assert record.weekly_plan.summary == "The next week should focus on review-workflow implementation."
     assert record.weekly_state_changes is not None
     assert record.weekly_state_changes.proposed_markdown == VALID_WEEKLY_STATE_MARKDOWN
-    assert record.scheduling_pass is not None
-    assert record.scheduling_pass.summary == "One focus block would support the staged review work."
-    assert record.final_review is not None
-    assert record.final_review.summary == "Sunday review summary."
-    assert record.final_review.key_findings == ["Weekly state was updated."]
+    assert record.scheduling_pass is None
+    assert record.scheduling_proposals is None
+    assert record.final_review is None
+    assert build_weekly_state_change_summary(record) == (
+        "Modifications:\n- Updated weekly state around staged review work."
+    )
     assert record.workflow_status == ReviewWorkflowStatus.AWAITING_FEEDBACK
-    assert record.current_stage == ReviewStage.FINAL_REVIEW
+    assert record.current_stage == ReviewStage.WEEKLY_PLAN
     assert record.stage_status == StageStatus.AWAITING_FEEDBACK
-    assert record.last_completed_stage == ReviewStage.FINAL_REVIEW
-    assert mock_generate_review_structured.call_count == 5
-    assert mock_save_review_workflow_sync.call_count >= 14
+    assert record.last_completed_stage == ReviewStage.WEEKLY_PLAN
+    assert mock_generate_review_structured.call_count == 4
+    assert mock_save_review_workflow_sync.call_count >= 10
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
+async def test_advance_review_from_completed_weekly_plan_runs_downstream_stages(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """
+    Tests that accepted weekly-plan feedback is the gate before scheduling and
+    final-review assembly can run.
+    """
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.ACTIVE,
+        current_stage=ReviewStage.WEEKLY_PLAN,
+        stage_status=StageStatus.COMPLETED,
+        last_completed_stage=ReviewStage.WEEKLY_PLAN,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+            decision_log_markdown="# Decision Log",
+            past_week_events=["[2026-04-27T09:00:00-04:00] Deep Work"],
+        ),
+        week_review=StageCheckpoint(
+            summary="The week had useful progress.",
+            key_findings=["Context routing advanced."],
+        ),
+        goals_audit=StageCheckpoint(
+            summary="The durable goals still look accurate.",
+            key_findings=["MVP goal remains active."],
+        ),
+        memory_audit=StageCheckpoint(
+            summary="Rolling memory remains useful.",
+            key_findings=["Keep the current durable preference signal."],
+        ),
+        weekly_plan=StageCheckpoint(
+            summary="The next week should focus on review-workflow implementation.",
+            key_findings=["Staged review work is the highest-leverage priority."],
+            constraints=["Do not overfill evenings."],
+        ),
+        weekly_state_changes=ArtifactChangeSummary(
+            modifications=["Updated weekly state around staged review work."],
+            proposed_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+        ),
+    )
+    mock_generate_review_structured.return_value = SchedulingPassResponse(
+        summary="One focus block would support the staged review work.",
+        key_findings=["A morning implementation block fits the constraints."],
+        constraints=["Do not overfill evenings."],
+        carry_forward=[],
+        proposed_events=[
+            ProposedEvent(
+                summary="Review Workflow Focus Block",
+                start_time="2026-05-01T09:00:00-04:00",
+                end_time="2026-05-01T11:00:00-04:00",
+                description="Implement the staged Sunday review workflow.",
+            ),
+        ],
+        scheduling_rationale="A single focus block supports the weekly plan without overcommitting.",
+    )
+
+    updated_record = await advance_review_from_current_stage(record)
+
+    assert updated_record.scheduling_pass is not None
+    assert updated_record.scheduling_pass.summary == "One focus block would support the staged review work."
+    assert updated_record.scheduling_proposals is not None
+    assert len(updated_record.scheduling_proposals.proposed_events) == 1
+    assert updated_record.final_review is not None
+    assert updated_record.final_review.summary == build_final_review_message(updated_record)
+    assert "*Scheduling Pass:* One focus block would support the staged review work." in updated_record.final_review.summary
+    assert updated_record.final_review.key_findings == [
+        "Context routing advanced.",
+        "MVP goal remains active.",
+        "Keep the current durable preference signal.",
+        "Staged review work is the highest-leverage priority.",
+        "A morning implementation block fits the constraints.",
+    ]
+    assert updated_record.final_review.carry_forward == [
+        "Weekly state proposal is awaiting confirmation.",
+        "1 scheduling-pass calendar proposal candidate(s) will be handed off for confirmation.",
+    ]
+    assert updated_record.workflow_status == ReviewWorkflowStatus.AWAITING_FEEDBACK
+    assert updated_record.current_stage == ReviewStage.FINAL_REVIEW
+    assert updated_record.stage_status == StageStatus.AWAITING_FEEDBACK
+    assert updated_record.last_completed_stage == ReviewStage.FINAL_REVIEW
 
 
 @patch("orchestrator.review_manager.capture_sentry_exception")

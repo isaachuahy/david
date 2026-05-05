@@ -2,14 +2,12 @@ import asyncio
 import uuid
 from datetime import datetime, timezone
 from string import Template
-from typing import Optional, Type, TypeVar
+from typing import Iterable, Optional, Type, TypeVar
 from google import genai
 from loguru import logger
 from pydantic import BaseModel
-from telegram.ext import ContextTypes
 
 from observability.sentry import capture_exception as capture_sentry_exception
-from orchestrator.context_builder import build_context
 from integrations.calendar import get_past_events
 from persistence.database import get_db
 from persistence.models import (
@@ -17,6 +15,7 @@ from persistence.models import (
     ReviewStage,
     ReviewWorkflowRecord,
     ReviewWorkflowStatus,
+    SchedulingPassArtifact,
     SourceSnapshot,
     StageCheckpoint,
     StageStatus,
@@ -27,7 +26,6 @@ from persistence.review_workflows import (
     save_review_workflow_sync,
 )
 from reasoning.parser import parse_model_response
-from reasoning.pro_client import generate_sunday_review, SundayReviewResponse
 from reasoning.schemas import (
     GoalsAuditResponse,
     MemoryAuditResponse,
@@ -604,9 +602,8 @@ async def run_week_review_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowR
     """
     Runs and checkpoints the week-review stage from the frozen source snapshot.
 
-    This is the first real staged review step. It persists a compact
-    StageCheckpoint before the current bridge continues into the older one-shot
-    Sunday review flow.
+    This is the first staged review step. It persists a compact checkpoint that
+    downstream stages use without rereading a drifting weekly context.
     """
     prompt = _render_week_review_prompt(record.source_snapshot)
 
@@ -703,18 +700,155 @@ async def run_scheduling_pass_stage(record: ReviewWorkflowRecord) -> ReviewWorkf
     """
     Runs and checkpoints scheduling recommendations for the reviewed week.
 
-    Proposed events stay in the structured response for this stage today. A
-    later pass should source Sunday-review proposal threads directly from this
-    checkpoint instead of the legacy one-shot bridge.
+    This stage stores the compact checkpoint plus the concrete proposal artifact
+    that handlers later validate into proposal threads for user confirmation.
     """
     prompt = _render_scheduling_pass_prompt(record)
+    model = _select_review_model(ReviewStage.SCHEDULING_PASS, context_chars=len(prompt))
 
-    return await _run_checkpoint_stage(
-        record=record,
-        stage=ReviewStage.SCHEDULING_PASS,
-        prompt=prompt,
-        response_schema=SchedulingPassResponse,
-        operation="scheduling_pass",
+    try:
+        response = await asyncio.to_thread(
+            _generate_review_structured,
+            prompt=prompt,
+            response_schema=SchedulingPassResponse,
+            model=model,
+            operation="scheduling_pass",
+        )
+    except Exception:
+        if model == GEMINI_PRO_MODEL:
+            raise
+
+        logger.warning("Retrying scheduling_pass with {} after {} failed.", GEMINI_PRO_MODEL, model)
+        response = await asyncio.to_thread(
+            _generate_review_structured,
+            prompt=prompt,
+            response_schema=SchedulingPassResponse,
+            model=GEMINI_PRO_MODEL,
+            operation="scheduling_pass_retry",
+        )
+
+    record.scheduling_pass = _response_to_stage_checkpoint(response)
+    record.scheduling_proposals = SchedulingPassArtifact(
+        proposed_events=[
+            event.model_dump(mode="json") for event in response.proposed_events
+        ],
+        scheduling_rationale=response.scheduling_rationale,
+    )
+    record.last_completed_stage = ReviewStage.SCHEDULING_PASS
+    return await save_review_workflow(record)
+
+
+def _merge_unique(items: Iterable[str]) -> list[str]:
+    """
+    Preserves first-seen order while removing repeated review-stage bullets.
+
+    Final review assembly combines several checkpoints, so de-duplicating here
+    keeps the user-facing result compact without hiding any new information.
+    """
+    seen: set[str] = set()
+    merged: list[str] = []
+    for item in items:
+        normalized = item.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        merged.append(normalized)
+    return merged
+
+
+def _completed_review_checkpoints(record: ReviewWorkflowRecord) -> list[tuple[str, StageCheckpoint]]:
+    """Returns completed staged checkpoints in the order they should be shown."""
+    checkpoints = [
+        ("Week Review", record.week_review),
+        ("Goals Audit", record.goals_audit),
+        ("Memory Audit", record.memory_audit),
+        ("Weekly Plan", record.weekly_plan),
+        ("Scheduling Pass", record.scheduling_pass),
+    ]
+    return [
+        (label, checkpoint)
+        for label, checkpoint in checkpoints
+        if checkpoint is not None
+    ]
+
+
+def build_weekly_state_change_summary(record: ReviewWorkflowRecord) -> str:
+    """
+    Builds a concise user-facing summary for the proposed weekly-state update.
+
+    The weekly-plan stage owns the proposed markdown. This helper only formats
+    the compact semantic diff already persisted on the workflow record.
+    """
+    changes = record.weekly_state_changes
+    if changes is None:
+        return "No weekly-state changes were proposed."
+
+    lines: list[str] = []
+    for label, values in (
+        ("Additions", changes.additions),
+        ("Deletions", changes.deletions),
+        ("Modifications", changes.modifications),
+    ):
+        if values:
+            lines.append(f"{label}:")
+            lines.extend(f"- {value}" for value in values)
+
+    if lines:
+        return "\n".join(lines)
+    if record.weekly_plan and record.weekly_plan.summary:
+        return record.weekly_plan.summary
+    return "Weekly-state markdown was updated from the staged Sunday review."
+
+
+def build_final_review_message(record: ReviewWorkflowRecord) -> str:
+    """
+    Assembles the Sunday review summary from completed staged checkpoints.
+
+    No model is called here. The final review is a deterministic handoff summary
+    that tells the user what the staged review already concluded.
+    """
+    sections = [
+        f"*{label}:* {checkpoint.summary}"
+        for label, checkpoint in _completed_review_checkpoints(record)
+        if checkpoint.summary
+    ]
+    if not sections:
+        return "The staged Sunday review completed, but no checkpoint summaries were available."
+    return "\n\n".join(sections)
+
+
+def build_final_review_checkpoint(record: ReviewWorkflowRecord) -> StageCheckpoint:
+    """
+    Creates the final-review checkpoint by assembling prior stage outputs.
+
+    This marks that staged outputs are ready for user confirmation surfaces:
+    weekly-state markdown confirmation and calendar proposal-thread review.
+    """
+    checkpoints = [checkpoint for _, checkpoint in _completed_review_checkpoints(record)]
+    carry_forward = ["Weekly state proposal is awaiting confirmation."]
+    scheduling_proposal_count = (
+        len(record.scheduling_proposals.proposed_events)
+        if record.scheduling_proposals
+        else 0
+    )
+    if scheduling_proposal_count:
+        carry_forward.append(
+            f"{scheduling_proposal_count} scheduling-pass calendar proposal candidate(s) will be handed off for confirmation."
+        )
+
+    return StageCheckpoint(
+        summary=build_final_review_message(record),
+        key_findings=_merge_unique(
+            finding
+            for checkpoint in checkpoints
+            for finding in checkpoint.key_findings
+        ),
+        constraints=_merge_unique(
+            constraint
+            for checkpoint in checkpoints
+            for constraint in checkpoint.constraints
+        ),
+        carry_forward=carry_forward,
     )
 
 
@@ -746,16 +880,13 @@ async def reconcile_review_workflows() -> list[ReviewWorkflowRecord]:
         raise
 
 
-async def start_weekly_review_workflow(
-    tg_context: ContextTypes.DEFAULT_TYPE | None = None,
-) -> tuple[ReviewWorkflowRecord, SundayReviewResponse]:
+async def start_weekly_review_workflow() -> ReviewWorkflowRecord:
     """
     Starts the current Sunday review flow behind one orchestration boundary.
 
-    This is the bridge away from handler-owned workflow logic: the Telegram
-    layer should only ask to start the review, while this function handles
-    durable workflow creation, state transitions, checkpointing, and the
-    temporary one-shot review call that still powers the analysis today.
+    The Telegram layer only asks to start the review. This function handles
+    durable workflow creation, staged reasoning, state transitions, and the
+    first user-facing gate at the proposed weekly plan.
     """
     review_workflow: ReviewWorkflowRecord | None = None
 
@@ -787,44 +918,12 @@ async def start_weekly_review_workflow(
         review_workflow = await run_weekly_plan_stage(review_workflow)
         review_workflow = await transition_review_stage(
             review_workflow,
-            stage=ReviewStage.SCHEDULING_PASS,
-            stage_status=StageStatus.RUNNING,
-        )
-        review_workflow = await run_scheduling_pass_stage(review_workflow)
-
-        # Bridge: the downstream review still uses the legacy one-shot call
-        # for user-facing confirmation and scheduling until those handlers
-        # consume staged artifacts directly.
-        review_workflow = await transition_review_stage(
-            review_workflow,
-            stage=ReviewStage.FINAL_REVIEW,
-            stage_status=StageStatus.RUNNING,
-        )
-        review = await asyncio.to_thread(run_sunday_review, tg_context)
-
-        carry_forward = ["Weekly state proposal is awaiting confirmation."]
-        if review.proposed_events:
-            carry_forward.append(
-                f"{len(review.proposed_events)} legacy calendar proposal candidate(s) will be handed off for confirmation."
-            )
-
-        review_workflow = await save_stage_checkpoint(
-            review_workflow,
-            ReviewStage.FINAL_REVIEW,
-            StageCheckpoint(
-                summary=review.message,
-                key_findings=[review.state_change_summary] if review.state_change_summary else [],
-                carry_forward=carry_forward,
-            ),
-        )
-        review_workflow = await transition_review_stage(
-            review_workflow,
             workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
-            stage=ReviewStage.FINAL_REVIEW,
+            stage=ReviewStage.WEEKLY_PLAN,
             stage_status=StageStatus.AWAITING_FEEDBACK,
         )
 
-        return review_workflow, review
+        return review_workflow
     except Exception as error:
         if review_workflow is not None:
             try:
@@ -851,55 +950,56 @@ async def start_weekly_review_workflow(
         raise
 
 
-async def apply_bridge_weekly_state_feedback(
-    review_id: str,
-    *,
-    accepted: bool,
-    proposal_expired: bool = False,
-    has_pending_event_feedback: bool = False,
-) -> Optional[ReviewWorkflowRecord]:
+async def advance_review_from_current_stage(
+    record: ReviewWorkflowRecord,
+) -> ReviewWorkflowRecord:
     """
-    Applies the current bridge-era weekly-state feedback to the review workflow.
+    Advances the Sunday review from the current completed user-gated stage.
 
-    Weekly-state confirmation is only one feedback surface inside the Sunday
-    review. The workflow should remain open if the user rejected the state,
-    the proposal expired, or weekly-review event confirmations are still
-    outstanding.
+    The only supported advancement today is from an accepted weekly plan into
+    scheduling and final review assembly. Unsupported states raise instead of
+    silently no-oping so workflow wiring mistakes surface quickly.
     """
-    record = await load_review_workflow(review_id)
-    if record is None:
-        return None
-
-    if proposal_expired or not accepted:
-        return await transition_review_stage(
-            record,
-            stage=ReviewStage.FINAL_REVIEW,
-            stage_status=StageStatus.IN_REVISION,
+    if not (
+        record.current_stage == ReviewStage.WEEKLY_PLAN
+        and record.stage_status == StageStatus.COMPLETED
+    ):
+        raise ValueError(
+            "Cannot advance Sunday review from "
+            f"{record.current_stage.value}/{record.stage_status.value}."
         )
 
-    if has_pending_event_feedback:
-        return await transition_review_stage(
-            record,
-            stage=ReviewStage.FINAL_REVIEW,
-            stage_status=StageStatus.AWAITING_FEEDBACK,
-        )
-
+    record = await transition_review_stage(
+        record,
+        stage=ReviewStage.SCHEDULING_PASS,
+        stage_status=StageStatus.RUNNING,
+    )
+    record = await run_scheduling_pass_stage(record)
+    record = await transition_review_stage(
+        record,
+        stage=ReviewStage.FINAL_REVIEW,
+        stage_status=StageStatus.RUNNING,
+    )
+    record = await save_stage_checkpoint(
+        record,
+        ReviewStage.FINAL_REVIEW,
+        build_final_review_checkpoint(record),
+    )
     return await transition_review_stage(
         record,
-        workflow_status=ReviewWorkflowStatus.COMPLETED,
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
         stage=ReviewStage.FINAL_REVIEW,
-        stage_status=StageStatus.COMPLETED,
-        last_completed_stage=ReviewStage.FINAL_REVIEW,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
     )
 
 
-async def apply_bridge_event_feedback(
+async def complete_review_after_event_feedback(
     review_id: str,
     *,
     has_pending_weekly_state_feedback: bool,
 ) -> Optional[ReviewWorkflowRecord]:
     """
-    Applies the last-event feedback transition for the current Sunday review.
+    Completes or pauses the review after calendar proposal feedback finishes.
 
     This helper assumes it is called after the final weekly-review proposal
     item has been resolved. If weekly-state feedback is still open,
@@ -924,30 +1024,6 @@ async def apply_bridge_event_feedback(
         last_completed_stage=ReviewStage.FINAL_REVIEW,
     )
 
-
-def run_sunday_review(tg_context: ContextTypes.DEFAULT_TYPE = None) -> SundayReviewResponse:
-    """
-    Generates the Sunday Review analysis by fetching context and past events,
-    then calling the reasoning layer. Returns a structured response object.
-    This is a pure business logic function with no side effects.
-    """
-    try:
-        context_block = build_context(tg_context)
-
-        # Fetch and format past events
-        past_events_raw = get_past_events(days=7)
-        if not past_events_raw:
-            past_events_block = "No events found in the past week."
-        else:
-            lines = _format_past_event_lines(past_events_raw)
-            past_events_block = "\n".join(f"- {line}" for line in lines)
-
-        review = generate_sunday_review(context_block, past_events_block)
-        return review
-    except Exception as error:
-        logger.error(f"Failed to run Sunday review: {error}")
-        capture_sentry_exception(error, component="review_manager", operation="run_sunday_review")
-        raise
 
 def execute_weekly_state_update(content: str) -> bool:
     """

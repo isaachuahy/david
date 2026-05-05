@@ -204,6 +204,19 @@ class ArtifactChangeSummary(BaseModel):
     proposed_markdown: Optional[str] = None
 
 
+class SchedulingPassArtifact(BaseModel):
+    """
+    Calendar proposal artifact produced by the Sunday review scheduling pass.
+
+    Events are stored as plain JSON dictionaries so persistence stays decoupled
+    from reasoning-layer schemas. The handler validates them back into
+    ProposedEvent objects before creating proposal threads.
+    """
+
+    proposed_events: list[dict[str, object]] = Field(default_factory=list)
+    scheduling_rationale: str = ""
+
+
 class ReviewWorkflowRecord(BaseModel):
     """
     Durable state for the staged Sunday review workflow.
@@ -231,4 +244,5 @@ class ReviewWorkflowRecord(BaseModel):
     goals_changes: Optional[ArtifactChangeSummary] = None
     weekly_state_changes: Optional[ArtifactChangeSummary] = None
     decision_log_changes: Optional[ArtifactChangeSummary] = None
+    scheduling_proposals: Optional[SchedulingPassArtifact] = None
     feedback_history: list[str] = Field(default_factory=list)

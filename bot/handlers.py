@@ -28,18 +28,23 @@ from orchestrator.session_manager import (
     untrack_confirmation_message, clear_tracked_confirmation_messages
 )
 from orchestrator.review_manager import (
-    apply_bridge_event_feedback,
-    apply_bridge_weekly_state_feedback,
+    advance_review_from_current_stage,
+    build_weekly_state_change_summary,
+    complete_review_after_event_feedback,
     execute_weekly_state_update,
+    load_review_workflow,
     start_weekly_review_workflow,
+    transition_review_stage,
 )
 from orchestrator.time_utils import USER_TIMEZONE, calendar_event_sort_key, parse_iso, parse_user_datetime, format_user_datetime
 from persistence.models import (
     CalendarWriteStatus,
     ProposalItemRecord,
     ProposalItemStatus,
+    ReviewStage,
     ReviewWorkflowStatus,
     SessionStatus,
+    StageStatus,
 )
 from reasoning.flash_client import FlashResponse
 from reasoning.schemas import ProposalThreadDraft, ProposedEvent
@@ -466,6 +471,52 @@ async def send_proposal_thread(
     )
 
 
+async def send_weekly_review_scheduling_proposals(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    review_workflow,
+) -> bool:
+    """
+    Presents scheduling-pass proposals after the weekly plan has been accepted.
+
+    Scheduling proposals are stage artifacts until this point. Once the weekly
+    plan is confirmed, they become a normal proposal thread with item-by-item
+    confirmation and revision behavior.
+    """
+    scheduling_proposals = review_workflow.scheduling_proposals
+    if not scheduling_proposals or not scheduling_proposals.proposed_events:
+        return False
+
+    proposed_events = [
+        ProposedEvent.model_validate(event)
+        for event in scheduling_proposals.proposed_events
+    ]
+    sorted_events = sorted(
+        proposed_events,
+        key=lambda event: parse_user_datetime(event.start_time),
+    )
+    await send_proposal_thread(
+        context=context,
+        chat_id=chat_id,
+        proposal_thread=ProposalThreadDraft(
+            title="Weekly review calendar proposals",
+            rationale=(
+                scheduling_proposals.scheduling_rationale
+                or "Calendar proposals generated from the Sunday review."
+            ),
+            proposed_events=sorted_events,
+        ),
+        prefix_text=(
+            "📅 *Weekly Review Proposal 1 of "
+            f"{len(sorted_events)}*\n"
+            "Please confirm, reject, or send feedback on this event before I move to the next one."
+        ),
+        source_type="weekly_review",
+        source_id=review_workflow.id,
+    )
+    return True
+
+
 def _match_existing_event(cached_events: list[dict], action: ProposedEvent):
     """Attempts to match a cancel/reschedule action to one specific upcoming event."""
     target_summary = (action.target_event_summary or action.summary or "").strip().lower()
@@ -594,7 +645,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not advanced_thread:
                 review_id = context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
                 if review_id:
-                    review_workflow = await apply_bridge_event_feedback(
+                    review_workflow = await complete_review_after_event_feedback(
                         review_id,
                         has_pending_weekly_state_feedback=has_pending_weekly_state_feedback(context),
                     )
@@ -682,7 +733,7 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not advanced_thread:
                 review_id = context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
                 if review_id:
-                    review_workflow = await apply_bridge_event_feedback(
+                    review_workflow = await complete_review_after_event_feedback(
                         review_id,
                         has_pending_weekly_state_feedback=has_pending_weekly_state_feedback(context),
                     )
@@ -719,58 +770,42 @@ async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
     elif trigger_type == "weekly_review":
         await query.edit_message_text("📅 *Starting Sunday Review. Analysing your week...*", parse_mode="Markdown")
         try:
-            review_workflow, review = await start_weekly_review_workflow(context)
+            review_workflow = await start_weekly_review_workflow()
             context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = review_workflow.id
             # Only consume the trigger after the review workflow is durable and has
             # actually started. This keeps the trigger retryable if startup fails.
             consume_trigger(context, trigger_type)
+            if review_workflow.weekly_plan is None:
+                raise ValueError("Sunday review completed without a weekly-plan checkpoint.")
+            if (
+                review_workflow.weekly_state_changes is None
+                or not review_workflow.weekly_state_changes.proposed_markdown
+            ):
+                raise ValueError("Sunday review completed without proposed weekly-state markdown.")
             
-            # Send the synthesis message
+            # Send the user-facing checkpoint before asking for confirmation.
             await context.bot.send_message(
                 chat_id=update.effective_chat.id, 
-                text=f"**Sunday Review Complete**\n\n{review.message}", 
+                text=f"**Sunday Review Weekly Plan Ready**\n\n{review_workflow.weekly_plan.summary}",
                 parse_mode="Markdown"
             )
             
             # Ask for confirmation before overwriting the weekly state
             context.user_data['proposed_weekly_state'] = {
-                "content": review.weekly_state_content,
+                "content": review_workflow.weekly_state_changes.proposed_markdown,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "review_id": review_workflow.id,
             }
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text=f"📝 *Proposed Weekly State Changes:*\n{review.state_change_summary}\n\nDo you want to apply these changes?",
+                text=(
+                    "📝 *Proposed Weekly State Changes:*\n"
+                    f"{build_weekly_state_change_summary(review_workflow)}\n\n"
+                    "Do you want to apply these changes?"
+                ),
                 reply_markup=build_weekly_state_keyboard(),
                 parse_mode="Markdown"
             )
-            
-            if review.proposed_events:
-                sorted_events = sorted(
-                    review.proposed_events,
-                    key=lambda event: parse_user_datetime(event.start_time),
-                )
-                await send_proposal_thread(
-                    context=context,
-                    chat_id=update.effective_chat.id,
-                    proposal_thread=ProposalThreadDraft(
-                        title="Weekly review calendar proposals",
-                        rationale="Calendar proposals generated from the Sunday review.",
-                        proposed_events=sorted_events,
-                    ),
-                    prefix_text=(
-                        "📅 *Weekly Review Proposal 1 of "
-                        f"{len(sorted_events)}*\n"
-                        "Please confirm, reject, or send feedback on this event before I move to the next one."
-                    ),
-                    source_type="weekly_review",
-                    source_id=review_workflow.id,
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="No calendar events were proposed in this weekly review.",
-                )
         except Exception as e:
             logger.error(f"Error during Sunday Review: {e}")
             capture_sentry_exception(
@@ -810,12 +845,13 @@ async def handle_confirm_weekly_state(update: Update, context: ContextTypes.DEFA
     if datetime.now(timezone.utc) - proposal_time > timedelta(hours=2):
         del context.user_data['proposed_weekly_state']
         if review_id:
-            await apply_bridge_weekly_state_feedback(
-                review_id,
-                accepted=False,
-                proposal_expired=True,
-                has_pending_event_feedback=has_pending_weekly_review_event_feedback(context),
-            )
+            record = await load_review_workflow(review_id)
+            if record is not None:
+                await transition_review_stage(
+                    record,
+                    stage=ReviewStage.WEEKLY_PLAN,
+                    stage_status=StageStatus.IN_REVISION,
+                )
         await query.edit_message_text("❌ *This weekly state proposal has expired (older than 2 hours).*", parse_mode="Markdown")
         return
 
@@ -824,18 +860,42 @@ async def handle_confirm_weekly_state(update: Update, context: ContextTypes.DEFA
     del context.user_data['proposed_weekly_state']
     
     if success:
+        await query.edit_message_text(
+            "✅ *Weekly State successfully updated and backed up.*\n\n"
+            "I’ll now prepare any calendar proposals from the accepted weekly plan.",
+            parse_mode="Markdown",
+        )
         if review_id:
-            review_workflow = await apply_bridge_weekly_state_feedback(
-                review_id,
-                accepted=True,
-                has_pending_event_feedback=has_pending_weekly_review_event_feedback(context),
+            review_workflow = await load_review_workflow(review_id)
+            if review_workflow is None:
+                logger.warning("Weekly state accepted, but review workflow {} could not be loaded.", review_id)
+                return
+
+            review_workflow = await transition_review_stage(
+                review_workflow,
+                workflow_status=ReviewWorkflowStatus.ACTIVE,
+                stage=ReviewStage.WEEKLY_PLAN,
+                stage_status=StageStatus.COMPLETED,
+                last_completed_stage=ReviewStage.WEEKLY_PLAN,
             )
-            if (
-                review_workflow is not None
-                and review_workflow.workflow_status == ReviewWorkflowStatus.COMPLETED
-            ):
+            review_workflow = await advance_review_from_current_stage(review_workflow)
+            proposals_sent = await send_weekly_review_scheduling_proposals(
+                context,
+                update.effective_chat.id,
+                review_workflow,
+            )
+            if not proposals_sent:
+                review_workflow = await complete_review_after_event_feedback(
+                    review_workflow.id,
+                    has_pending_weekly_state_feedback=False,
+                )
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="No calendar events were proposed from this accepted weekly plan.",
+                )
+
+            if review_workflow and review_workflow.workflow_status == ReviewWorkflowStatus.COMPLETED:
                 context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
-        await query.edit_message_text("✅ *Weekly State successfully updated and backed up.*", parse_mode="Markdown")
     else:
         await query.edit_message_text("❌ *Failed to update weekly state. Please check the logs.*", parse_mode="Markdown")
 
@@ -856,11 +916,13 @@ async def handle_reject_weekly_state(update: Update, context: ContextTypes.DEFAU
         del context.user_data['proposed_weekly_state']
 
     if review_id:
-        await apply_bridge_weekly_state_feedback(
-            review_id,
-            accepted=False,
-            has_pending_event_feedback=has_pending_weekly_review_event_feedback(context),
-        )
+        record = await load_review_workflow(review_id)
+        if record is not None:
+            await transition_review_stage(
+                record,
+                stage=ReviewStage.WEEKLY_PLAN,
+                stage_status=StageStatus.IN_REVISION,
+            )
 
     await query.edit_message_text(
         "🚫 *Weekly state update rejected. The Sunday review remains open for revision.*",
