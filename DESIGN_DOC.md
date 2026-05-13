@@ -216,7 +216,9 @@ Calendar `cancel` remains an event operation, not a general proposal lifecycle s
 
 ## Sunday Review
 
-Sunday review is a staged workflow.
+Sunday review is a staged, gated workflow. It replaces one broad review call
+with narrower Flash stages, durable checkpoints, and confirmation boundaries
+where factual accuracy or user-impacting changes matter.
 
 Its responsibilities are:
 - review what happened during the week
@@ -228,13 +230,18 @@ Its responsibilities are:
 The workflow runs in order:
 
 1. `week_review`
-2. `goals_audit`
-3. `memory_audit`
-4. `weekly_plan`
-5. `scheduling_pass`
-6. `final_review`
+2. factual confirmation
+3. `goals_audit`
+4. conditional goals confirmation
+5. `memory_audit`
+6. conditional memory confirmation
+7. `weekly_plan`
+8. weekly-plan confirmation
+9. `scheduling_pass`
+10. calendar proposal confirmation
+11. `final_review`
 
-Later stages must inherit constraints and lessons from earlier stages. If the review learns that a certain class of schedule proposal does not work, the scheduling pass must respect that.
+Later stages must inherit confirmed constraints and lessons from earlier stages. Scheduling must only run after the weekly plan is accepted, and calendar proposals must remain item-by-item confirmable and revisable.
 
 ## Workflow State
 

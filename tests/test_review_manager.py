@@ -450,14 +450,14 @@ async def test_run_scheduling_pass_stage_requires_reviewed_weekly_plan():
 @patch("orchestrator.review_manager._generate_review_structured")
 @patch("orchestrator.review_manager.build_review_source_snapshot")
 @patch("orchestrator.review_manager.save_review_workflow_sync")
-async def test_start_weekly_review_workflow_pauses_at_weekly_plan_feedback(
+async def test_start_weekly_review_workflow_pauses_at_week_review_feedback(
     mock_save_review_workflow_sync,
     mock_build_review_source_snapshot,
     mock_generate_review_structured,
 ):
     """
-    Tests that the initial workflow pauses at the weekly-plan confirmation gate
-    before downstream scheduling is allowed to run.
+    Tests that the initial workflow pauses at factual week-review confirmation
+    before downstream audit and planning stages are allowed to run.
     """
     mock_build_review_source_snapshot.return_value = SourceSnapshot(
         goals_markdown="# Goals",
@@ -472,51 +472,24 @@ async def test_start_weekly_review_workflow_pauses_at_weekly_plan_feedback(
             constraints=[],
             carry_forward=["Carry context cleanup forward."],
         ),
-        GoalsAuditResponse(
-            summary="The durable goals still look accurate.",
-            key_findings=["MVP goal remains active."],
-            constraints=[],
-            carry_forward=["Keep goal emphasis unchanged."],
-        ),
-        MemoryAuditResponse(
-            summary="Rolling memory remains useful.",
-            key_findings=["Keep the current durable preference signal."],
-            constraints=[],
-            carry_forward=["No major memory changes needed."],
-        ),
-        WeeklyPlanResponse(
-            summary="The next week should focus on review-workflow implementation.",
-            key_findings=["Staged review work is the highest-leverage priority."],
-            constraints=["Do not overfill evenings."],
-            carry_forward=["Carry context cleanup forward."],
-            state_change_summary="Updated weekly state around staged review work.",
-            weekly_state_content=VALID_WEEKLY_STATE_MARKDOWN,
-        ),
     ]
     record = await start_weekly_review_workflow()
 
     assert record.week_review is not None
     assert record.week_review.summary == "The week had useful progress."
-    assert record.goals_audit is not None
-    assert record.goals_audit.summary == "The durable goals still look accurate."
-    assert record.memory_audit is not None
-    assert record.memory_audit.summary == "Rolling memory remains useful."
-    assert record.weekly_plan is not None
-    assert record.weekly_plan.summary == "The next week should focus on review-workflow implementation."
-    assert record.weekly_state_changes is not None
-    assert record.weekly_state_changes.proposed_markdown == VALID_WEEKLY_STATE_MARKDOWN
+    assert record.goals_audit is None
+    assert record.memory_audit is None
+    assert record.weekly_plan is None
+    assert record.weekly_state_changes is None
     assert record.scheduling_pass is None
     assert record.scheduling_proposals is None
     assert record.final_review is None
-    assert build_weekly_state_change_summary(record) == (
-        "Modifications:\n- Updated weekly state around staged review work."
-    )
     assert record.workflow_status == ReviewWorkflowStatus.AWAITING_FEEDBACK
-    assert record.current_stage == ReviewStage.WEEKLY_PLAN
+    assert record.current_stage == ReviewStage.WEEK_REVIEW
     assert record.stage_status == StageStatus.AWAITING_FEEDBACK
-    assert record.last_completed_stage == ReviewStage.WEEKLY_PLAN
-    assert mock_generate_review_structured.call_count == 4
-    assert mock_save_review_workflow_sync.call_count >= 10
+    assert record.last_completed_stage == ReviewStage.WEEK_REVIEW
+    assert mock_generate_review_structured.call_count == 1
+    assert mock_save_review_workflow_sync.call_count >= 4
 
 
 @pytest.mark.asyncio

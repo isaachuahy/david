@@ -886,7 +886,7 @@ async def start_weekly_review_workflow() -> ReviewWorkflowRecord:
 
     The Telegram layer only asks to start the review. This function handles
     durable workflow creation, staged reasoning, state transitions, and the
-    first user-facing gate at the proposed weekly plan.
+    first user-facing gate at the factual week review.
     """
     review_workflow: ReviewWorkflowRecord | None = None
 
@@ -900,26 +900,8 @@ async def start_weekly_review_workflow() -> ReviewWorkflowRecord:
         review_workflow = await run_week_review_stage(review_workflow)
         review_workflow = await transition_review_stage(
             review_workflow,
-            stage=ReviewStage.GOALS_AUDIT,
-            stage_status=StageStatus.RUNNING,
-        )
-        review_workflow = await run_goals_audit_stage(review_workflow)
-        review_workflow = await transition_review_stage(
-            review_workflow,
-            stage=ReviewStage.MEMORY_AUDIT,
-            stage_status=StageStatus.RUNNING,
-        )
-        review_workflow = await run_memory_audit_stage(review_workflow)
-        review_workflow = await transition_review_stage(
-            review_workflow,
-            stage=ReviewStage.WEEKLY_PLAN,
-            stage_status=StageStatus.RUNNING,
-        )
-        review_workflow = await run_weekly_plan_stage(review_workflow)
-        review_workflow = await transition_review_stage(
-            review_workflow,
             workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
-            stage=ReviewStage.WEEKLY_PLAN,
+            stage=ReviewStage.WEEK_REVIEW,
             stage_status=StageStatus.AWAITING_FEEDBACK,
         )
 
@@ -956,40 +938,56 @@ async def advance_review_from_current_stage(
     """
     Advances the Sunday review from the current completed user-gated stage.
 
-    The only supported advancement today is from an accepted weekly plan into
-    scheduling and final review assembly. Unsupported states raise instead of
-    silently no-oping so workflow wiring mistakes surface quickly.
+    Supported advancements are explicit so workflow wiring mistakes surface
+    quickly instead of silently no-oping.
     """
-    if not (
+    if (
+        record.current_stage == ReviewStage.WEEK_REVIEW
+        and record.stage_status == StageStatus.COMPLETED
+    ):
+        record = await transition_review_stage(
+            record,
+            stage=ReviewStage.GOALS_AUDIT,
+            stage_status=StageStatus.RUNNING,
+        )
+        record = await run_goals_audit_stage(record)
+        return await transition_review_stage(
+            record,
+            workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            stage=ReviewStage.GOALS_AUDIT,
+            stage_status=StageStatus.AWAITING_FEEDBACK,
+        )
+
+    if (
         record.current_stage == ReviewStage.WEEKLY_PLAN
         and record.stage_status == StageStatus.COMPLETED
     ):
-        raise ValueError(
-            "Cannot advance Sunday review from "
-            f"{record.current_stage.value}/{record.stage_status.value}."
+        record = await transition_review_stage(
+            record,
+            stage=ReviewStage.SCHEDULING_PASS,
+            stage_status=StageStatus.RUNNING,
+        )
+        record = await run_scheduling_pass_stage(record)
+        record = await transition_review_stage(
+            record,
+            stage=ReviewStage.FINAL_REVIEW,
+            stage_status=StageStatus.RUNNING,
+        )
+        record = await save_stage_checkpoint(
+            record,
+            ReviewStage.FINAL_REVIEW,
+            build_final_review_checkpoint(record),
+        )
+        return await transition_review_stage(
+            record,
+            workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            stage=ReviewStage.FINAL_REVIEW,
+            stage_status=StageStatus.AWAITING_FEEDBACK,
         )
 
-    record = await transition_review_stage(
-        record,
-        stage=ReviewStage.SCHEDULING_PASS,
-        stage_status=StageStatus.RUNNING,
-    )
-    record = await run_scheduling_pass_stage(record)
-    record = await transition_review_stage(
-        record,
-        stage=ReviewStage.FINAL_REVIEW,
-        stage_status=StageStatus.RUNNING,
-    )
-    record = await save_stage_checkpoint(
-        record,
-        ReviewStage.FINAL_REVIEW,
-        build_final_review_checkpoint(record),
-    )
-    return await transition_review_stage(
-        record,
-        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
-        stage=ReviewStage.FINAL_REVIEW,
-        stage_status=StageStatus.AWAITING_FEEDBACK,
+    raise ValueError(
+        "Cannot advance Sunday review from "
+        f"{record.current_stage.value}/{record.stage_status.value}."
     )
 
 

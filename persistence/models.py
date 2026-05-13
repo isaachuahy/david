@@ -132,7 +132,7 @@ class ReviewWorkflowStatus(str, Enum):
 
 
 class ReviewStage(str, Enum):
-    """Sequential stages for the Sunday review pipeline."""
+    """Reasoning and handoff stages for the gated Sunday review pipeline."""
 
     WEEK_REVIEW = "week_review"
     GOALS_AUDIT = "goals_audit"
@@ -147,7 +147,9 @@ class StageStatus(str, Enum):
     Fine-grained state inside the current Sunday review stage.
 
     This lets the application resume within the active stage after restarts
-    instead of rerunning the entire workflow from the beginning.
+    instead of rerunning the entire workflow from the beginning. User-facing
+    gates are represented by a stage entering AWAITING_FEEDBACK or IN_REVISION,
+    rather than by adding separate confirmation-only stages.
     """
 
     NOT_STARTED = "not_started"
@@ -219,12 +221,13 @@ class SchedulingPassArtifact(BaseModel):
 
 class ReviewWorkflowRecord(BaseModel):
     """
-    Durable state for the staged Sunday review workflow.
+    Durable state for the staged, gated Sunday review workflow.
 
     This model is intentionally specific to Sunday review rather than a generic
     workflow abstraction. The narrower scope keeps persistence readable while
     still giving the system enough information to recover from process restarts,
-    continue within the active stage, and avoid context drift during review.
+    continue within the active stage or confirmation gate, and avoid context
+    drift during review.
     """
 
     id: str

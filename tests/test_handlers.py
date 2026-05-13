@@ -440,7 +440,7 @@ async def test_handle_start_trigger_daily(mock_consume_trigger):
 @patch('bot.handlers.send_proposal_thread', new_callable=AsyncMock)
 @patch('bot.handlers.start_weekly_review_workflow', new_callable=AsyncMock)
 @patch('bot.handlers.consume_trigger')
-async def test_handle_start_trigger_weekly_pauses_at_weekly_plan_confirmation(
+async def test_handle_start_trigger_weekly_pauses_at_week_review_confirmation(
     mock_consume_trigger,
     mock_start_weekly_review_workflow,
     mock_send_proposal_thread,
@@ -467,10 +467,10 @@ async def test_handle_start_trigger_weekly_pauses_at_weekly_plan_confirmation(
             weekly_state_markdown="# Weekly State",
             decision_log_markdown="# Decision Log",
         ),
-        weekly_plan=StageCheckpoint(summary="Strong week overall."),
-        weekly_state_changes=ArtifactChangeSummary(
-            modifications=["Updated priorities for next week."],
-            proposed_markdown="# Weekly State",
+        week_review=StageCheckpoint(
+            summary="The week had useful progress.",
+            key_findings=["Context routing advanced."],
+            constraints=["Avoid late-evening event proposals."],
         ),
     )
     mock_start_weekly_review_workflow.return_value = review_workflow
@@ -482,13 +482,151 @@ async def test_handle_start_trigger_weekly_pauses_at_weekly_plan_confirmation(
     mock_start_weekly_review_workflow.assert_awaited_once_with()
     assert context.user_data["active_review_workflow_id"] == "review_test"
     mock_send_proposal_thread.assert_not_awaited()
-    assert context.user_data["proposed_weekly_state"]["content"] == "# Weekly State"
+    assert context.user_data["active_review_stage_confirmation"] == {
+        "review_id": "review_test",
+        "stage": "week_review",
+    }
     sent_messages = context.bot.send_message.await_args_list
-    assert sent_messages[0].kwargs["text"] == (
-        "**Sunday Review Weekly Plan Ready**\n\nStrong week overall."
+    assert "*Week Review Ready*" in sent_messages[0].kwargs["text"]
+    assert "The week had useful progress." in sent_messages[0].kwargs["text"]
+    assert "Context routing advanced." in sent_messages[0].kwargs["text"]
+    assert sent_messages[0].kwargs["reply_markup"] is not None
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers.send_review_stage_confirmation', new_callable=AsyncMock)
+@patch('bot.handlers.advance_review_from_current_stage', new_callable=AsyncMock)
+@patch('bot.handlers.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
+async def test_handle_confirm_review_stage_advances_to_next_stage_confirmation(
+    mock_load_review_workflow,
+    mock_transition_review_stage,
+    mock_advance_review_from_current_stage,
+    mock_send_review_stage_confirmation,
+):
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.callback_query = MagicMock()
+    update.callback_query.data = "confirm_review_stage_week_review"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.chat_id = 456
+
+    context = MagicMock()
+    context.user_data = {
+        "active_review_workflow_id": "review_test",
+        "active_review_stage_confirmation": {
+            "review_id": "review_test",
+            "stage": "week_review",
+        },
+    }
+    context.bot_data = {"allowed_user_id": 123}
+
+    loaded_record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        week_review=StageCheckpoint(summary="The week had useful progress."),
     )
-    assert "Updated priorities for next week." in sent_messages[1].kwargs["text"]
-    assert "Do you want to apply these changes?" in sent_messages[1].kwargs["text"]
+    completed_record = loaded_record.model_copy(
+        update={
+            "workflow_status": ReviewWorkflowStatus.ACTIVE,
+            "current_stage": ReviewStage.WEEK_REVIEW,
+            "stage_status": StageStatus.COMPLETED,
+            "last_completed_stage": ReviewStage.WEEK_REVIEW,
+        }
+    )
+    advanced_record = completed_record.model_copy(
+        update={
+            "workflow_status": ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            "current_stage": ReviewStage.GOALS_AUDIT,
+            "stage_status": StageStatus.AWAITING_FEEDBACK,
+            "goals_audit": StageCheckpoint(summary="Goals still look accurate."),
+        }
+    )
+    mock_load_review_workflow.return_value = loaded_record
+    mock_transition_review_stage.return_value = completed_record
+    mock_advance_review_from_current_stage.return_value = advanced_record
+
+    await handle_confirm(update, context)
+
+    mock_load_review_workflow.assert_awaited_once_with("review_test")
+    mock_transition_review_stage.assert_awaited_once_with(
+        loaded_record,
+        workflow_status=ReviewWorkflowStatus.ACTIVE,
+        stage=ReviewStage.WEEK_REVIEW,
+        stage_status=StageStatus.COMPLETED,
+        last_completed_stage=ReviewStage.WEEK_REVIEW,
+    )
+    mock_advance_review_from_current_stage.assert_awaited_once_with(completed_record)
+    mock_send_review_stage_confirmation.assert_awaited_once_with(
+        context,
+        456,
+        advanced_record,
+        ReviewStage.GOALS_AUDIT,
+    )
+    assert "active_review_stage_confirmation" not in context.user_data
+    update.callback_query.edit_message_text.assert_awaited_once_with(
+        "✅ *Week Review confirmed.*",
+        parse_mode="Markdown",
+    )
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
+async def test_handle_message_marks_active_review_stage_in_revision(
+    mock_load_review_workflow,
+    mock_transition_review_stage,
+):
+    update = MagicMock()
+    update.effective_chat.id = 456
+    update.effective_user.id = 123
+    update.message.text = "The week review missed the dentist appointment."
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {
+        "active_review_stage_confirmation": {
+            "review_id": "review_test",
+            "stage": "week_review",
+        },
+        "session_state": "ACTIVE",
+    }
+    context.bot_data = {"allowed_user_id": 123}
+
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+    )
+    mock_load_review_workflow.return_value = record
+
+    await handle_message(update, context)
+
+    assert record.feedback_history == [
+        "week_review: The week review missed the dentist appointment.",
+    ]
+    mock_transition_review_stage.assert_awaited_once_with(
+        record,
+        stage=ReviewStage.WEEK_REVIEW,
+        stage_status=StageStatus.IN_REVISION,
+    )
+    assert "active_review_stage_confirmation" not in context.user_data
+    update.message.reply_text.assert_awaited_once_with(
+        "📝 *Revision noted for this review stage.* I’ll keep the Sunday review paused here until the revision loop is wired in.",
+        parse_mode="Markdown",
+    )
 
 
 @pytest.mark.asyncio

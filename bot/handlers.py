@@ -48,10 +48,11 @@ from persistence.models import (
 )
 from reasoning.flash_client import FlashResponse
 from reasoning.schemas import ProposalThreadDraft, ProposedEvent
-from bot.keyboards import build_proposal_item_keyboard, build_weekly_state_keyboard
+from bot.keyboards import build_proposal_item_keyboard, build_review_stage_keyboard, build_weekly_state_keyboard
 from observability.sentry import capture_exception as capture_sentry_exception
 
 ACTIVE_REVIEW_WORKFLOW_ID_KEY = "active_review_workflow_id"
+ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY = "active_review_stage_confirmation"
 UNAUTHORIZED_CALLBACK_TEXT = "This action is not available."
 CALENDAR_AUTH_ERROR_TEXT = (
     "Google Calendar is currently unavailable because the saved Google authorization "
@@ -160,6 +161,125 @@ def has_pending_weekly_state_feedback(context: ContextTypes.DEFAULT_TYPE) -> boo
     """
     proposed_state = context.user_data.get("proposed_weekly_state")
     return isinstance(proposed_state, dict)
+
+
+def _get_review_stage_checkpoint(record, stage: ReviewStage):
+    """Returns the checkpoint field that belongs to one review stage."""
+    return {
+        ReviewStage.WEEK_REVIEW: record.week_review,
+        ReviewStage.GOALS_AUDIT: record.goals_audit,
+        ReviewStage.MEMORY_AUDIT: record.memory_audit,
+        ReviewStage.WEEKLY_PLAN: record.weekly_plan,
+        ReviewStage.SCHEDULING_PASS: record.scheduling_pass,
+        ReviewStage.FINAL_REVIEW: record.final_review,
+    }.get(stage)
+
+
+def _format_review_stage_summary(stage: ReviewStage, record) -> str:
+    """
+    Formats one review checkpoint for user confirmation.
+
+    The summary is intentionally compact; detailed revision generation will be
+    handled by stage-specific feedback loops rather than this presentation step.
+    """
+    checkpoint = _get_review_stage_checkpoint(record, stage)
+    if checkpoint is None:
+        raise ValueError(f"Review stage {stage.value} has no checkpoint to confirm.")
+
+    lines = [
+        f"*{stage.value.replace('_', ' ').title()} Ready*",
+        "",
+        checkpoint.summary or "No summary was provided.",
+    ]
+    if checkpoint.key_findings:
+        lines.append("")
+        lines.append("*Key findings:*")
+        lines.extend(f"- {finding}" for finding in checkpoint.key_findings)
+    if checkpoint.constraints:
+        lines.append("")
+        lines.append("*Constraints:*")
+        lines.extend(f"- {constraint}" for constraint in checkpoint.constraints)
+    return "\n".join(lines)
+
+
+async def send_review_stage_confirmation(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    record,
+    stage: ReviewStage,
+) -> None:
+    """Presents one Sunday review stage checkpoint for confirm/revise feedback."""
+    context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = {
+        "review_id": record.id,
+        "stage": stage.value,
+    }
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=_format_review_stage_summary(stage, record),
+        reply_markup=build_review_stage_keyboard(stage.value),
+        parse_mode="Markdown",
+    )
+
+
+async def send_weekly_plan_confirmation(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    record,
+) -> None:
+    """Presents the proposed weekly-state artifact for acceptance or revision."""
+    if record.weekly_state_changes is None or not record.weekly_state_changes.proposed_markdown:
+        raise ValueError("Sunday review has no proposed weekly-state markdown to confirm.")
+
+    context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = {
+        "review_id": record.id,
+        "stage": ReviewStage.WEEKLY_PLAN.value,
+    }
+    context.user_data['proposed_weekly_state'] = {
+        "content": record.weekly_state_changes.proposed_markdown,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "review_id": record.id,
+    }
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"**Sunday Review Weekly Plan Ready**\n\n{record.weekly_plan.summary if record.weekly_plan else ''}",
+        parse_mode="Markdown",
+    )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "📝 *Proposed Weekly State Changes:*\n"
+            f"{build_weekly_state_change_summary(record)}\n\n"
+            "Do you want to apply these changes?"
+        ),
+        reply_markup=build_weekly_state_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
+async def mark_review_stage_in_revision(
+    context: ContextTypes.DEFAULT_TYPE,
+    review_id: str,
+    stage: ReviewStage,
+    feedback: str,
+) -> bool:
+    """
+    Stores review-stage feedback and marks the stage for future revision.
+
+    This records the user correction without attempting a stage-specific model
+    revision yet, keeping the confirmation gate durable across restarts.
+    """
+    record = await load_review_workflow(review_id)
+    if record is None:
+        return False
+
+    record.feedback_history.append(f"{stage.value}: {feedback}")
+    await transition_review_stage(
+        record,
+        stage=stage,
+        stage_status=StageStatus.IN_REVISION,
+    )
+    context.user_data.pop(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY, None)
+    return True
 
 
 async def _send_proposal_item_confirmation(
@@ -598,6 +718,52 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    if query.data.startswith("confirm_review_stage_"):
+        stage = ReviewStage(query.data.split("confirm_review_stage_")[1])
+        active_confirmation = context.user_data.get(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY)
+        review_id = (
+            active_confirmation.get("review_id")
+            if isinstance(active_confirmation, dict)
+            else context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
+        )
+        record = await load_review_workflow(review_id) if review_id else None
+        if record is None:
+            await query.edit_message_text("❌ *This review stage is no longer available.*", parse_mode="Markdown")
+            return
+
+        record = await transition_review_stage(
+            record,
+            workflow_status=ReviewWorkflowStatus.ACTIVE,
+            stage=stage,
+            stage_status=StageStatus.COMPLETED,
+            last_completed_stage=stage,
+        )
+        record = await advance_review_from_current_stage(record)
+        context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = record.id
+        context.user_data.pop(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY, None)
+        await query.edit_message_text(
+            f"✅ *{stage.value.replace('_', ' ').title()} confirmed.*",
+            parse_mode="Markdown",
+        )
+
+        if record.current_stage == ReviewStage.WEEKLY_PLAN:
+            await send_weekly_plan_confirmation(
+                context,
+                query.message.chat_id,
+                record,
+            )
+        elif record.current_stage in {
+            ReviewStage.GOALS_AUDIT,
+            ReviewStage.MEMORY_AUDIT,
+        }:
+            await send_review_stage_confirmation(
+                context,
+                query.message.chat_id,
+                record,
+                record.current_stage,
+            )
+        return
+
     if query.data.startswith("confirm_item_"):
         item_id = query.data.split("confirm_item_")[1]
         untrack_confirmation_message(context, item_id)
@@ -706,6 +872,29 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    if query.data.startswith("reject_review_stage_"):
+        stage = ReviewStage(query.data.split("reject_review_stage_")[1])
+        active_confirmation = context.user_data.get(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY)
+        review_id = (
+            active_confirmation.get("review_id")
+            if isinstance(active_confirmation, dict)
+            else context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
+        )
+        marked = await mark_review_stage_in_revision(
+            context,
+            review_id,
+            stage,
+            "User requested revision from the review-stage confirmation button.",
+        ) if review_id else False
+        if not marked:
+            await query.edit_message_text("❌ *This review stage is no longer available.*", parse_mode="Markdown")
+            return
+        await query.edit_message_text(
+            "📝 *Revision noted.* Send the correction you want me to apply to this review stage.",
+            parse_mode="Markdown",
+        )
+        return
+
     if query.data.startswith("reject_item_"):
         item_id = query.data.split("reject_item_")[1]
         untrack_confirmation_message(context, item_id)
@@ -775,36 +964,11 @@ async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
             # Only consume the trigger after the review workflow is durable and has
             # actually started. This keeps the trigger retryable if startup fails.
             consume_trigger(context, trigger_type)
-            if review_workflow.weekly_plan is None:
-                raise ValueError("Sunday review completed without a weekly-plan checkpoint.")
-            if (
-                review_workflow.weekly_state_changes is None
-                or not review_workflow.weekly_state_changes.proposed_markdown
-            ):
-                raise ValueError("Sunday review completed without proposed weekly-state markdown.")
-            
-            # Send the user-facing checkpoint before asking for confirmation.
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id, 
-                text=f"**Sunday Review Weekly Plan Ready**\n\n{review_workflow.weekly_plan.summary}",
-                parse_mode="Markdown"
-            )
-            
-            # Ask for confirmation before overwriting the weekly state
-            context.user_data['proposed_weekly_state'] = {
-                "content": review_workflow.weekly_state_changes.proposed_markdown,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "review_id": review_workflow.id,
-            }
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=(
-                    "📝 *Proposed Weekly State Changes:*\n"
-                    f"{build_weekly_state_change_summary(review_workflow)}\n\n"
-                    "Do you want to apply these changes?"
-                ),
-                reply_markup=build_weekly_state_keyboard(),
-                parse_mode="Markdown"
+            await send_review_stage_confirmation(
+                context,
+                update.effective_chat.id,
+                review_workflow,
+                ReviewStage.WEEK_REVIEW,
             )
         except Exception as e:
             logger.error(f"Error during Sunday Review: {e}")
@@ -949,6 +1113,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if get_session_state(context) == SessionStatus.CLOSING:
         await update.message.reply_text("⏳ *I am currently synthesizing our last session. Please give me a moment...*", parse_mode="Markdown")
         return
+
+    active_stage_confirmation = context.user_data.get(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY)
+    if isinstance(active_stage_confirmation, dict):
+        review_id = active_stage_confirmation.get("review_id")
+        stage_value = active_stage_confirmation.get("stage")
+        if review_id and stage_value:
+            marked = await mark_review_stage_in_revision(
+                context,
+                review_id,
+                ReviewStage(stage_value),
+                update.message.text,
+            )
+            if marked:
+                await update.message.reply_text(
+                    "📝 *Revision noted for this review stage.* I’ll keep the Sunday review paused here until the revision loop is wired in.",
+                    parse_mode="Markdown",
+                )
+                return
 
     # Check if a text message was sent while a proposal is waiting for confirmation.
     pending_confirmations = get_tracked_confirmation_messages(context)

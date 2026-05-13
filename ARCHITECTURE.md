@@ -78,15 +78,22 @@ The system also runs two scheduled routines:
 
 ## 3. Sunday Review Workflow
 
-Sunday review is a durable staged workflow.
+Sunday review is a durable, gated workflow. Each model call is narrow and
+checkpointed, and user confirmation is required before downstream stages depend
+on uncertain facts or user-impacting artifacts.
 
-It runs as a sequential pipeline:
+It runs as a staged pipeline:
 1. `week_review`
-2. `goals_audit`
-3. `memory_audit`
-4. `weekly_plan`
-5. `scheduling_pass`
-6. `final_review`
+2. factual confirmation
+3. `goals_audit`
+4. conditional goals confirmation
+5. `memory_audit`
+6. conditional memory confirmation
+7. `weekly_plan`
+8. weekly-plan confirmation
+9. `scheduling_pass`
+10. calendar proposal confirmation
+11. `final_review`
 
 Each stage consumes:
 - the frozen `SourceSnapshot`
@@ -97,17 +104,20 @@ Each stage consumes:
 flowchart TD
     A["Start Sunday review"] --> B["Freeze SourceSnapshot"]
     B --> C["week_review"]
-    C --> D["goals_audit"]
-    D --> E["memory_audit"]
-    E --> F["weekly_plan"]
-    F --> G["scheduling_pass"]
-    G --> H["final_review"]
-    H --> I{"User feedback?"}
-
-    I -- "Revise weekly plan" --> F
-    I -- "Revise schedule" --> G
-    I -- "Approve" --> J["Commit artifact updates
-    and confirm selected events"]
+    C --> C1{"Week facts confirmed?"}
+    C1 -- "Revise" --> C
+    C1 -- "Confirm" --> D["goals_audit"]
+    D --> D1{"Goal changes need confirmation?"}
+    D1 -- "Revise/reconfirm" --> D
+    D1 -- "No or confirmed" --> E["memory_audit"]
+    E --> E1{"Memory edits need confirmation?"}
+    E1 -- "Revise/reconfirm" --> E
+    E1 -- "No or confirmed" --> F["weekly_plan"]
+    F --> P{"Weekly plan accepted?"}
+    P -- "Revise" --> F
+    P -- "Accept" --> G["scheduling_pass"]
+    G --> I["Confirm calendar proposals item by item"]
+    I --> H["final_review"]
 ```
 
 ### Sunday Review Guarantees

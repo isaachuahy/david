@@ -20,6 +20,21 @@ def build_weekly_state_keyboard() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(keyboard)
 
+def build_review_stage_keyboard(stage: str) -> InlineKeyboardMarkup:
+    """
+    Builds the Confirm/Revise inline keyboard for a Sunday review stage.
+
+    The stage is embedded in the callback so one generic handler can confirm or
+    revise week review, goals audit, memory audit, and weekly plan gates.
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("Confirm", callback_data=f"confirm_review_stage_{stage}"),
+            InlineKeyboardButton("Revise", callback_data=f"reject_review_stage_{stage}")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 def build_trigger_keyboard(trigger_type: str) -> InlineKeyboardMarkup:
     """Builds the Start/Delay inline keyboard for scheduled triggers."""
     keyboard = [
