@@ -414,6 +414,27 @@ def _format_revision_request(item: ProposalItemRecord, feedback: str) -> str:
     )
 
 
+def _proposal_event_from_item(item: ProposalItemRecord) -> ProposedEvent:
+    """
+    Rebuilds the proposal schema from a persisted item.
+
+    This is used as a recovery path when a revision cannot be validated: the
+    active proposal should stay confirmable instead of being stranded in an
+    in-revision state after the old inline keyboard has been retired.
+    """
+    return ProposedEvent(
+        action_type=item.action_type,
+        summary=item.summary,
+        start_time=item.start_time,
+        end_time=item.end_time,
+        description=item.description,
+        requested_calendar_text=item.calendar_id,
+        calendar_id=item.calendar_id,
+        target_event_id=item.target_event_id,
+        target_event_calendar_id=item.target_event_calendar_id,
+    )
+
+
 async def _revise_active_proposal_item(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -454,7 +475,24 @@ async def _revise_active_proposal_item(
         await context.bot.send_message(chat_id=chat_id, text=response.message)
         return True
 
-    normalized_action = await _normalize_calendar_action(context, revised_action)
+    try:
+        normalized_action = await _normalize_calendar_action(context, revised_action)
+    except ValueError as error:
+        restored_item = revise_proposal_item(
+            item_id,
+            _proposal_event_from_item(item),
+            feedback=feedback,
+        )
+        await context.bot.send_message(chat_id=chat_id, text=str(error))
+        if restored_item is not None:
+            await _send_proposal_item_confirmation(
+                context,
+                chat_id,
+                restored_item,
+                prefix_text="I kept the previous proposal active because the revision could not be matched.",
+            )
+        return True
+
     revised_item = revise_proposal_item(
         item_id,
         normalized_action,
@@ -560,17 +598,25 @@ async def send_proposal_thread(
     if not proposal_thread.proposed_events:
         return None
 
+    normalized_actions: list[ProposedEvent] = []
+    first_display_name: str | None = None
+    for index, action in enumerate(proposal_thread.proposed_events):
+        # Validate every model-proposed calendar action before creating durable
+        # thread state, so failed event matching cannot leave empty active threads.
+        normalized_action = await _normalize_calendar_action(context, action)
+        if index == 0:
+            first_display_name = normalized_action.calendar_display_name
+        normalized_actions.append(normalized_action)
+
     thread = create_proposal_thread(
         source_type=source_type,
         source_id=source_id or context.user_data.get("current_session_id"),
         title=proposal_thread.title,
     )
 
-    first_display_name: str | None = None
-    for index, action in enumerate(proposal_thread.proposed_events):
-        normalized_action = await _normalize_calendar_action(context, action)
-        if index == 0:
-            first_display_name = normalized_action.calendar_display_name
+    for index, normalized_action in enumerate(normalized_actions):
+        # Store only actions that have already passed deterministic validation.
+        # The proposal thread stays durable, but bad drafts never enter the queue.
         add_proposal_item(
             thread.id,
             normalized_action,
@@ -1140,12 +1186,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for item_id, message_id in pending_confirmations
             if item_id.startswith("pi_")
         ]
-        if active_items:
+        for item_id, message_id in active_items:
+            item = get_proposal_item(item_id)
+            if not item or item.status not in {
+                ProposalItemStatus.ACTIVE,
+                ProposalItemStatus.IN_REVISION,
+            }:
+                # Stale tracked proposal UIs should not capture unrelated text.
+                # Once removed, this message can continue into normal routing.
+                untrack_confirmation_message(context, item_id)
+                continue
+
             revised = await _revise_active_proposal_item(
                 context,
                 update.effective_chat.id,
-                active_items[0][0],
-                active_items[0][1],
+                item_id,
+                message_id,
                 update.message.text,
             )
             if not revised:
