@@ -149,6 +149,65 @@ async def test_handle_message_uses_proposal_thread_when_present(
 
 
 @pytest.mark.asyncio
+@patch('bot.handlers.send_proposal_thread', new_callable=AsyncMock)
+@patch('bot.handlers.process_message', new_callable=AsyncMock)
+async def test_handle_message_rolls_back_failed_proposal_turn_from_chat_history(
+    mock_process_message,
+    mock_send_proposal_thread,
+):
+    proposal_thread = ProposalThreadDraft(
+        title="Cancel ambiguous event",
+        rationale="The user referred to an event without enough detail.",
+        proposed_events=[
+            ProposedEvent(
+                action_type="cancel",
+                summary="This event",
+                start_time="2026-03-31T09:00:00-04:00",
+                end_time="2026-03-31T10:00:00-04:00",
+                description="Ambiguous cancellation request.",
+            ),
+        ],
+    )
+    mock_process_message.return_value = FlashResponse(
+        message="I can cancel that.",
+        calendar_planning_mode="propose",
+        proposal_thread=proposal_thread,
+    )
+    mock_send_proposal_thread.side_effect = ValueError(
+        "I couldn't identify a single calendar event to cancel."
+    )
+
+    update = MagicMock()
+    update.effective_chat.id = 456
+    update.effective_user.id = 123
+    update.message.text = "Cancel this event"
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {
+        "session_state": "ACTIVE",
+        "chat_history": [
+            {"role": "user", "content": "Earlier request"},
+            {"role": "assistant", "content": "Earlier response"},
+            {"role": "user", "content": "Cancel this event"},
+            {"role": "assistant", "content": "I can cancel that."},
+        ],
+    }
+    context.bot_data = {"allowed_user_id": 123}
+    context.job_queue.get_jobs_by_name.return_value = ()
+
+    await handle_message(update, context)
+
+    assert context.user_data["chat_history"] == [
+        {"role": "user", "content": "Earlier request"},
+        {"role": "assistant", "content": "Earlier response"},
+    ]
+    update.message.reply_text.assert_awaited_once_with(
+        "I couldn't identify a single calendar event to cancel."
+    )
+
+
+@pytest.mark.asyncio
 @patch('bot.handlers._send_proposal_item_confirmation', new_callable=AsyncMock)
 @patch('bot.handlers.revise_proposal_item')
 @patch('bot.handlers.mark_proposal_item_in_revision')
@@ -171,6 +230,7 @@ async def test_handle_message_revises_active_proposal_item_in_place(
     context.user_data = {
         "pending_confirmations": [("pi_123", 999)],
         "session_state": "ACTIVE",
+        "cached_events": [],
     }
     context.bot_data = {"allowed_user_id": 123}
     context.bot.edit_message_text = AsyncMock()
@@ -211,17 +271,39 @@ async def test_handle_message_revises_active_proposal_item_in_place(
 
 
 @pytest.mark.asyncio
+@patch('bot.handlers._send_proposal_item_clarification', new_callable=AsyncMock)
+@patch('bot.handlers.activate_next_proposal_item')
+@patch('bot.handlers.mark_proposal_item_in_revision')
 @patch('bot.handlers._normalize_calendar_action', new_callable=AsyncMock)
 @patch('bot.handlers.add_proposal_item')
 @patch('bot.handlers.create_proposal_thread')
-async def test_send_proposal_thread_does_not_create_thread_when_validation_fails(
+async def test_send_proposal_thread_keeps_invalid_item_recoverable(
     mock_create_proposal_thread,
     mock_add_proposal_item,
     mock_normalize_calendar_action,
+    mock_mark_in_revision,
+    mock_activate_next_proposal_item,
+    mock_send_clarification,
 ):
     mock_normalize_calendar_action.side_effect = ValueError(
         "I couldn't identify a single calendar event to cancel."
     )
+    mock_create_proposal_thread.return_value = ProposalThreadRecord(
+        id="pt_123",
+        source_type="conversation",
+        title="Cancel ambiguous event",
+        status=ProposalThreadStatus.ACTIVE,
+        created_at="2026-03-31T00:00:00+00:00",
+        updated_at="2026-03-31T00:00:00+00:00",
+    )
+    unresolved_item = make_proposal_item(status=ProposalItemStatus.IN_REVISION)
+    unresolved_item.action_type = "cancel"
+    unresolved_item.summary = "This event"
+    mock_add_proposal_item.return_value = unresolved_item
+    mock_mark_in_revision.return_value = unresolved_item
+    mock_activate_next_proposal_item.return_value = unresolved_item
+    mock_send_clarification.return_value = "pi_123"
+
     context = MagicMock()
     context.user_data = {"current_session_id": "sess_123"}
 
@@ -239,19 +321,123 @@ async def test_send_proposal_thread_does_not_create_thread_when_validation_fails
         ],
     )
 
-    with pytest.raises(ValueError, match="single calendar event"):
-        await send_proposal_thread(
-            context,
-            456,
-            proposal_thread,
-            prefix_text="I found a possible cancellation.",
-        )
+    item_id = await send_proposal_thread(
+        context,
+        456,
+        proposal_thread,
+        prefix_text="I found a possible cancellation.",
+    )
 
-    # Validation must happen before persistence so a failed calendar match cannot
-    # leave an empty active proposal thread behind.
+    assert item_id == "pi_123"
     mock_normalize_calendar_action.assert_awaited_once()
-    mock_create_proposal_thread.assert_not_called()
-    mock_add_proposal_item.assert_not_called()
+    mock_create_proposal_thread.assert_called_once()
+    mock_add_proposal_item.assert_called_once()
+    assert mock_add_proposal_item.call_args.kwargs["status"] == ProposalItemStatus.IN_REVISION
+    mock_mark_in_revision.assert_called_once_with(
+        "pi_123",
+        feedback="I couldn't identify a single calendar event to cancel.",
+    )
+    mock_activate_next_proposal_item.assert_called_once_with("pt_123")
+    mock_send_clarification.assert_awaited_once_with(
+        context,
+        456,
+        unresolved_item,
+        prefix_text="I found a possible cancellation.",
+    )
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers._send_proposal_item_confirmation', new_callable=AsyncMock)
+@patch('bot.handlers.activate_next_proposal_item')
+@patch('bot.handlers.mark_proposal_item_in_revision')
+@patch('bot.handlers._normalize_calendar_action', new_callable=AsyncMock)
+@patch('bot.handlers.add_proposal_item')
+@patch('bot.handlers.create_proposal_thread')
+async def test_send_proposal_thread_persists_mixed_batch_in_original_order(
+    mock_create_proposal_thread,
+    mock_add_proposal_item,
+    mock_normalize_calendar_action,
+    mock_mark_in_revision,
+    mock_activate_next_proposal_item,
+    mock_send_confirmation,
+):
+    mock_create_proposal_thread.return_value = ProposalThreadRecord(
+        id="pt_123",
+        source_type="conversation",
+        title="Mixed calendar changes",
+        status=ProposalThreadStatus.ACTIVE,
+        created_at="2026-03-31T00:00:00+00:00",
+        updated_at="2026-03-31T00:00:00+00:00",
+    )
+
+    first_action = ProposedEvent(
+        summary="Deep Work",
+        start_time="2026-03-31T08:00:00-04:00",
+        end_time="2026-03-31T09:30:00-04:00",
+        description="Focus block.",
+    )
+    invalid_action = ProposedEvent(
+        action_type="cancel",
+        summary="This event",
+        start_time="2026-03-31T10:00:00-04:00",
+        end_time="2026-03-31T10:30:00-04:00",
+        description="Ambiguous cancellation.",
+    )
+    third_action = ProposedEvent(
+        summary="Writing Sprint",
+        start_time="2026-03-31T11:00:00-04:00",
+        end_time="2026-03-31T12:00:00-04:00",
+        description="Draft notes.",
+    )
+    mock_normalize_calendar_action.side_effect = [
+        first_action,
+        ValueError("I couldn't identify a single calendar event to cancel."),
+        third_action,
+    ]
+
+    first_item = make_proposal_item(status=ProposalItemStatus.QUEUED)
+    first_item.id = "pi_first"
+    unresolved_item = make_proposal_item(status=ProposalItemStatus.IN_REVISION)
+    unresolved_item.id = "pi_second"
+    third_item = make_proposal_item(status=ProposalItemStatus.QUEUED)
+    third_item.id = "pi_third"
+    active_first = make_proposal_item(status=ProposalItemStatus.ACTIVE)
+    active_first.id = "pi_first"
+    mock_add_proposal_item.side_effect = [first_item, unresolved_item, third_item]
+    mock_mark_in_revision.return_value = unresolved_item
+    mock_activate_next_proposal_item.return_value = active_first
+    mock_send_confirmation.return_value = "pi_first"
+
+    context = MagicMock()
+    context.user_data = {"current_session_id": "sess_123"}
+
+    result = await send_proposal_thread(
+        context,
+        456,
+        ProposalThreadDraft(
+            title="Mixed calendar changes",
+            rationale="The user asked for several ordered calendar changes.",
+            proposed_events=[first_action, invalid_action, third_action],
+        ),
+    )
+
+    assert result == "pi_first"
+    assert [call.args[1].summary for call in mock_add_proposal_item.call_args_list] == [
+        "Deep Work",
+        "This event",
+        "Writing Sprint",
+    ]
+    assert [call.kwargs["status"] for call in mock_add_proposal_item.call_args_list] == [
+        ProposalItemStatus.QUEUED,
+        ProposalItemStatus.IN_REVISION,
+        ProposalItemStatus.QUEUED,
+    ]
+    mock_mark_in_revision.assert_called_once_with(
+        "pi_second",
+        feedback="I couldn't identify a single calendar event to cancel.",
+    )
+    mock_activate_next_proposal_item.assert_called_once_with("pt_123")
+    mock_send_confirmation.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -296,19 +482,19 @@ async def test_handle_message_untracks_stale_proposal_and_routes_normally(
 
 
 @pytest.mark.asyncio
-@patch('bot.handlers._send_proposal_item_confirmation', new_callable=AsyncMock)
+@patch('bot.handlers._send_proposal_item_clarification', new_callable=AsyncMock)
 @patch('bot.handlers._normalize_calendar_action', new_callable=AsyncMock)
 @patch('bot.handlers.revise_proposal_item')
 @patch('bot.handlers.mark_proposal_item_in_revision')
 @patch('bot.handlers.get_proposal_item')
 @patch('bot.handlers.process_message', new_callable=AsyncMock)
-async def test_handle_message_restores_proposal_when_revision_validation_fails(
+async def test_handle_message_keeps_revised_item_unresolved_when_validation_fails(
     mock_process_message,
     mock_get_proposal_item,
     mock_mark_in_revision,
     mock_revise_proposal_item,
     mock_normalize_calendar_action,
-    mock_send_confirmation,
+    mock_send_clarification,
 ):
     update = MagicMock()
     update.effective_chat.id = 456
@@ -320,6 +506,7 @@ async def test_handle_message_restores_proposal_when_revision_validation_fails(
     context.user_data = {
         "pending_confirmations": [("pi_123", 999)],
         "session_state": "ACTIVE",
+        "cached_events": [],
     }
     context.bot_data = {"allowed_user_id": 123}
     context.bot.edit_message_text = AsyncMock()
@@ -347,28 +534,104 @@ async def test_handle_message_restores_proposal_when_revision_validation_fails(
     mock_normalize_calendar_action.side_effect = ValueError(
         "I couldn't identify a single calendar event to cancel."
     )
-    restored_item = make_proposal_item()
-    mock_revise_proposal_item.return_value = restored_item
+    updated_item = make_proposal_item(status=ProposalItemStatus.ACTIVE)
+    unresolved_item = make_proposal_item(status=ProposalItemStatus.IN_REVISION)
+    mock_revise_proposal_item.return_value = updated_item
+    mock_mark_in_revision.side_effect = [None, unresolved_item]
 
     await handle_message(update, context)
 
-    mock_mark_in_revision.assert_called_once_with(
-        "pi_123",
-        feedback="Cancel this event instead",
-    )
+    assert mock_mark_in_revision.call_args_list[0].args == ("pi_123",)
+    assert mock_mark_in_revision.call_args_list[0].kwargs == {
+        "feedback": "Cancel this event instead",
+    }
+    assert mock_mark_in_revision.call_args_list[1].args == ("pi_123",)
+    assert mock_mark_in_revision.call_args_list[1].kwargs == {
+        "feedback": "I couldn't identify a single calendar event to cancel.",
+    }
     mock_revise_proposal_item.assert_called_once()
-    restored_action = mock_revise_proposal_item.call_args.args[1]
-    assert restored_action.summary == original_item.summary
-    context.bot.send_message.assert_awaited_once_with(
-        chat_id=456,
-        text="I couldn't identify a single calendar event to cancel.",
-    )
-    mock_send_confirmation.assert_awaited_once_with(
+    revised_action = mock_revise_proposal_item.call_args.args[1]
+    assert revised_action.summary == "This event"
+    mock_send_clarification.assert_awaited_once_with(
         context,
         456,
-        restored_item,
-        prefix_text="I kept the previous proposal active because the revision could not be matched.",
+        unresolved_item,
+        prefix_text="I still need more detail before I can confirm this calendar change.",
     )
+    context.bot.send_message.assert_not_awaited()
+    update.message.reply_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers.track_confirmation_message')
+@patch('bot.handlers.list_proposal_items')
+@patch('bot.handlers.mark_proposal_item_in_revision')
+@patch('bot.handlers.get_proposal_item')
+@patch('bot.handlers.process_message', new_callable=AsyncMock)
+async def test_handle_message_keeps_unresolved_item_tracked_across_clarifications(
+    mock_process_message,
+    mock_get_proposal_item,
+    mock_mark_in_revision,
+    mock_list_proposal_items,
+    mock_track_confirmation_message,
+):
+    update = MagicMock()
+    update.effective_chat.id = 456
+    update.effective_user.id = 123
+    update.message.text = "It is the sync with Alex"
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {
+        "pending_confirmations": [("pi_456", 999)],
+        "session_state": "ACTIVE",
+        "cached_events": [
+            {
+                "id": "evt_existing",
+                "summary": "Existing Meeting",
+                "start": {"dateTime": "2026-03-31T10:00:00-04:00"},
+                "end": {"dateTime": "2026-03-31T10:30:00-04:00"},
+                "calendar_id": "primary",
+            },
+        ],
+    }
+    context.bot_data = {"allowed_user_id": 123}
+    context.bot.edit_message_text = AsyncMock()
+    context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=777))
+
+    prior_item = make_proposal_item(status=ProposalItemStatus.ACCEPTED)
+    prior_item.sequence_index = 0
+    prior_item.summary = "Deep Work"
+    prior_item.start_time = "2026-03-31T08:00:00-04:00"
+    prior_item.end_time = "2026-03-31T09:30:00-04:00"
+
+    unresolved_item = make_proposal_item(status=ProposalItemStatus.IN_REVISION)
+    unresolved_item.id = "pi_456"
+    unresolved_item.sequence_index = 1
+    unresolved_item.summary = "This event"
+    unresolved_item.last_feedback = "I couldn't identify a single calendar event to cancel."
+
+    mock_get_proposal_item.return_value = unresolved_item
+    mock_list_proposal_items.return_value = [prior_item, unresolved_item]
+    mock_process_message.return_value = FlashResponse(
+        message="Which Alex sync should I use?"
+    )
+
+    await handle_message(update, context)
+
+    revision_prompt = mock_process_message.await_args.args[0]
+    assert "<CURRENT_CALENDAR_CONTEXT>" in revision_prompt
+    assert "Existing Meeting" in revision_prompt
+    assert "<PROPOSAL_THREAD_CONTEXT>" in revision_prompt
+    assert "Item 1 (accepted)" in revision_prompt
+    assert "Deep Work" in revision_prompt
+    assert "Item 2 (in_revision)" in revision_prompt
+    assert "I couldn't identify a single calendar event to cancel." in revision_prompt
+    context.bot.send_message.assert_awaited_once_with(
+        chat_id=456,
+        text="Which Alex sync should I use?",
+    )
+    mock_track_confirmation_message.assert_called_once_with(context, "pi_456", 777)
     update.message.reply_text.assert_not_awaited()
 
 
@@ -950,6 +1213,65 @@ async def test_handle_confirm_advances_durable_proposal_thread(
         context,
         456,
         next_item,
+    )
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers._send_proposal_item_clarification', new_callable=AsyncMock)
+@patch('bot.handlers.activate_next_proposal_item')
+@patch('bot.handlers.mark_proposal_item_accepted')
+@patch('bot.handlers.confirm_write')
+@patch('bot.handlers.accept_proposal_item')
+@patch('bot.handlers.get_proposal_item')
+@patch('bot.handlers.untrack_confirmation_message')
+async def test_handle_confirm_blocks_on_unresolved_next_item(
+    mock_remove_ui,
+    mock_get_item,
+    mock_accept_proposal_item,
+    mock_confirm_write,
+    mock_mark_proposal_item_accepted,
+    mock_activate_next_proposal_item,
+    mock_send_clarification,
+):
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.callback_query = MagicMock()
+    update.callback_query.data = "confirm_item_pi_123"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.text = "Original Proposal Text"
+    update.callback_query.message.chat_id = 456
+
+    current_item = make_proposal_item()
+    unresolved_item = make_proposal_item(status=ProposalItemStatus.IN_REVISION)
+    unresolved_item.id = "pi_456"
+    unresolved_item.sequence_index = 1
+    unresolved_item.summary = "This event"
+
+    context = MagicMock()
+    context.user_data = {}
+    context.bot_data = {"allowed_user_id": 123}
+    context.bot.send_message = AsyncMock()
+
+    mock_get_item.return_value = current_item
+    mock_accept_proposal_item.return_value = "cw_123"
+    mock_confirm_write.return_value = {
+        "id": "evt_123",
+        "summary": "Test Event",
+        "start": {"dateTime": "2026-03-31T15:00:00Z"},
+    }
+    mock_activate_next_proposal_item.return_value = unresolved_item
+
+    await handle_confirm(update, context)
+
+    mock_mark_proposal_item_accepted.assert_called_once_with("pi_123")
+    mock_activate_next_proposal_item.assert_called_once_with("pt_123")
+    context.bot.send_message.assert_not_awaited()
+    mock_send_clarification.assert_awaited_once_with(
+        context,
+        456,
+        unresolved_item,
+        prefix_text="Confirmed. I need one clarification before the next related proposal.",
     )
 
 @pytest.mark.asyncio

@@ -14,6 +14,7 @@ from orchestrator.confirmation_queue import (
     create_proposal_thread,
     get_pending_write,
     get_proposal_item,
+    list_proposal_items,
     mark_proposal_item_in_revision,
     mark_proposal_item_accepted,
     reject_proposal_item,
@@ -391,17 +392,94 @@ def _extract_revised_calendar_action(response: FlashResponse) -> ProposedEvent |
     return None
 
 
-def _format_revision_request(item: ProposalItemRecord, feedback: str) -> str:
+def _format_calendar_cache_for_revision(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """
+    Formats the session calendar cache for proposal-item revision turns.
+
+    The cache mirrors the Google Calendar snapshot used by normal routing. Adding
+    it to revision prompts lets the model compare draft proposal changes against
+    the user's real calendar without relying on fragile chat history alone.
+    """
+    events = context.user_data.get("cached_events", [])
+    if not events:
+        return "No cached calendar events."
+
+    lines = []
+    for event in events:
+        start = event.get("start", {}).get("dateTime", event.get("start", {}).get("date", "Unknown start"))
+        end = event.get("end", {}).get("dateTime", event.get("end", {}).get("date", "Unknown end"))
+        summary = event.get("summary", "Busy / No Title")
+        calendar_id = event.get("calendar_id", "primary")
+        event_id = event.get("id", "unknown")
+        lines.append(
+            f"- {summary} | {start} to {end} | calendar_id={calendar_id} | event_id={event_id}"
+        )
+
+    return "\n".join(lines)
+
+
+def _format_proposal_thread_context(item: ProposalItemRecord) -> str:
+    """
+    Formats the durable proposal thread state for a revision turn.
+
+    Each feedback turn includes the latest stored state for the whole thread so
+    later proposal items can be revised with awareness of prior accepted,
+    rejected, queued, or still-unresolved items in the same batch.
+    """
+    try:
+        thread_items = list_proposal_items(item.thread_id)
+    except Exception as error:
+        logger.error(f"Failed to load proposal thread context for {item.thread_id}: {error}")
+        thread_items = [item]
+
+    lines = []
+    for thread_item in thread_items:
+        validation_note = (
+            f"\n  Validation/feedback note: {thread_item.last_feedback}"
+            if thread_item.last_feedback
+            else ""
+        )
+        target_line = (
+            f"\n  Target event ID: {thread_item.target_event_id}"
+            if thread_item.target_event_id
+            else ""
+        )
+        lines.append(
+            f"Item {thread_item.sequence_index + 1} ({thread_item.status.value})\n"
+            f"  Action: {thread_item.action_type}\n"
+            f"  Summary: {thread_item.summary}\n"
+            f"  Start: {thread_item.start_time}\n"
+            f"  End: {thread_item.end_time}\n"
+            f"  Description: {thread_item.description}\n"
+            f"  Calendar ID: {thread_item.calendar_id}"
+            f"{target_line}"
+            f"{validation_note}"
+        )
+
+    return "\n\n".join(lines)
+
+
+def _format_revision_request(
+    context: ContextTypes.DEFAULT_TYPE,
+    item: ProposalItemRecord,
+    feedback: str,
+) -> str:
     """
     Builds an explicit revision turn for the router.
 
-    The message includes the active draft because chat history alone is not a
-    durable enough source of truth for multi-turn proposal-item revisions.
+    The message includes the real calendar cache and the whole proposal thread
+    because chat history alone is not durable enough for multi-turn revisions.
     """
     return (
         "Revise the active calendar proposal using this feedback. "
         "Return a concrete revised proposal only if it is ready for confirmation; "
         "otherwise ask a clarifying question.\n\n"
+        "<CURRENT_CALENDAR_CONTEXT>\n"
+        f"{_format_calendar_cache_for_revision(context)}\n"
+        "</CURRENT_CALENDAR_CONTEXT>\n\n"
+        "<PROPOSAL_THREAD_CONTEXT>\n"
+        f"{_format_proposal_thread_context(item)}\n"
+        "</PROPOSAL_THREAD_CONTEXT>\n\n"
         "<ACTIVE_PROPOSAL_ITEM>\n"
         f"Action: {item.action_type}\n"
         f"Summary: {item.summary}\n"
@@ -460,6 +538,62 @@ def _rollback_latest_chat_turn(context: ContextTypes.DEFAULT_TYPE, user_text: st
         chat_history.pop()
 
 
+def _format_unresolved_proposal_prompt(item: ProposalItemRecord, prefix_text: str = "") -> str:
+    """
+    Builds the user-facing prompt for a recoverable but not-yet-confirmable item.
+
+    These items stay in the proposal thread as IN_REVISION drafts. They need more
+    user detail before we can safely present confirm/reject calendar controls.
+    """
+    start_text = item.start_time
+    end_text = item.end_time
+    try:
+        start_text = format_user_datetime(parse_user_datetime(item.start_time))
+        end_text = format_user_datetime(parse_user_datetime(item.end_time))
+    except Exception:
+        logger.debug("Using raw proposal times for unresolved item {}.", item.id)
+
+    validation_note = (
+        f"\n\nIssue: {item.last_feedback}"
+        if item.last_feedback
+        else ""
+    )
+    prompt = (
+        f"📝 *Needs clarification:*\n"
+        f"*{item.summary}*\n"
+        f"_{item.description}_\n\n"
+        f"Action: {item.action_type}\n"
+        f"Calendar ID: `{item.calendar_id}`\n"
+        f"Draft Start: {start_text}\n"
+        f"Draft End: {end_text}"
+        f"{validation_note}\n\n"
+        "Please send the event title and/or start time so I can update this proposal."
+    )
+    return f"{prefix_text}\n\n{prompt}".strip() if prefix_text else prompt
+
+
+async def _send_proposal_item_clarification(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    item: ProposalItemRecord,
+    *,
+    prefix_text: str = "",
+) -> str:
+    """
+    Presents an unresolved proposal item and tracks it for the next text reply.
+
+    Unlike confirmation UI, this message has no inline buttons because the item
+    is not safe to accept until calendar validation succeeds.
+    """
+    message = await context.bot.send_message(
+        chat_id=chat_id,
+        text=_format_unresolved_proposal_prompt(item, prefix_text=prefix_text),
+        parse_mode="Markdown",
+    )
+    track_confirmation_message(context, item.id, message.message_id)
+    return item.id
+
+
 async def _revise_active_proposal_item(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -492,31 +626,41 @@ async def _revise_active_proposal_item(
     mark_proposal_item_in_revision(item_id, feedback=feedback)
     untrack_confirmation_message(context, item_id)
 
-    revision_request = _format_revision_request(item, feedback)
+    if "cached_events" not in context.user_data:
+        context.user_data["cached_events"] = await asyncio.to_thread(get_upcoming_events)
+
+    revision_request = _format_revision_request(context, item, feedback)
     response = await process_message(revision_request, context)
     revised_action = _extract_revised_calendar_action(response)
 
     if revised_action is None:
-        await context.bot.send_message(chat_id=chat_id, text=response.message)
+        message = await context.bot.send_message(chat_id=chat_id, text=response.message)
+        track_confirmation_message(context, item_id, message.message_id)
         return True
 
     try:
         normalized_action = await _normalize_calendar_action(context, revised_action)
     except ValueError as error:
         _rollback_latest_chat_turn(context, revision_request)
-        restored_item = revise_proposal_item(
+        updated_item = revise_proposal_item(
             item_id,
-            _proposal_event_from_item(item),
+            revised_action,
             feedback=feedback,
         )
-        await context.bot.send_message(chat_id=chat_id, text=str(error))
-        if restored_item is not None:
-            await _send_proposal_item_confirmation(
+        unresolved_item = (
+            mark_proposal_item_in_revision(item_id, feedback=str(error))
+            if updated_item is not None
+            else None
+        )
+        if unresolved_item is not None:
+            await _send_proposal_item_clarification(
                 context,
                 chat_id,
-                restored_item,
-                prefix_text="I kept the previous proposal active because the revision could not be matched.",
+                unresolved_item,
+                prefix_text="I still need more detail before I can confirm this calendar change.",
             )
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=str(error))
         return True
 
     revised_item = revise_proposal_item(
@@ -558,6 +702,15 @@ async def _advance_proposal_thread_after_item_resolution(
     next_item = activate_next_proposal_item(item.thread_id)
     if next_item is None:
         return False
+
+    if next_item.status == ProposalItemStatus.IN_REVISION:
+        await _send_proposal_item_clarification(
+            context,
+            chat_id,
+            next_item,
+            prefix_text=f"{outcome_text}. I need one clarification before the next related proposal.",
+        )
+        return True
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -624,24 +777,19 @@ async def send_proposal_thread(
     if not proposal_thread.proposed_events:
         return None
 
-    normalized_actions: list[ProposedEvent] = []
-    validation_errors: list[str] = []
+    proposal_actions: list[tuple[ProposedEvent, ProposalItemStatus, str | None]] = []
     first_display_name: str | None = None
     for index, action in enumerate(proposal_thread.proposed_events):
         # Validate every model-proposed calendar action before creating durable
-        # thread state, so failed event matching cannot leave empty active threads.
+        # thread state, but keep failed actions as recoverable drafts in sequence.
         try:
             normalized_action = await _normalize_calendar_action(context, action)
         except ValueError as error:
-            validation_errors.append(f"{action.summary}: {error}")
+            proposal_actions.append((action, ProposalItemStatus.IN_REVISION, str(error)))
             continue
         if first_display_name is None:
             first_display_name = normalized_action.calendar_display_name
-        normalized_actions.append(normalized_action)
-
-    if not normalized_actions:
-        error_text = validation_errors[0] if validation_errors else "No calendar proposals could be validated."
-        raise ValueError(error_text)
+        proposal_actions.append((normalized_action, ProposalItemStatus.QUEUED, None))
 
     thread = create_proposal_thread(
         source_type=source_type,
@@ -649,29 +797,27 @@ async def send_proposal_thread(
         title=proposal_thread.title,
     )
 
-    for index, normalized_action in enumerate(normalized_actions):
-        # Store only actions that have already passed deterministic validation.
-        # The proposal thread stays durable, but bad drafts never enter the queue.
-        add_proposal_item(
+    for index, (action, status, validation_error) in enumerate(proposal_actions):
+        item = add_proposal_item(
             thread.id,
-            normalized_action,
+            action,
             sequence_index=index,
-            status=ProposalItemStatus.QUEUED,
+            status=status,
         )
+        if validation_error:
+            mark_proposal_item_in_revision(item.id, feedback=validation_error)
 
     item = activate_next_proposal_item(thread.id)
     if item is None:
         raise RuntimeError("Failed to activate the first item in the proposal thread.")
 
-    if validation_errors:
-        # Preserve valid proposals from the same model turn while making the
-        # skipped ambiguous actions visible to the user for follow-up.
-        skipped_text = (
-            "I skipped "
-            f"{len(validation_errors)} calendar proposal(s) that could not be matched:\n"
-            + "\n".join(f"- {error}" for error in validation_errors)
+    if item.status == ProposalItemStatus.IN_REVISION:
+        return await _send_proposal_item_clarification(
+            context,
+            chat_id,
+            item,
+            prefix_text=prefix_text,
         )
-        prefix_text = f"{prefix_text}\n\n{skipped_text}" if prefix_text else skipped_text
 
     return await _send_proposal_item_confirmation(
         context,

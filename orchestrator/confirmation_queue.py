@@ -200,10 +200,11 @@ def add_proposal_item(
 
 def activate_next_proposal_item(thread_id: str) -> Optional[ProposalItemRecord]:
     """
-    Activates the next queued proposal item in a thread.
+    Activates the next actionable proposal item in a thread.
 
-    When no queued items remain, the thread is marked completed. The loop is
-    explicit so accepted/rejected/expired items are skipped after restarts.
+    Items are handled in their original sequence. A queued item becomes
+    confirmable, while an in-revision item blocks later proposals until user
+    clarification repairs or rejects it.
     """
     thread = get_proposal_thread(thread_id)
     if not thread or thread.status != ProposalThreadStatus.ACTIVE:
@@ -213,6 +214,11 @@ def activate_next_proposal_item(thread_id: str) -> Optional[ProposalItemRecord]:
         if item.status == ProposalItemStatus.QUEUED:
             item.status = ProposalItemStatus.ACTIVE
             _update_proposal_item(item)
+            thread.active_item_id = item.id
+            _update_proposal_thread(thread)
+            return item
+
+        if item.status == ProposalItemStatus.IN_REVISION:
             thread.active_item_id = item.id
             _update_proposal_thread(thread)
             return item
