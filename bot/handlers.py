@@ -435,6 +435,31 @@ def _proposal_event_from_item(item: ProposalItemRecord) -> ProposedEvent:
     )
 
 
+def _rollback_latest_chat_turn(context: ContextTypes.DEFAULT_TYPE, user_text: str) -> None:
+    """
+    Removes the most recent model turn when downstream validation rejects it.
+
+    The router appends chat history before the Telegram handler validates and
+    displays calendar proposals. If validation fails afterward, this rollback
+    keeps short-term memory from treating an undelivered proposal as real context.
+    """
+    chat_history = context.user_data.get("chat_history")
+    if not isinstance(chat_history, list) or len(chat_history) < 2:
+        return
+
+    latest_user_turn = chat_history[-2]
+    latest_assistant_turn = chat_history[-1]
+    if (
+        latest_user_turn.get("role") == "user"
+        and latest_user_turn.get("content") == user_text
+        and latest_assistant_turn.get("role") == "assistant"
+    ):
+        # Remove the paired user/assistant entries for only this failed turn;
+        # older session context remains intact for the next normal message.
+        chat_history.pop()
+        chat_history.pop()
+
+
 async def _revise_active_proposal_item(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -478,6 +503,7 @@ async def _revise_active_proposal_item(
     try:
         normalized_action = await _normalize_calendar_action(context, revised_action)
     except ValueError as error:
+        _rollback_latest_chat_turn(context, revision_request)
         restored_item = revise_proposal_item(
             item_id,
             _proposal_event_from_item(item),
@@ -599,14 +625,23 @@ async def send_proposal_thread(
         return None
 
     normalized_actions: list[ProposedEvent] = []
+    validation_errors: list[str] = []
     first_display_name: str | None = None
     for index, action in enumerate(proposal_thread.proposed_events):
         # Validate every model-proposed calendar action before creating durable
         # thread state, so failed event matching cannot leave empty active threads.
-        normalized_action = await _normalize_calendar_action(context, action)
-        if index == 0:
+        try:
+            normalized_action = await _normalize_calendar_action(context, action)
+        except ValueError as error:
+            validation_errors.append(f"{action.summary}: {error}")
+            continue
+        if first_display_name is None:
             first_display_name = normalized_action.calendar_display_name
         normalized_actions.append(normalized_action)
+
+    if not normalized_actions:
+        error_text = validation_errors[0] if validation_errors else "No calendar proposals could be validated."
+        raise ValueError(error_text)
 
     thread = create_proposal_thread(
         source_type=source_type,
@@ -627,6 +662,16 @@ async def send_proposal_thread(
     item = activate_next_proposal_item(thread.id)
     if item is None:
         raise RuntimeError("Failed to activate the first item in the proposal thread.")
+
+    if validation_errors:
+        # Preserve valid proposals from the same model turn while making the
+        # skipped ambiguous actions visible to the user for follow-up.
+        skipped_text = (
+            "I skipped "
+            f"{len(validation_errors)} calendar proposal(s) that could not be matched:\n"
+            + "\n".join(f"- {error}" for error in validation_errors)
+        )
+        prefix_text = f"{prefix_text}\n\n{skipped_text}" if prefix_text else skipped_text
 
     return await _send_proposal_item_confirmation(
         context,
@@ -1244,6 +1289,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(response.message)
     except ValueError as e:
         logger.error(f"Calendar proposal validation error: {e}")
+        _rollback_latest_chat_turn(context, text)
         await update.message.reply_text(str(e))
     except Exception as e:
         logger.error(f"Error handling message: {e}")

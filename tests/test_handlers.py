@@ -11,6 +11,7 @@ from bot.handlers import (
     handle_confirm_weekly_state,
     handle_reject_weekly_state,
     send_calendar_proposal,
+    send_proposal_thread,
     test_schedule as handler_test_schedule,
 )
 from orchestrator.session_manager import (
@@ -206,6 +207,168 @@ async def test_handle_message_revises_active_proposal_item_in_place(
     assert mock_process_message.await_args.args[0].startswith("Revise the active calendar proposal")
     mock_revise_proposal_item.assert_called_once()
     mock_send_confirmation.assert_awaited_once()
+    update.message.reply_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers._normalize_calendar_action', new_callable=AsyncMock)
+@patch('bot.handlers.add_proposal_item')
+@patch('bot.handlers.create_proposal_thread')
+async def test_send_proposal_thread_does_not_create_thread_when_validation_fails(
+    mock_create_proposal_thread,
+    mock_add_proposal_item,
+    mock_normalize_calendar_action,
+):
+    mock_normalize_calendar_action.side_effect = ValueError(
+        "I couldn't identify a single calendar event to cancel."
+    )
+    context = MagicMock()
+    context.user_data = {"current_session_id": "sess_123"}
+
+    proposal_thread = ProposalThreadDraft(
+        title="Cancel ambiguous event",
+        rationale="The user referred to an event without enough detail.",
+        proposed_events=[
+            ProposedEvent(
+                action_type="cancel",
+                summary="This event",
+                start_time="2026-03-31T09:00:00-04:00",
+                end_time="2026-03-31T10:00:00-04:00",
+                description="Ambiguous cancellation request.",
+            ),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="single calendar event"):
+        await send_proposal_thread(
+            context,
+            456,
+            proposal_thread,
+            prefix_text="I found a possible cancellation.",
+        )
+
+    # Validation must happen before persistence so a failed calendar match cannot
+    # leave an empty active proposal thread behind.
+    mock_normalize_calendar_action.assert_awaited_once()
+    mock_create_proposal_thread.assert_not_called()
+    mock_add_proposal_item.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers.get_pending_write')
+@patch('bot.handlers.get_proposal_item')
+@patch('bot.handlers.start_session')
+@patch('bot.handlers.process_message', new_callable=AsyncMock)
+async def test_handle_message_untracks_stale_proposal_and_routes_normally(
+    mock_process_message,
+    mock_start_session,
+    mock_get_proposal_item,
+    mock_get_pending_write,
+):
+    update = MagicMock()
+    update.effective_chat.id = 456
+    update.effective_user.id = 123
+    update.message.text = "Can you help me think through today instead?"
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {
+        "pending_confirmations": [("pi_stale", 999)],
+        "session_state": "IDLE",
+    }
+    context.bot_data = {"allowed_user_id": 123}
+    context.job_queue.get_jobs_by_name.return_value = ()
+
+    mock_get_proposal_item.return_value = None
+    mock_get_pending_write.return_value = None
+    mock_process_message.return_value = FlashResponse(message="Of course.")
+
+    await handle_message(update, context)
+
+    # A stale proposal item should be cleaned up and then the user's text should
+    # continue into normal routing instead of being swallowed as proposal feedback.
+    assert context.user_data["pending_confirmations"] == []
+    mock_process_message.assert_awaited_once_with(
+        "Can you help me think through today instead?",
+        context,
+    )
+    update.message.reply_text.assert_awaited_once_with("Of course.")
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers._send_proposal_item_confirmation', new_callable=AsyncMock)
+@patch('bot.handlers._normalize_calendar_action', new_callable=AsyncMock)
+@patch('bot.handlers.revise_proposal_item')
+@patch('bot.handlers.mark_proposal_item_in_revision')
+@patch('bot.handlers.get_proposal_item')
+@patch('bot.handlers.process_message', new_callable=AsyncMock)
+async def test_handle_message_restores_proposal_when_revision_validation_fails(
+    mock_process_message,
+    mock_get_proposal_item,
+    mock_mark_in_revision,
+    mock_revise_proposal_item,
+    mock_normalize_calendar_action,
+    mock_send_confirmation,
+):
+    update = MagicMock()
+    update.effective_chat.id = 456
+    update.effective_user.id = 123
+    update.message.text = "Cancel this event instead"
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {
+        "pending_confirmations": [("pi_123", 999)],
+        "session_state": "ACTIVE",
+    }
+    context.bot_data = {"allowed_user_id": 123}
+    context.bot.edit_message_text = AsyncMock()
+    context.bot.send_message = AsyncMock()
+
+    original_item = make_proposal_item()
+    mock_get_proposal_item.return_value = original_item
+    mock_process_message.return_value = FlashResponse(
+        message="I found a cancellation to propose.",
+        calendar_planning_mode="propose",
+        proposal_thread=ProposalThreadDraft(
+            title="Cancel event",
+            rationale="The user asked to revise the active proposal.",
+            proposed_events=[
+                ProposedEvent(
+                    action_type="cancel",
+                    summary="This event",
+                    start_time="2026-03-31T09:00:00-04:00",
+                    end_time="2026-03-31T10:00:00-04:00",
+                    description="Ambiguous cancellation request.",
+                ),
+            ],
+        ),
+    )
+    mock_normalize_calendar_action.side_effect = ValueError(
+        "I couldn't identify a single calendar event to cancel."
+    )
+    restored_item = make_proposal_item()
+    mock_revise_proposal_item.return_value = restored_item
+
+    await handle_message(update, context)
+
+    mock_mark_in_revision.assert_called_once_with(
+        "pi_123",
+        feedback="Cancel this event instead",
+    )
+    mock_revise_proposal_item.assert_called_once()
+    restored_action = mock_revise_proposal_item.call_args.args[1]
+    assert restored_action.summary == original_item.summary
+    context.bot.send_message.assert_awaited_once_with(
+        chat_id=456,
+        text="I couldn't identify a single calendar event to cancel.",
+    )
+    mock_send_confirmation.assert_awaited_once_with(
+        context,
+        456,
+        restored_item,
+        prefix_text="I kept the previous proposal active because the revision could not be matched.",
+    )
     update.message.reply_text.assert_not_awaited()
 
 
