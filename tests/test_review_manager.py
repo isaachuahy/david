@@ -12,6 +12,7 @@ from orchestrator.review_manager import (
     run_scheduling_pass_stage,
     run_week_review_stage,
     run_weekly_plan_stage,
+    revise_review_stage,
     start_weekly_review_workflow,
 )
 from persistence.models import (
@@ -19,6 +20,7 @@ from persistence.models import (
     ReviewStage,
     ReviewWorkflowRecord,
     ReviewWorkflowStatus,
+    SchedulingPassArtifact,
     SourceSnapshot,
     StageCheckpoint,
     StageStatus,
@@ -444,6 +446,90 @@ async def test_run_scheduling_pass_stage_requires_reviewed_weekly_plan():
     record.weekly_plan = StageCheckpoint(summary="Weekly plan exists.")
     with pytest.raises(ValueError, match="proposed weekly state is available"):
         await run_scheduling_pass_stage(record)
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
+async def test_revise_review_stage_regenerates_stage_and_clears_downstream_outputs(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """
+    Tests that revising an early review stage invalidates stale downstream work.
+
+    This protects the staged Sunday review from context rot: if the factual week
+    review changes, later audit, plan, scheduling, and final-review artifacts can
+    no longer be treated as trustworthy.
+    """
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.WEEK_REVIEW,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+            decision_log_markdown="# Decision Log",
+            past_week_events=["[2026-04-27T09:00:00-04:00] Deep Work"],
+        ),
+        week_review=StageCheckpoint(summary="The original week review missed one event."),
+        goals_audit=StageCheckpoint(summary="Stale goals audit."),
+        memory_audit=StageCheckpoint(summary="Stale memory audit."),
+        weekly_plan=StageCheckpoint(summary="Stale weekly plan."),
+        scheduling_pass=StageCheckpoint(summary="Stale scheduling pass."),
+        final_review=StageCheckpoint(summary="Stale final review."),
+        weekly_state_changes=ArtifactChangeSummary(
+            modifications=["Stale weekly-state change."],
+            proposed_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+        ),
+        scheduling_proposals=SchedulingPassArtifact(
+            proposed_events=[
+                {
+                    "summary": "Stale Event",
+                    "start_time": "2026-05-01T09:00:00-04:00",
+                    "end_time": "2026-05-01T10:00:00-04:00",
+                    "description": "No longer trustworthy.",
+                }
+            ],
+            scheduling_rationale="Stale rationale.",
+        ),
+    )
+    mock_generate_review_structured.return_value = WeekReviewResponse(
+        summary="The revised week review includes the missing dentist appointment.",
+        key_findings=["A missed appointment changed the factual week review."],
+        constraints=[],
+        carry_forward=["Account for the appointment in later stages."],
+    )
+
+    updated_record = await revise_review_stage(
+        record,
+        stage=ReviewStage.WEEK_REVIEW,
+        feedback="The week review missed the dentist appointment.",
+    )
+
+    assert updated_record.week_review is not None
+    assert updated_record.week_review.summary == (
+        "The revised week review includes the missing dentist appointment."
+    )
+    assert updated_record.goals_audit is None
+    assert updated_record.memory_audit is None
+    assert updated_record.weekly_plan is None
+    assert updated_record.scheduling_pass is None
+    assert updated_record.final_review is None
+    assert updated_record.weekly_state_changes is None
+    assert updated_record.scheduling_proposals is None
+    assert updated_record.feedback_history == [
+        "week_review: The week review missed the dentist appointment.",
+    ]
+    assert updated_record.workflow_status == ReviewWorkflowStatus.AWAITING_FEEDBACK
+    assert updated_record.current_stage == ReviewStage.WEEK_REVIEW
+    assert updated_record.stage_status == StageStatus.AWAITING_FEEDBACK
+    assert updated_record.last_completed_stage == ReviewStage.WEEK_REVIEW
+    assert "dentist appointment" in mock_generate_review_structured.call_args.kwargs["prompt"]
+    assert mock_save_review_workflow_sync.call_count >= 3
 
 
 @pytest.mark.asyncio

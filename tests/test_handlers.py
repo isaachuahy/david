@@ -1004,11 +1004,13 @@ async def test_handle_confirm_review_stage_advances_to_next_stage_confirmation(
 
 
 @pytest.mark.asyncio
-@patch('bot.handlers.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.handlers.send_review_stage_confirmation', new_callable=AsyncMock)
+@patch('bot.handlers.revise_review_stage', new_callable=AsyncMock)
 @patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
-async def test_handle_message_marks_active_review_stage_in_revision(
+async def test_handle_message_revises_active_review_stage(
     mock_load_review_workflow,
-    mock_transition_review_stage,
+    mock_revise_review_stage,
+    mock_send_review_stage_confirmation,
 ):
     update = MagicMock()
     update.effective_chat.id = 456
@@ -1036,22 +1038,37 @@ async def test_handle_message_marks_active_review_stage_in_revision(
             decision_log_markdown="# Decision Log",
         ),
     )
+    revised_record = record.model_copy(
+        update={
+            "workflow_status": ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            "current_stage": ReviewStage.WEEK_REVIEW,
+            "stage_status": StageStatus.AWAITING_FEEDBACK,
+            "week_review": StageCheckpoint(summary="Revised week review."),
+        }
+    )
     mock_load_review_workflow.return_value = record
+    mock_revise_review_stage.return_value = revised_record
 
     await handle_message(update, context)
 
-    assert record.feedback_history == [
-        "week_review: The week review missed the dentist appointment.",
-    ]
-    mock_transition_review_stage.assert_awaited_once_with(
+    mock_revise_review_stage.assert_awaited_once_with(
         record,
         stage=ReviewStage.WEEK_REVIEW,
-        stage_status=StageStatus.IN_REVISION,
+        feedback="The week review missed the dentist appointment.",
     )
-    assert "active_review_stage_confirmation" not in context.user_data
+    assert context.user_data["active_review_stage_confirmation"] == {
+        "review_id": "review_test",
+        "stage": "week_review",
+    }
     update.message.reply_text.assert_awaited_once_with(
-        "📝 *Revision noted for this review stage.* I’ll keep the Sunday review paused here until the revision loop is wired in.",
+        "📝 *Revision applied.*",
         parse_mode="Markdown",
+    )
+    mock_send_review_stage_confirmation.assert_awaited_once_with(
+        context,
+        456,
+        revised_record,
+        ReviewStage.WEEK_REVIEW,
     )
 
 

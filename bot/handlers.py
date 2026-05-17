@@ -34,6 +34,7 @@ from orchestrator.review_manager import (
     complete_review_after_event_feedback,
     execute_weekly_state_update,
     load_review_workflow,
+    revise_review_stage,
     start_weekly_review_workflow,
     transition_review_stage,
 )
@@ -257,30 +258,33 @@ async def send_weekly_plan_confirmation(
     )
 
 
-async def mark_review_stage_in_revision(
+async def revise_active_review_stage(
     context: ContextTypes.DEFAULT_TYPE,
     review_id: str,
     stage: ReviewStage,
     feedback: str,
-) -> bool:
+) -> object | None:
     """
-    Stores review-stage feedback and marks the stage for future revision.
+    Revises the active Sunday review stage from user feedback.
 
-    This records the user correction without attempting a stage-specific model
-    revision yet, keeping the confirmation gate durable across restarts.
+    The review manager owns stage-specific regeneration. The handler only keeps
+    the Telegram confirmation pointer active so the revised stage can be shown
+    again and iterated until the user confirms it.
     """
     record = await load_review_workflow(review_id)
     if record is None:
-        return False
+        return None
 
-    record.feedback_history.append(f"{stage.value}: {feedback}")
-    await transition_review_stage(
+    revised_record = await revise_review_stage(
         record,
         stage=stage,
-        stage_status=StageStatus.IN_REVISION,
+        feedback=feedback,
     )
-    context.user_data.pop(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY, None)
-    return True
+    context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = {
+        "review_id": revised_record.id,
+        "stage": stage.value,
+    }
+    return revised_record
 
 
 async def _send_proposal_item_confirmation(
@@ -1117,17 +1121,21 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if isinstance(active_confirmation, dict)
             else context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
         )
-        marked = await mark_review_stage_in_revision(
-            context,
-            review_id,
-            stage,
-            "User requested revision from the review-stage confirmation button.",
-        ) if review_id else False
-        if not marked:
+        record = await load_review_workflow(review_id) if review_id else None
+        if record is None:
             await query.edit_message_text("❌ *This review stage is no longer available.*", parse_mode="Markdown")
             return
+        await transition_review_stage(
+            record,
+            stage=stage,
+            stage_status=StageStatus.IN_REVISION,
+        )
+        context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = {
+            "review_id": record.id,
+            "stage": stage.value,
+        }
         await query.edit_message_text(
-            "📝 *Revision noted.* Send the correction you want me to apply to this review stage.",
+            "📝 *Revision requested.* Send the correction you want me to apply to this review stage.",
             parse_mode="Markdown",
         )
         return
@@ -1356,17 +1364,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         review_id = active_stage_confirmation.get("review_id")
         stage_value = active_stage_confirmation.get("stage")
         if review_id and stage_value:
-            marked = await mark_review_stage_in_revision(
+            revised_record = await revise_active_review_stage(
                 context,
                 review_id,
                 ReviewStage(stage_value),
                 update.message.text,
             )
-            if marked:
-                await update.message.reply_text(
-                    "📝 *Revision noted for this review stage.* I’ll keep the Sunday review paused here until the revision loop is wired in.",
-                    parse_mode="Markdown",
-                )
+            if revised_record:
+                await update.message.reply_text("📝 *Revision applied.*", parse_mode="Markdown")
+                if revised_record.current_stage == ReviewStage.WEEKLY_PLAN:
+                    await send_weekly_plan_confirmation(
+                        context,
+                        update.effective_chat.id,
+                        revised_record,
+                    )
+                else:
+                    await send_review_stage_confirmation(
+                        context,
+                        update.effective_chat.id,
+                        revised_record,
+                        ReviewStage(stage_value),
+                    )
                 return
 
     # Check if a text message was sent while a proposal is waiting for confirmation.

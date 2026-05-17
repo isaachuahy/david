@@ -52,6 +52,14 @@ _REVIEW_STAGE_FIELD_BY_STAGE = {
     ReviewStage.SCHEDULING_PASS: "scheduling_pass",
     ReviewStage.FINAL_REVIEW: "final_review",
 }
+_REVIEW_STAGE_INVALIDATION_ORDER = [
+    ReviewStage.WEEK_REVIEW,
+    ReviewStage.GOALS_AUDIT,
+    ReviewStage.MEMORY_AUDIT,
+    ReviewStage.WEEKLY_PLAN,
+    ReviewStage.SCHEDULING_PASS,
+    ReviewStage.FINAL_REVIEW,
+]
 
 _WEEKLY_STATE_REQUIRED_MARKERS = (
     "# Weekly State",
@@ -127,6 +135,82 @@ def _format_checkpoint_for_prompt(checkpoint: StageCheckpoint) -> str:
         lines.append("Carry forward:")
         lines.extend(f"- {item}" for item in checkpoint.carry_forward)
     return "\n".join(lines)
+
+
+def _get_review_stage_checkpoint(
+    record: ReviewWorkflowRecord,
+    stage: ReviewStage,
+) -> Optional[StageCheckpoint]:
+    """Returns the persisted checkpoint for a review stage, if one exists."""
+    return getattr(record, _REVIEW_STAGE_FIELD_BY_STAGE[stage])
+
+
+def _format_revision_prompt_context(
+    record: ReviewWorkflowRecord,
+    stage: ReviewStage,
+    feedback: str,
+) -> str:
+    """
+    Builds the small revision-only context appended to a normal stage prompt.
+
+    The base prompt still owns the task and schema. This appendix only tells the
+    model what the user corrected and what previous output should be revised,
+    which keeps revision behavior general without duplicating every stage prompt.
+    """
+    lines = [
+        "",
+        "---",
+        "Revision context:",
+        f"- Stage being revised: {stage.value}",
+        f"- User feedback to incorporate: {feedback.strip()}",
+    ]
+
+    previous_checkpoint = _get_review_stage_checkpoint(record, stage)
+    if previous_checkpoint is not None:
+        lines.append("")
+        lines.append("Previous stage output to revise:")
+        lines.append(_format_checkpoint_for_prompt(previous_checkpoint))
+
+    if stage == ReviewStage.WEEKLY_PLAN and record.weekly_state_changes:
+        lines.append("")
+        lines.append("Previous weekly-state change summary:")
+        lines.extend(f"- {item}" for item in record.weekly_state_changes.modifications)
+        if record.weekly_state_changes.proposed_markdown:
+            lines.append("")
+            lines.append("Previous proposed weekly_state.md to revise:")
+            lines.append(record.weekly_state_changes.proposed_markdown)
+
+    if stage == ReviewStage.SCHEDULING_PASS and record.scheduling_proposals:
+        lines.append("")
+        lines.append("Previous scheduling rationale:")
+        lines.append(record.scheduling_proposals.scheduling_rationale or "No rationale recorded.")
+        if record.scheduling_proposals.proposed_events:
+            lines.append("")
+            lines.append("Previous scheduling proposal summaries:")
+            for event in record.scheduling_proposals.proposed_events:
+                summary = str(event.get("summary", "Untitled proposal"))
+                start_time = str(event.get("start_time", "unknown start"))
+                end_time = str(event.get("end_time", "unknown end"))
+                lines.append(f"- {summary}: {start_time} to {end_time}")
+
+    lines.append("")
+    lines.append(
+        "Revise this stage only. Use the latest feedback as authoritative and do not infer extra changes."
+    )
+    return "\n".join(lines)
+
+
+def _with_revision_context(
+    prompt: str,
+    *,
+    record: ReviewWorkflowRecord,
+    stage: ReviewStage,
+    revision_feedback: Optional[str],
+) -> str:
+    """Appends revision instructions only when a stage is being regenerated."""
+    if not revision_feedback:
+        return prompt
+    return prompt + _format_revision_prompt_context(record, stage, revision_feedback)
 
 
 def _render_review_prompt(filename: str, **values: str) -> str:
@@ -598,25 +682,39 @@ async def save_stage_checkpoint(
     return await save_review_workflow(record)
 
 
-async def run_week_review_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowRecord:
+async def run_week_review_stage(
+    record: ReviewWorkflowRecord,
+    *,
+    revision_feedback: Optional[str] = None,
+) -> ReviewWorkflowRecord:
     """
     Runs and checkpoints the week-review stage from the frozen source snapshot.
 
     This is the first staged review step. It persists a compact checkpoint that
     downstream stages use without rereading a drifting weekly context.
     """
-    prompt = _render_week_review_prompt(record.source_snapshot)
+    prompt = _with_revision_context(
+        _render_week_review_prompt(record.source_snapshot),
+        record=record,
+        stage=ReviewStage.WEEK_REVIEW,
+        revision_feedback=revision_feedback,
+    )
+    operation = "week_review_revision" if revision_feedback else "week_review"
 
     return await _run_checkpoint_stage(
         record=record,
         stage=ReviewStage.WEEK_REVIEW,
         prompt=prompt,
         response_schema=WeekReviewResponse,
-        operation="week_review",
+        operation=operation,
     )
 
 
-async def run_goals_audit_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowRecord:
+async def run_goals_audit_stage(
+    record: ReviewWorkflowRecord,
+    *,
+    revision_feedback: Optional[str] = None,
+) -> ReviewWorkflowRecord:
     """
     Runs and checkpoints the goals-audit stage using the completed week review.
 
@@ -624,36 +722,56 @@ async def run_goals_audit_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowR
     later workflow steps can use its checkpoint when planning or asking for
     explicit confirmation.
     """
-    prompt = _render_goals_audit_prompt(record)
+    prompt = _with_revision_context(
+        _render_goals_audit_prompt(record),
+        record=record,
+        stage=ReviewStage.GOALS_AUDIT,
+        revision_feedback=revision_feedback,
+    )
+    operation = "goals_audit_revision" if revision_feedback else "goals_audit"
 
     return await _run_checkpoint_stage(
         record=record,
         stage=ReviewStage.GOALS_AUDIT,
         prompt=prompt,
         response_schema=GoalsAuditResponse,
-        operation="goals_audit",
+        operation=operation,
     )
 
 
-async def run_memory_audit_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowRecord:
+async def run_memory_audit_stage(
+    record: ReviewWorkflowRecord,
+    *,
+    revision_feedback: Optional[str] = None,
+) -> ReviewWorkflowRecord:
     """
     Runs and checkpoints the memory-audit stage using prior review evidence.
 
     This stage surfaces memory quality and compaction signals while leaving
     concrete decision-log edits for a later user-facing artifact step.
     """
-    prompt = _render_memory_audit_prompt(record)
+    prompt = _with_revision_context(
+        _render_memory_audit_prompt(record),
+        record=record,
+        stage=ReviewStage.MEMORY_AUDIT,
+        revision_feedback=revision_feedback,
+    )
+    operation = "memory_audit_revision" if revision_feedback else "memory_audit"
 
     return await _run_checkpoint_stage(
         record=record,
         stage=ReviewStage.MEMORY_AUDIT,
         prompt=prompt,
         response_schema=MemoryAuditResponse,
-        operation="memory_audit",
+        operation=operation,
     )
 
 
-async def run_weekly_plan_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowRecord:
+async def run_weekly_plan_stage(
+    record: ReviewWorkflowRecord,
+    *,
+    revision_feedback: Optional[str] = None,
+) -> ReviewWorkflowRecord:
     """
     Runs the weekly-plan stage and stores the proposed weekly-state artifact.
 
@@ -661,8 +779,14 @@ async def run_weekly_plan_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowR
     the full proposed markdown that can later be shown to the user or written
     after confirmation.
     """
-    prompt = _render_weekly_plan_prompt(record)
+    prompt = _with_revision_context(
+        _render_weekly_plan_prompt(record),
+        record=record,
+        stage=ReviewStage.WEEKLY_PLAN,
+        revision_feedback=revision_feedback,
+    )
     model = _select_review_model(ReviewStage.WEEKLY_PLAN, context_chars=len(prompt))
+    operation = "weekly_plan_revision" if revision_feedback else "weekly_plan"
 
     try:
         response = await asyncio.to_thread(
@@ -670,19 +794,20 @@ async def run_weekly_plan_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowR
             prompt=prompt,
             response_schema=WeeklyPlanResponse,
             model=model,
-            operation="weekly_plan",
+            operation=operation,
         )
     except Exception:
         if model == GEMINI_PRO_MODEL:
             raise
 
-        logger.warning("Retrying weekly_plan with {} after {} failed.", GEMINI_PRO_MODEL, model)
+        retry_operation = f"{operation}_retry"
+        logger.warning("Retrying {} with {} after {} failed.", operation, GEMINI_PRO_MODEL, model)
         response = await asyncio.to_thread(
             _generate_review_structured,
             prompt=prompt,
             response_schema=WeeklyPlanResponse,
             model=GEMINI_PRO_MODEL,
-            operation="weekly_plan_retry",
+            operation=retry_operation,
         )
 
     validate_weekly_state_markdown(response.weekly_state_content)
@@ -696,15 +821,25 @@ async def run_weekly_plan_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowR
     return await save_review_workflow(record)
 
 
-async def run_scheduling_pass_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowRecord:
+async def run_scheduling_pass_stage(
+    record: ReviewWorkflowRecord,
+    *,
+    revision_feedback: Optional[str] = None,
+) -> ReviewWorkflowRecord:
     """
     Runs and checkpoints scheduling recommendations for the reviewed week.
 
     This stage stores the compact checkpoint plus the concrete proposal artifact
     that handlers later validate into proposal threads for user confirmation.
     """
-    prompt = _render_scheduling_pass_prompt(record)
+    prompt = _with_revision_context(
+        _render_scheduling_pass_prompt(record),
+        record=record,
+        stage=ReviewStage.SCHEDULING_PASS,
+        revision_feedback=revision_feedback,
+    )
     model = _select_review_model(ReviewStage.SCHEDULING_PASS, context_chars=len(prompt))
+    operation = "scheduling_pass_revision" if revision_feedback else "scheduling_pass"
 
     try:
         response = await asyncio.to_thread(
@@ -712,19 +847,20 @@ async def run_scheduling_pass_stage(record: ReviewWorkflowRecord) -> ReviewWorkf
             prompt=prompt,
             response_schema=SchedulingPassResponse,
             model=model,
-            operation="scheduling_pass",
+            operation=operation,
         )
     except Exception:
         if model == GEMINI_PRO_MODEL:
             raise
 
-        logger.warning("Retrying scheduling_pass with {} after {} failed.", GEMINI_PRO_MODEL, model)
+        retry_operation = f"{operation}_retry"
+        logger.warning("Retrying {} with {} after {} failed.", operation, GEMINI_PRO_MODEL, model)
         response = await asyncio.to_thread(
             _generate_review_structured,
             prompt=prompt,
             response_schema=SchedulingPassResponse,
             model=GEMINI_PRO_MODEL,
-            operation="scheduling_pass_retry",
+            operation=retry_operation,
         )
 
     record.scheduling_pass = _response_to_stage_checkpoint(response)
@@ -736,6 +872,81 @@ async def run_scheduling_pass_stage(record: ReviewWorkflowRecord) -> ReviewWorkf
     )
     record.last_completed_stage = ReviewStage.SCHEDULING_PASS
     return await save_review_workflow(record)
+
+
+def _clear_outputs_after_stage(record: ReviewWorkflowRecord, stage: ReviewStage) -> None:
+    """
+    Removes downstream outputs that are no longer trustworthy after a revision.
+
+    A revised early-stage checkpoint can change the meaning of every later
+    stage. Clearing those fields before regeneration prevents stale weekly
+    plans, scheduling artifacts, or final-review summaries from surviving after
+    their evidence changed.
+    """
+    stage_index = _REVIEW_STAGE_INVALIDATION_ORDER.index(stage)
+
+    for downstream_stage in _REVIEW_STAGE_INVALIDATION_ORDER[stage_index + 1:]:
+        setattr(record, _REVIEW_STAGE_FIELD_BY_STAGE[downstream_stage], None)
+
+    if stage_index < _REVIEW_STAGE_INVALIDATION_ORDER.index(ReviewStage.GOALS_AUDIT):
+        record.goals_changes = None
+
+    if stage_index < _REVIEW_STAGE_INVALIDATION_ORDER.index(ReviewStage.MEMORY_AUDIT):
+        record.decision_log_changes = None
+
+    if stage_index < _REVIEW_STAGE_INVALIDATION_ORDER.index(ReviewStage.WEEKLY_PLAN):
+        record.weekly_state_changes = None
+
+    if stage_index < _REVIEW_STAGE_INVALIDATION_ORDER.index(ReviewStage.SCHEDULING_PASS):
+        record.scheduling_proposals = None
+
+
+async def revise_review_stage(
+    record: ReviewWorkflowRecord,
+    *,
+    stage: ReviewStage,
+    feedback: str,
+) -> ReviewWorkflowRecord:
+    """
+    Regenerates one Sunday-review stage from user feedback and prior context.
+
+    The workflow remains inside the same stage: feedback moves it into
+    IN_REVISION, the stage runner regenerates the checkpoint/artifact, and the
+    result is returned to AWAITING_FEEDBACK for another explicit user gate.
+    """
+    stripped_feedback = feedback.strip()
+    if not stripped_feedback:
+        raise ValueError("Review-stage revision feedback cannot be empty.")
+    if stage == ReviewStage.FINAL_REVIEW:
+        raise ValueError("Final review is assembled deterministically and cannot be LLM-revised.")
+
+    record.feedback_history.append(f"{stage.value}: {stripped_feedback}")
+    _clear_outputs_after_stage(record, stage)
+    record = await transition_review_stage(
+        record,
+        stage=stage,
+        stage_status=StageStatus.IN_REVISION,
+    )
+
+    if stage == ReviewStage.WEEK_REVIEW:
+        record = await run_week_review_stage(record, revision_feedback=stripped_feedback)
+    elif stage == ReviewStage.GOALS_AUDIT:
+        record = await run_goals_audit_stage(record, revision_feedback=stripped_feedback)
+    elif stage == ReviewStage.MEMORY_AUDIT:
+        record = await run_memory_audit_stage(record, revision_feedback=stripped_feedback)
+    elif stage == ReviewStage.WEEKLY_PLAN:
+        record = await run_weekly_plan_stage(record, revision_feedback=stripped_feedback)
+    elif stage == ReviewStage.SCHEDULING_PASS:
+        record = await run_scheduling_pass_stage(record, revision_feedback=stripped_feedback)
+    else:
+        raise ValueError(f"Unsupported review-stage revision: {stage.value}.")
+
+    return await transition_review_stage(
+        record,
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        stage=stage,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+    )
 
 
 def _merge_unique(items: Iterable[str]) -> list[str]:
