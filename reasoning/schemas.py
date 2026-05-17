@@ -164,7 +164,7 @@ class MemoryAuditResponse(BaseModel):
     LLM-facing schema for the memory audit stage of the Sunday review workflow.
 
     This response captures memory-quality findings for the orchestrator to store
-    as a durable checkpoint before later stages propose concrete artifact edits.
+    as a durable checkpoint and compact proposed decision-log edits.
     """
 
     summary: str = Field(
@@ -193,6 +193,27 @@ class MemoryAuditResponse(BaseModel):
         description=(
             "Memory edits, compaction candidates, or reconfirmation questions "
             "that should be considered by weekly planning or final review."
+        ),
+    )
+    decision_log_additions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Compact durable memory entries that should be added to decision_log.md "
+            "if confirmed by the user."
+        ),
+    )
+    decision_log_deletions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Stale, duplicated, or misleading decision-log entries that should "
+            "be removed if confirmed by the user."
+        ),
+    )
+    decision_log_modifications: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Concise descriptions of decision-log entries that should be rewritten "
+            "or compacted if confirmed by the user."
         ),
     )
 

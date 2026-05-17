@@ -747,8 +747,8 @@ async def run_memory_audit_stage(
     """
     Runs and checkpoints the memory-audit stage using prior review evidence.
 
-    This stage surfaces memory quality and compaction signals while leaving
-    concrete decision-log edits for a later user-facing artifact step.
+    This stage surfaces memory quality and stores compact proposed decision-log
+    changes for user confirmation without rewriting the full artifact.
     """
     prompt = _with_revision_context(
         _render_memory_audit_prompt(record),
@@ -756,15 +756,46 @@ async def run_memory_audit_stage(
         stage=ReviewStage.MEMORY_AUDIT,
         revision_feedback=revision_feedback,
     )
+    model = _select_review_model(ReviewStage.MEMORY_AUDIT, context_chars=len(prompt))
     operation = "memory_audit_revision" if revision_feedback else "memory_audit"
 
-    return await _run_checkpoint_stage(
-        record=record,
-        stage=ReviewStage.MEMORY_AUDIT,
-        prompt=prompt,
-        response_schema=MemoryAuditResponse,
-        operation=operation,
-    )
+    try:
+        response = await asyncio.to_thread(
+            _generate_review_structured,
+            prompt=prompt,
+            response_schema=MemoryAuditResponse,
+            model=model,
+            operation=operation,
+        )
+    except Exception:
+        if model == GEMINI_PRO_MODEL:
+            raise
+
+        retry_operation = f"{operation}_retry"
+        logger.warning("Retrying {} with {} after {} failed.", operation, GEMINI_PRO_MODEL, model)
+        response = await asyncio.to_thread(
+            _generate_review_structured,
+            prompt=prompt,
+            response_schema=MemoryAuditResponse,
+            model=GEMINI_PRO_MODEL,
+            operation=retry_operation,
+        )
+
+    record.memory_audit = _response_to_stage_checkpoint(response)
+    if (
+        response.decision_log_additions
+        or response.decision_log_deletions
+        or response.decision_log_modifications
+    ):
+        record.decision_log_changes = ArtifactChangeSummary(
+            additions=response.decision_log_additions,
+            deletions=response.decision_log_deletions,
+            modifications=response.decision_log_modifications,
+        )
+    else:
+        record.decision_log_changes = None
+    record.last_completed_stage = ReviewStage.MEMORY_AUDIT
+    return await save_review_workflow(record)
 
 
 async def run_weekly_plan_stage(
@@ -1166,6 +1197,23 @@ async def advance_review_from_current_stage(
             record,
             workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
             stage=ReviewStage.GOALS_AUDIT,
+            stage_status=StageStatus.AWAITING_FEEDBACK,
+        )
+
+    if (
+        record.current_stage == ReviewStage.GOALS_AUDIT
+        and record.stage_status == StageStatus.COMPLETED
+    ):
+        record = await transition_review_stage(
+            record,
+            stage=ReviewStage.MEMORY_AUDIT,
+            stage_status=StageStatus.RUNNING,
+        )
+        record = await run_memory_audit_stage(record)
+        return await transition_review_stage(
+            record,
+            workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            stage=ReviewStage.MEMORY_AUDIT,
             stage_status=StageStatus.AWAITING_FEEDBACK,
         )
 

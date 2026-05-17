@@ -200,7 +200,7 @@ async def test_run_memory_audit_stage_persists_memory_audit_checkpoint(
 ):
     """
     Tests that memory_audit consumes prior checkpoints and persists its own
-    durable checkpoint without rewriting memory yet.
+    durable checkpoint plus compact proposed decision-log changes.
     """
     record = ReviewWorkflowRecord(
         id="review_test",
@@ -223,6 +223,9 @@ async def test_run_memory_audit_stage_persists_memory_audit_checkpoint(
         key_findings=["The decision log should preserve the recurring evening-energy pattern."],
         constraints=["Avoid treating one-off schedule details as durable memory."],
         carry_forward=["Consider adding a compact evening-energy preference to rolling context."],
+        decision_log_additions=["David works better when late-evening commitments are avoided."],
+        decision_log_deletions=["Remove duplicated weekly implementation note."],
+        decision_log_modifications=["Tighten the rolling-context entry about energy constraints."],
     )
 
     updated_record = await run_memory_audit_stage(record)
@@ -239,6 +242,16 @@ async def test_run_memory_audit_stage_persists_memory_audit_checkpoint(
     ]
     assert updated_record.memory_audit.carry_forward == [
         "Consider adding a compact evening-energy preference to rolling context.",
+    ]
+    assert updated_record.decision_log_changes is not None
+    assert updated_record.decision_log_changes.additions == [
+        "David works better when late-evening commitments are avoided.",
+    ]
+    assert updated_record.decision_log_changes.deletions == [
+        "Remove duplicated weekly implementation note.",
+    ]
+    assert updated_record.decision_log_changes.modifications == [
+        "Tighten the rolling-context entry about energy constraints.",
     ]
     assert updated_record.last_completed_stage == ReviewStage.MEMORY_AUDIT
     mock_generate_review_structured.assert_called_once()

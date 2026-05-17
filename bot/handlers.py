@@ -204,6 +204,29 @@ def _format_review_stage_summary(stage: ReviewStage, record) -> str:
     return "\n".join(lines)
 
 
+def _format_artifact_change_summary(changes) -> str:
+    """
+    Formats compact artifact-change proposals for confirmation messages.
+
+    Sunday review stages store semantic diffs rather than raw line diffs. This
+    keeps Telegram output readable while still showing what would change.
+    """
+    if changes is None:
+        return "No artifact changes were proposed."
+
+    lines: list[str] = []
+    for label, values in (
+        ("Additions", changes.additions),
+        ("Deletions", changes.deletions),
+        ("Modifications", changes.modifications),
+    ):
+        if values:
+            lines.append(f"*{label}:*")
+            lines.extend(f"- {value}" for value in values)
+
+    return "\n".join(lines) if lines else "No artifact changes were proposed."
+
+
 async def send_review_stage_confirmation(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -219,6 +242,29 @@ async def send_review_stage_confirmation(
         chat_id=chat_id,
         text=_format_review_stage_summary(stage, record),
         reply_markup=build_review_stage_keyboard(stage.value),
+        parse_mode="Markdown",
+    )
+
+
+async def send_memory_audit_confirmation(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    record,
+) -> None:
+    """Presents memory-audit findings plus proposed decision-log changes."""
+    context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = {
+        "review_id": record.id,
+        "stage": ReviewStage.MEMORY_AUDIT.value,
+    }
+    text = (
+        f"{_format_review_stage_summary(ReviewStage.MEMORY_AUDIT, record)}\n\n"
+        "*Proposed Decision Log Changes:*\n"
+        f"{_format_artifact_change_summary(record.decision_log_changes)}"
+    )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=build_review_stage_keyboard(ReviewStage.MEMORY_AUDIT.value),
         parse_mode="Markdown",
     )
 
@@ -256,6 +302,42 @@ async def send_weekly_plan_confirmation(
         reply_markup=build_weekly_state_keyboard(),
         parse_mode="Markdown",
     )
+
+
+async def send_review_stage_gate(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    record,
+) -> None:
+    """
+    Presents the correct user-facing gate for the workflow's current stage.
+
+    The review manager owns stage transitions. This dispatcher only chooses the
+    Telegram surface for the persisted stage, keeping stage-specific UI details
+    out of callback and message handlers.
+    """
+    if record.current_stage == ReviewStage.WEEKLY_PLAN:
+        await send_weekly_plan_confirmation(context, chat_id, record)
+        return
+
+    if record.current_stage == ReviewStage.MEMORY_AUDIT:
+        await send_memory_audit_confirmation(context, chat_id, record)
+        return
+
+    if record.current_stage in {
+        ReviewStage.WEEK_REVIEW,
+        ReviewStage.GOALS_AUDIT,
+        ReviewStage.FINAL_REVIEW,
+    }:
+        await send_review_stage_confirmation(
+            context,
+            chat_id,
+            record,
+            record.current_stage,
+        )
+        return
+
+    raise ValueError(f"Unsupported review-stage gate: {record.current_stage.value}.")
 
 
 async def revise_active_review_stage(
@@ -987,22 +1069,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
-        if record.current_stage == ReviewStage.WEEKLY_PLAN:
-            await send_weekly_plan_confirmation(
-                context,
-                query.message.chat_id,
-                record,
-            )
-        elif record.current_stage in {
-            ReviewStage.GOALS_AUDIT,
-            ReviewStage.MEMORY_AUDIT,
-        }:
-            await send_review_stage_confirmation(
-                context,
-                query.message.chat_id,
-                record,
-                record.current_stage,
-            )
+        await send_review_stage_gate(context, query.message.chat_id, record)
         return
 
     if query.data.startswith("confirm_item_"):
@@ -1209,11 +1276,10 @@ async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
             # Only consume the trigger after the review workflow is durable and has
             # actually started. This keeps the trigger retryable if startup fails.
             consume_trigger(context, trigger_type)
-            await send_review_stage_confirmation(
+            await send_review_stage_gate(
                 context,
                 update.effective_chat.id,
                 review_workflow,
-                ReviewStage.WEEK_REVIEW,
             )
         except Exception as e:
             logger.error(f"Error during Sunday Review: {e}")
@@ -1372,19 +1438,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if revised_record:
                 await update.message.reply_text("📝 *Revision applied.*", parse_mode="Markdown")
-                if revised_record.current_stage == ReviewStage.WEEKLY_PLAN:
-                    await send_weekly_plan_confirmation(
-                        context,
-                        update.effective_chat.id,
-                        revised_record,
-                    )
-                else:
-                    await send_review_stage_confirmation(
-                        context,
-                        update.effective_chat.id,
-                        revised_record,
-                        ReviewStage(stage_value),
-                    )
+                await send_review_stage_gate(
+                    context,
+                    update.effective_chat.id,
+                    revised_record,
+                )
                 return
 
     # Check if a text message was sent while a proposal is waiting for confirmation.

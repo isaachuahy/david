@@ -12,6 +12,7 @@ from bot.handlers import (
     handle_reject_weekly_state,
     send_calendar_proposal,
     send_proposal_thread,
+    send_review_stage_gate,
     test_schedule as handler_test_schedule,
 )
 from orchestrator.session_manager import (
@@ -920,7 +921,7 @@ async def test_handle_start_trigger_weekly_pauses_at_week_review_confirmation(
 
 
 @pytest.mark.asyncio
-@patch('bot.handlers.send_review_stage_confirmation', new_callable=AsyncMock)
+@patch('bot.handlers.send_review_stage_gate', new_callable=AsyncMock)
 @patch('bot.handlers.advance_review_from_current_stage', new_callable=AsyncMock)
 @patch('bot.handlers.transition_review_stage', new_callable=AsyncMock)
 @patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
@@ -928,7 +929,7 @@ async def test_handle_confirm_review_stage_advances_to_next_stage_confirmation(
     mock_load_review_workflow,
     mock_transition_review_stage,
     mock_advance_review_from_current_stage,
-    mock_send_review_stage_confirmation,
+    mock_send_review_stage_gate,
 ):
     update = MagicMock()
     update.effective_user.id = 123
@@ -990,11 +991,10 @@ async def test_handle_confirm_review_stage_advances_to_next_stage_confirmation(
         last_completed_stage=ReviewStage.WEEK_REVIEW,
     )
     mock_advance_review_from_current_stage.assert_awaited_once_with(completed_record)
-    mock_send_review_stage_confirmation.assert_awaited_once_with(
+    mock_send_review_stage_gate.assert_awaited_once_with(
         context,
         456,
         advanced_record,
-        ReviewStage.GOALS_AUDIT,
     )
     assert "active_review_stage_confirmation" not in context.user_data
     update.callback_query.edit_message_text.assert_awaited_once_with(
@@ -1004,13 +1004,58 @@ async def test_handle_confirm_review_stage_advances_to_next_stage_confirmation(
 
 
 @pytest.mark.asyncio
-@patch('bot.handlers.send_review_stage_confirmation', new_callable=AsyncMock)
+async def test_send_review_stage_gate_presents_memory_audit_decision_log_changes():
+    context = MagicMock()
+    context.user_data = {}
+    context.bot.send_message = AsyncMock()
+
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.MEMORY_AUDIT,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        memory_audit=StageCheckpoint(
+            summary="Memory is useful but one durable preference should be added.",
+            key_findings=["Evening constraints have repeated enough to preserve."],
+            constraints=["Do not overfit one-off schedule details."],
+        ),
+        decision_log_changes=ArtifactChangeSummary(
+            additions=["David works better when late-evening commitments are avoided."],
+            deletions=["Remove duplicated implementation note."],
+            modifications=["Compact the rolling-context energy preference."],
+        ),
+    )
+
+    await send_review_stage_gate(context, 456, record)
+
+    context.bot.send_message.assert_awaited_once()
+    sent_text = context.bot.send_message.await_args.kwargs["text"]
+    assert "*Memory Audit Ready*" in sent_text
+    assert "*Proposed Decision Log Changes:*" in sent_text
+    assert "David works better when late-evening commitments are avoided." in sent_text
+    assert "Remove duplicated implementation note." in sent_text
+    assert "Compact the rolling-context energy preference." in sent_text
+    assert context.user_data["active_review_stage_confirmation"] == {
+        "review_id": "review_test",
+        "stage": "memory_audit",
+    }
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers.send_review_stage_gate', new_callable=AsyncMock)
 @patch('bot.handlers.revise_review_stage', new_callable=AsyncMock)
 @patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
 async def test_handle_message_revises_active_review_stage(
     mock_load_review_workflow,
     mock_revise_review_stage,
-    mock_send_review_stage_confirmation,
+    mock_send_review_stage_gate,
 ):
     update = MagicMock()
     update.effective_chat.id = 456
@@ -1064,11 +1109,10 @@ async def test_handle_message_revises_active_review_stage(
         "📝 *Revision applied.*",
         parse_mode="Markdown",
     )
-    mock_send_review_stage_confirmation.assert_awaited_once_with(
+    mock_send_review_stage_gate.assert_awaited_once_with(
         context,
         456,
         revised_record,
-        ReviewStage.WEEK_REVIEW,
     )
 
 
