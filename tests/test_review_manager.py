@@ -5,7 +5,6 @@ import pytest
 from orchestrator.review_manager import (
     advance_review_from_current_stage,
     build_final_review_message,
-    build_weekly_state_change_summary,
     execute_weekly_state_update,
     run_goals_audit_stage,
     run_memory_audit_stage,

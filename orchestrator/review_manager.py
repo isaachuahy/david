@@ -1193,34 +1193,6 @@ def _completed_review_checkpoints(record: ReviewWorkflowRecord) -> list[tuple[st
     ]
 
 
-def build_weekly_state_change_summary(record: ReviewWorkflowRecord) -> str:
-    """
-    Builds a concise user-facing summary for the proposed weekly-state update.
-
-    The weekly-plan stage owns the proposed markdown. This helper only formats
-    the compact semantic diff already persisted on the workflow record.
-    """
-    changes = record.weekly_state_changes
-    if changes is None:
-        return "No weekly-state changes were proposed."
-
-    lines: list[str] = []
-    for label, values in (
-        ("Additions", changes.additions),
-        ("Deletions", changes.deletions),
-        ("Modifications", changes.modifications),
-    ):
-        if values:
-            lines.append(f"{label}:")
-            lines.extend(f"- {value}" for value in values)
-
-    if lines:
-        return "\n".join(lines)
-    if record.weekly_plan and record.weekly_plan.summary:
-        return record.weekly_plan.summary
-    return "Weekly-state markdown was updated from the staged Sunday review."
-
-
 def build_final_review_message(record: ReviewWorkflowRecord) -> str:
     """
     Assembles the Sunday review summary from completed staged checkpoints.

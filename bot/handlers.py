@@ -31,7 +31,6 @@ from orchestrator.session_manager import (
 from orchestrator.artifact_writes import create_artifact_write, execute_artifact_write, retry_artifact_write
 from orchestrator.review_manager import (
     advance_review_from_current_stage,
-    build_weekly_state_change_summary,
     complete_review_after_event_feedback,
     load_review_workflow,
     revise_review_stage,
@@ -57,7 +56,6 @@ from bot.keyboards import (
     build_artifact_write_retry_keyboard,
     build_proposal_item_keyboard,
     build_review_stage_keyboard,
-    build_weekly_state_keyboard,
 )
 from observability.sentry import capture_exception as capture_sentry_exception
 from persistence.artifact_writes import list_retryable_artifact_writes_sync
@@ -292,24 +290,15 @@ async def send_weekly_plan_confirmation(
         "review_id": record.id,
         "stage": ReviewStage.WEEKLY_PLAN.value,
     }
-    context.user_data['proposed_weekly_state'] = {
-        "content": record.weekly_state_changes.proposed_markdown,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "review_id": record.id,
-    }
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"**Sunday Review Weekly Plan Ready**\n\n{record.weekly_plan.summary if record.weekly_plan else ''}",
-        parse_mode="Markdown",
+    text = (
+        f"{_format_review_stage_summary(ReviewStage.WEEKLY_PLAN, record)}\n\n"
+        "*Proposed Weekly State Changes:*\n"
+        f"{_format_artifact_change_summary(record.weekly_state_changes)}"
     )
     await context.bot.send_message(
         chat_id=chat_id,
-        text=(
-            "📝 *Proposed Weekly State Changes:*\n"
-            f"{build_weekly_state_change_summary(record)}\n\n"
-            "Do you want to apply these changes?"
-        ),
-        reply_markup=build_weekly_state_keyboard(),
+        text=text,
+        reply_markup=build_review_stage_keyboard(ReviewStage.WEEKLY_PLAN.value),
         parse_mode="Markdown",
     )
 
@@ -358,19 +347,28 @@ async def apply_confirmed_review_stage_artifacts(
     """
     Applies confirmed markdown artifacts that belong to a review-stage gate.
 
-    Most checkpoint stages only advance. Memory audit is different because its
-    confirmation approves a deterministic proposed decision_log.md replacement
-    before downstream planning is allowed to use the updated memory.
+    Most checkpoint stages only advance. Memory audit and weekly plan also
+    approve deterministic markdown replacements that downstream stages must see
+    before the workflow can continue.
     """
-    if stage != ReviewStage.MEMORY_AUDIT:
+    artifact_by_stage = {
+        ReviewStage.MEMORY_AUDIT: ArtifactType.DECISION_LOG,
+        ReviewStage.WEEKLY_PLAN: ArtifactType.WEEKLY_STATE,
+    }
+    changes_by_stage = {
+        ReviewStage.MEMORY_AUDIT: record.decision_log_changes,
+        ReviewStage.WEEKLY_PLAN: record.weekly_state_changes,
+    }
+
+    if stage not in artifact_by_stage:
         return True
 
-    changes = record.decision_log_changes
+    changes = changes_by_stage[stage]
     if changes is None or not changes.proposed_markdown:
         return True
 
     write = create_artifact_write(
-        artifact_type=ArtifactType.DECISION_LOG,
+        artifact_type=artifact_by_stage[stage],
         content=changes.proposed_markdown,
         source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
         source_id=record.id,
@@ -411,6 +409,29 @@ async def advance_review_after_confirmed_stage(
     record = await advance_review_from_current_stage(record)
     context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = record.id
     context.user_data.pop(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY, None)
+
+    if stage == ReviewStage.WEEKLY_PLAN:
+        # Weekly-plan confirmation is the handoff from markdown artifact review
+        # into normal proposal-thread confirmation. The review manager prepares
+        # the scheduling artifact; handlers own the Telegram proposal queue.
+        proposals_sent = await send_weekly_review_scheduling_proposals(
+            context,
+            chat_id,
+            record,
+        )
+        if not proposals_sent:
+            record = await complete_review_after_event_feedback(
+                record.id,
+                has_pending_weekly_state_feedback=False,
+            )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No calendar events were proposed from this accepted weekly plan.",
+            )
+            if record is not None and record.workflow_status == ReviewWorkflowStatus.COMPLETED:
+                context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
+        return
+
     await send_review_stage_gate(context, chat_id, record)
 
 
