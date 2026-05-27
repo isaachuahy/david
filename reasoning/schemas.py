@@ -163,8 +163,8 @@ class MemoryAuditResponse(BaseModel):
     """
     LLM-facing schema for the memory audit stage of the Sunday review workflow.
 
-    This response captures memory-quality findings for the orchestrator to store
-    as a durable checkpoint and compact proposed decision-log edits.
+    This response captures memory-quality findings before a separate proposal
+    pass derives concrete decision-log changes from the checkpoint.
     """
 
     summary: str = Field(
@@ -195,25 +195,48 @@ class MemoryAuditResponse(BaseModel):
             "that should be considered by weekly planning or final review."
         ),
     )
-    decision_log_additions: list[str] = Field(
+
+
+class DecisionLogChangeProposalResponse(BaseModel):
+    """
+    LLM-facing schema for proposed decision-log operations.
+
+    These are candidate operations only. The application materializes them into
+    proposed markdown deterministically, and nothing is written until the user
+    confirms the memory-audit gate.
+    """
+
+    proposed_rolling_context_additions: list[str] = Field(
         default_factory=list,
         description=(
-            "Compact durable memory entries that should be added to decision_log.md "
-            "if confirmed by the user."
+            "Candidate complete bullet lines to add to the Current Rolling Context section."
         ),
     )
-    decision_log_deletions: list[str] = Field(
+    proposed_rolling_context_deletions: list[str] = Field(
         default_factory=list,
         description=(
-            "Stale, duplicated, or misleading decision-log entries that should "
-            "be removed if confirmed by the user."
+            "Candidate exact existing bullet lines from Current Rolling Context to remove."
         ),
     )
-    decision_log_modifications: list[str] = Field(
+    proposed_rolling_context_modifications: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Candidate exact old bullet line to replacement bullet line mappings. "
+            "Keys must match existing Current Rolling Context bullets exactly."
+        ),
+    )
+    proposed_recent_decisions_reset: bool = Field(
+        default=True,
+        description=(
+            "Whether the proposed markdown should reset Recent Decisions to the "
+            "placeholder after compaction."
+        ),
+    )
+    proposed_recent_decisions_carry_forward: list[str] = Field(
         default_factory=list,
         description=(
-            "Concise descriptions of decision-log entries that should be rewritten "
-            "or compacted if confirmed by the user."
+            "Candidate recent-decision notes to keep visible because they were "
+            "not compacted into Current Rolling Context."
         ),
     )
 

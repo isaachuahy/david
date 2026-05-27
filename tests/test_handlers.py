@@ -24,6 +24,10 @@ from reasoning.flash_client import FlashResponse
 from reasoning.schemas import ProposalThreadDraft, ProposedEvent
 from persistence.models import (
     ArtifactChangeSummary,
+    ArtifactType,
+    ArtifactWriteRecord,
+    ArtifactWriteSourceType,
+    ArtifactWriteStatus,
     CalendarWriteStatus,
     ProposalItemRecord,
     ProposalItemStatus,
@@ -1004,6 +1008,315 @@ async def test_handle_confirm_review_stage_advances_to_next_stage_confirmation(
 
 
 @pytest.mark.asyncio
+@patch('bot.handlers.send_review_stage_gate', new_callable=AsyncMock)
+@patch('bot.handlers.advance_review_from_current_stage', new_callable=AsyncMock)
+@patch('bot.handlers.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
+@patch('bot.handlers.execute_artifact_write')
+@patch('bot.handlers.create_artifact_write')
+async def test_handle_confirm_memory_audit_executes_decision_log_artifact_write(
+    mock_create_artifact_write,
+    mock_execute_artifact_write,
+    mock_load_review_workflow,
+    mock_transition_review_stage,
+    mock_advance_review_from_current_stage,
+    mock_send_review_stage_gate,
+):
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.callback_query = MagicMock()
+    update.callback_query.data = "confirm_review_stage_memory_audit"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.chat_id = 456
+
+    context = MagicMock()
+    context.user_data = {
+        "active_review_workflow_id": "review_test",
+        "active_review_stage_confirmation": {
+            "review_id": "review_test",
+            "stage": "memory_audit",
+        },
+    }
+    context.bot_data = {"allowed_user_id": 123}
+
+    loaded_record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.MEMORY_AUDIT,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        memory_audit=StageCheckpoint(summary="Memory audit is ready."),
+        decision_log_changes=ArtifactChangeSummary(
+            additions=["- Keep evenings light."],
+            proposed_markdown="# Decision Log\n\n## Current Rolling Context\n- Keep evenings light.\n",
+        ),
+    )
+    completed_record = loaded_record.model_copy(
+        update={
+            "workflow_status": ReviewWorkflowStatus.ACTIVE,
+            "current_stage": ReviewStage.MEMORY_AUDIT,
+            "stage_status": StageStatus.COMPLETED,
+            "last_completed_stage": ReviewStage.MEMORY_AUDIT,
+        }
+    )
+    advanced_record = completed_record.model_copy(
+        update={
+            "workflow_status": ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            "current_stage": ReviewStage.WEEKLY_PLAN,
+            "stage_status": StageStatus.AWAITING_FEEDBACK,
+        }
+    )
+    artifact_write = ArtifactWriteRecord(
+        id="awrite_memory",
+        artifact_type=ArtifactType.DECISION_LOG,
+        content=loaded_record.decision_log_changes.proposed_markdown,
+        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
+        source_id="review_test",
+        source_stage=ReviewStage.MEMORY_AUDIT.value,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+    )
+    mock_load_review_workflow.return_value = loaded_record
+    mock_create_artifact_write.return_value = artifact_write
+    mock_execute_artifact_write.return_value = artifact_write.model_copy(
+        update={"status": ArtifactWriteStatus.EXECUTED}
+    )
+    mock_transition_review_stage.return_value = completed_record
+    mock_advance_review_from_current_stage.return_value = advanced_record
+
+    await handle_confirm(update, context)
+
+    mock_create_artifact_write.assert_called_once_with(
+        artifact_type=ArtifactType.DECISION_LOG,
+        content=loaded_record.decision_log_changes.proposed_markdown,
+        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
+        source_id="review_test",
+        source_stage=ReviewStage.MEMORY_AUDIT.value,
+    )
+    mock_execute_artifact_write.assert_called_once_with(artifact_write)
+    mock_transition_review_stage.assert_awaited_once_with(
+        loaded_record,
+        workflow_status=ReviewWorkflowStatus.ACTIVE,
+        stage=ReviewStage.MEMORY_AUDIT,
+        stage_status=StageStatus.COMPLETED,
+        last_completed_stage=ReviewStage.MEMORY_AUDIT,
+    )
+    mock_advance_review_from_current_stage.assert_awaited_once_with(completed_record)
+    mock_send_review_stage_gate.assert_awaited_once_with(context, 456, advanced_record)
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers.advance_review_from_current_stage', new_callable=AsyncMock)
+@patch('bot.handlers.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
+@patch('bot.handlers.execute_artifact_write')
+@patch('bot.handlers.create_artifact_write')
+async def test_handle_confirm_memory_audit_failed_artifact_write_shows_retry(
+    mock_create_artifact_write,
+    mock_execute_artifact_write,
+    mock_load_review_workflow,
+    mock_transition_review_stage,
+    mock_advance_review_from_current_stage,
+):
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.callback_query = MagicMock()
+    update.callback_query.data = "confirm_review_stage_memory_audit"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.chat_id = 456
+
+    context = MagicMock()
+    context.user_data = {
+        "active_review_stage_confirmation": {
+            "review_id": "review_test",
+            "stage": "memory_audit",
+        },
+    }
+    context.bot_data = {"allowed_user_id": 123}
+
+    loaded_record = ReviewWorkflowRecord(
+        id="review_test",
+        current_stage=ReviewStage.MEMORY_AUDIT,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        memory_audit=StageCheckpoint(summary="Memory audit is ready."),
+        decision_log_changes=ArtifactChangeSummary(
+            proposed_markdown="# Decision Log\n\n## Current Rolling Context\n- Keep evenings light.\n",
+        ),
+    )
+    failed_write = ArtifactWriteRecord(
+        id="awrite_failed",
+        artifact_type=ArtifactType.DECISION_LOG,
+        content=loaded_record.decision_log_changes.proposed_markdown,
+        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
+        source_id="review_test",
+        source_stage=ReviewStage.MEMORY_AUDIT.value,
+        status=ArtifactWriteStatus.FAILED_RETRYABLE,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+    )
+    mock_load_review_workflow.return_value = loaded_record
+    mock_create_artifact_write.return_value = failed_write
+    mock_execute_artifact_write.return_value = failed_write
+
+    await handle_confirm(update, context)
+
+    assert context.user_data["active_artifact_write_retry"] == {
+        "write_id": "awrite_failed",
+        "review_id": "review_test",
+        "stage": "memory_audit",
+    }
+    mock_transition_review_stage.assert_not_awaited()
+    mock_advance_review_from_current_stage.assert_not_awaited()
+    update.callback_query.edit_message_text.assert_awaited_once()
+    assert "could not apply" in update.callback_query.edit_message_text.await_args.args[0]
+    assert update.callback_query.edit_message_text.await_args.kwargs["reply_markup"] is not None
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers.send_review_stage_gate', new_callable=AsyncMock)
+@patch('bot.handlers.advance_review_from_current_stage', new_callable=AsyncMock)
+@patch('bot.handlers.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
+@patch('bot.handlers.retry_artifact_write')
+async def test_handle_retry_artifact_write_success_advances_review(
+    mock_retry_artifact_write,
+    mock_load_review_workflow,
+    mock_transition_review_stage,
+    mock_advance_review_from_current_stage,
+    mock_send_review_stage_gate,
+):
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.callback_query = MagicMock()
+    update.callback_query.data = "retry_artifact_write_awrite_failed"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.chat_id = 456
+
+    context = MagicMock()
+    context.user_data = {
+        "active_artifact_write_retry": {
+            "write_id": "awrite_failed",
+            "review_id": "review_test",
+            "stage": "memory_audit",
+        },
+    }
+    context.bot_data = {"allowed_user_id": 123}
+
+    executed_write = ArtifactWriteRecord(
+        id="awrite_failed",
+        artifact_type=ArtifactType.DECISION_LOG,
+        content="# Decision Log",
+        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
+        source_id="review_test",
+        source_stage=ReviewStage.MEMORY_AUDIT.value,
+        status=ArtifactWriteStatus.EXECUTED,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+    )
+    loaded_record = ReviewWorkflowRecord(
+        id="review_test",
+        current_stage=ReviewStage.MEMORY_AUDIT,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+    )
+    completed_record = loaded_record.model_copy(
+        update={
+            "workflow_status": ReviewWorkflowStatus.ACTIVE,
+            "current_stage": ReviewStage.MEMORY_AUDIT,
+            "stage_status": StageStatus.COMPLETED,
+            "last_completed_stage": ReviewStage.MEMORY_AUDIT,
+        }
+    )
+    advanced_record = completed_record.model_copy(
+        update={
+            "workflow_status": ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            "current_stage": ReviewStage.WEEKLY_PLAN,
+            "stage_status": StageStatus.AWAITING_FEEDBACK,
+        }
+    )
+    mock_retry_artifact_write.return_value = executed_write
+    mock_load_review_workflow.return_value = loaded_record
+    mock_transition_review_stage.return_value = completed_record
+    mock_advance_review_from_current_stage.return_value = advanced_record
+
+    await handle_confirm(update, context)
+
+    mock_retry_artifact_write.assert_called_once_with("awrite_failed")
+    assert "active_artifact_write_retry" not in context.user_data
+    mock_transition_review_stage.assert_awaited_once_with(
+        loaded_record,
+        workflow_status=ReviewWorkflowStatus.ACTIVE,
+        stage=ReviewStage.MEMORY_AUDIT,
+        stage_status=StageStatus.COMPLETED,
+        last_completed_stage=ReviewStage.MEMORY_AUDIT,
+    )
+    mock_send_review_stage_gate.assert_awaited_once_with(context, 456, advanced_record)
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers.retry_artifact_write')
+async def test_handle_retry_artifact_write_failure_keeps_retry_button(
+    mock_retry_artifact_write,
+):
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.callback_query = MagicMock()
+    update.callback_query.data = "retry_artifact_write_awrite_failed"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {}
+    context.bot_data = {"allowed_user_id": 123}
+
+    failed_write = ArtifactWriteRecord(
+        id="awrite_failed",
+        artifact_type=ArtifactType.DECISION_LOG,
+        content="# Decision Log",
+        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
+        source_id="review_test",
+        source_stage=ReviewStage.MEMORY_AUDIT.value,
+        status=ArtifactWriteStatus.FAILED_RETRYABLE,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+    )
+    mock_retry_artifact_write.return_value = failed_write
+
+    await handle_confirm(update, context)
+
+    assert context.user_data["active_artifact_write_retry"] == {
+        "write_id": "awrite_failed",
+        "review_id": "review_test",
+        "stage": "memory_audit",
+    }
+    update.callback_query.edit_message_text.assert_awaited_once()
+    assert "still could not be applied" in update.callback_query.edit_message_text.await_args.args[0]
+    assert update.callback_query.edit_message_text.await_args.kwargs["reply_markup"] is not None
+
+
+@pytest.mark.asyncio
 async def test_send_review_stage_gate_presents_memory_audit_decision_log_changes():
     context = MagicMock()
     context.user_data = {}
@@ -1121,9 +1434,11 @@ async def test_handle_message_revises_active_review_stage(
 @patch('bot.handlers.advance_review_from_current_stage', new_callable=AsyncMock)
 @patch('bot.handlers.transition_review_stage', new_callable=AsyncMock)
 @patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
-@patch('bot.handlers.execute_weekly_state_update')
+@patch('bot.handlers.execute_artifact_write')
+@patch('bot.handlers.create_artifact_write')
 async def test_handle_confirm_weekly_state_advances_and_sends_scheduling_proposals(
-    mock_execute,
+    mock_create_artifact_write,
+    mock_execute_artifact_write,
     mock_load_review_workflow,
     mock_transition_review_stage,
     mock_advance_review_from_current_stage,
@@ -1183,7 +1498,21 @@ async def test_handle_confirm_weekly_state_advances_and_sends_scheduling_proposa
             ),
         }
     )
-    mock_execute.return_value = True
+    artifact_write = ArtifactWriteRecord(
+        id="awrite_weekly",
+        artifact_type=ArtifactType.WEEKLY_STATE,
+        content="# Updated Weekly State",
+        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
+        source_id="review_test",
+        source_stage=ReviewStage.WEEKLY_PLAN.value,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+    )
+    executed_write = artifact_write.model_copy(
+        update={"status": ArtifactWriteStatus.EXECUTED}
+    )
+    mock_create_artifact_write.return_value = artifact_write
+    mock_execute_artifact_write.return_value = executed_write
     mock_load_review_workflow.return_value = loaded_record
     mock_transition_review_stage.return_value = loaded_record
     mock_advance_review_from_current_stage.return_value = advanced_record
@@ -1191,7 +1520,14 @@ async def test_handle_confirm_weekly_state_advances_and_sends_scheduling_proposa
     await handle_confirm_weekly_state(update, context)
 
     update.callback_query.answer.assert_awaited_once()
-    mock_execute.assert_called_once_with('# Updated Weekly State')
+    mock_create_artifact_write.assert_called_once_with(
+        artifact_type=ArtifactType.WEEKLY_STATE,
+        content="# Updated Weekly State",
+        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
+        source_id="review_test",
+        source_stage=ReviewStage.WEEKLY_PLAN.value,
+    )
+    mock_execute_artifact_write.assert_called_once_with(artifact_write)
     mock_load_review_workflow.assert_awaited_once_with("review_test")
     mock_transition_review_stage.assert_awaited_once_with(
         loaded_record,
@@ -1441,8 +1777,13 @@ async def test_handle_delay_trigger():
 
 @pytest.mark.asyncio
 @patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
-@patch('bot.handlers.execute_weekly_state_update')
-async def test_handle_confirm_weekly_state_without_review_id(mock_execute, mock_load_review_workflow):
+@patch('bot.handlers.execute_artifact_write')
+@patch('bot.handlers.create_artifact_write')
+async def test_handle_confirm_weekly_state_without_review_id(
+    mock_create_artifact_write,
+    mock_execute_artifact_write,
+    mock_load_review_workflow,
+):
     update = MagicMock()
     update.effective_user.id = 123
     update.callback_query = MagicMock()
@@ -1456,12 +1797,30 @@ async def test_handle_confirm_weekly_state_without_review_id(mock_execute, mock_
         }
     }
     context.bot_data = {"allowed_user_id": 123}
-    mock_execute.return_value = True
+    artifact_write = ArtifactWriteRecord(
+        id="awrite_weekly",
+        artifact_type=ArtifactType.WEEKLY_STATE,
+        content="# Updated Weekly State",
+        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+    )
+    mock_create_artifact_write.return_value = artifact_write
+    mock_execute_artifact_write.return_value = artifact_write.model_copy(
+        update={"status": ArtifactWriteStatus.EXECUTED}
+    )
     
     await handle_confirm_weekly_state(update, context)
     
     update.callback_query.answer.assert_awaited_once()
-    mock_execute.assert_called_once_with('# Updated Weekly State')
+    mock_create_artifact_write.assert_called_once_with(
+        artifact_type=ArtifactType.WEEKLY_STATE,
+        content="# Updated Weekly State",
+        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
+        source_id=None,
+        source_stage=ReviewStage.WEEKLY_PLAN.value,
+    )
+    mock_execute_artifact_write.assert_called_once_with(artifact_write)
     assert 'proposed_weekly_state' not in context.user_data
     mock_load_review_workflow.assert_not_awaited()
     update.callback_query.edit_message_text.assert_awaited_once_with(

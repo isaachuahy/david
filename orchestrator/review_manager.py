@@ -9,9 +9,11 @@ from pydantic import BaseModel
 
 from observability.sentry import capture_exception as capture_sentry_exception
 from integrations.calendar import get_past_events
-from persistence.database import get_db
+from orchestrator.artifact_writes import execute_artifact_replacement
+from orchestrator.review_artifacts import get_effective_artifact_content
 from persistence.models import (
     ArtifactChangeSummary,
+    ArtifactType,
     ReviewStage,
     ReviewWorkflowRecord,
     ReviewWorkflowStatus,
@@ -27,6 +29,7 @@ from persistence.review_workflows import (
 )
 from reasoning.parser import parse_model_response
 from reasoning.schemas import (
+    DecisionLogChangeProposalResponse,
     GoalsAuditResponse,
     MemoryAuditResponse,
     SchedulingPassResponse,
@@ -276,6 +279,24 @@ def _render_memory_audit_prompt(record: ReviewWorkflowRecord) -> str:
     )
 
 
+def _render_decision_log_change_prompt(record: ReviewWorkflowRecord) -> str:
+    """
+    Renders the second memory-audit pass for deterministic decision-log changes.
+
+    The first memory-audit pass must already be checkpointed. This proposal pass
+    receives that checkpoint and outputs exact operations that application code
+    can validate and materialize into proposed markdown.
+    """
+    if record.memory_audit is None:
+        raise ValueError("Cannot propose decision_log changes before memory_audit is checkpointed.")
+
+    return _render_review_prompt(
+        "decision_log_change.txt",
+        decision_log_markdown=record.source_snapshot.decision_log_markdown,
+        memory_audit_checkpoint=_format_checkpoint_for_prompt(record.memory_audit),
+    )
+
+
 def _render_weekly_plan_prompt(record: ReviewWorkflowRecord) -> str:
     """
     Renders the weekly-plan prompt from the frozen snapshot and checkpoints.
@@ -293,11 +314,11 @@ def _render_weekly_plan_prompt(record: ReviewWorkflowRecord) -> str:
     return _render_review_prompt(
         "weekly_plan.txt",
         weekly_state_markdown=record.source_snapshot.weekly_state_markdown,
-        goals_markdown=record.source_snapshot.goals_markdown,
+        goals_markdown=get_effective_artifact_content(record, ArtifactType.GOALS),
         week_review_checkpoint=_format_checkpoint_for_prompt(record.week_review),
         goals_audit_checkpoint=_format_checkpoint_for_prompt(record.goals_audit),
         memory_audit_checkpoint=_format_checkpoint_for_prompt(record.memory_audit),
-        decision_log_markdown=record.source_snapshot.decision_log_markdown,
+        decision_log_markdown=get_effective_artifact_content(record, ArtifactType.DECISION_LOG),
     )
 
 
@@ -324,9 +345,10 @@ def _render_scheduling_pass_prompt(record: ReviewWorkflowRecord) -> str:
 
     return _render_review_prompt(
         "scheduling_pass.txt",
-        weekly_state_markdown=record.source_snapshot.weekly_state_markdown,
+        weekly_state_markdown=get_effective_artifact_content(record, ArtifactType.WEEKLY_STATE),
         proposed_weekly_state_markdown=record.weekly_state_changes.proposed_markdown,
-        goals_markdown=record.source_snapshot.goals_markdown,
+        goals_markdown=get_effective_artifact_content(record, ArtifactType.GOALS),
+        decision_log_markdown=get_effective_artifact_content(record, ArtifactType.DECISION_LOG),
         week_review_checkpoint=_format_checkpoint_for_prompt(record.week_review),
         goals_audit_checkpoint=_format_checkpoint_for_prompt(record.goals_audit),
         memory_audit_checkpoint=_format_checkpoint_for_prompt(record.memory_audit),
@@ -367,6 +389,127 @@ def validate_weekly_state_markdown(content: str) -> None:
             "Weekly state markdown appears to include another artifact: "
             + ", ".join(forbidden_markers)
         )
+
+
+def _normalize_decision_log_bullet(value: str) -> str:
+    """Normalizes proposed rolling-context entries to complete markdown bullets."""
+    stripped = value.strip()
+    if not stripped:
+        return ""
+    return stripped if stripped.startswith("- ") else f"- {stripped}"
+
+
+def _extract_decision_log_sections(content: str) -> tuple[list[str], list[str], list[str], list[str]]:
+    """
+    Splits decision_log.md into prefix, rolling-context bullets, recent lines, suffix.
+
+    The deterministic materializer only edits known sections from
+    decision_log.example.md. If those section headers are missing, it fails
+    instead of making a best-effort edit in the wrong place.
+    """
+    lines = content.splitlines()
+    rolling_header = "## Current Rolling Context"
+    recent_header = "## Recent Decisions (Appended Daily)"
+
+    try:
+        rolling_index = lines.index(rolling_header)
+        recent_index = lines.index(recent_header)
+    except ValueError as error:
+        raise ValueError("decision_log.md is missing required review section headers.") from error
+
+    if recent_index <= rolling_index:
+        raise ValueError("decision_log.md sections are in an unsupported order.")
+
+    prefix = lines[: rolling_index + 1]
+    rolling_body = lines[rolling_index + 1:recent_index]
+    recent_and_suffix = lines[recent_index:]
+
+    next_section_index = next(
+        (
+            index
+            for index, line in enumerate(recent_and_suffix[1:], start=1)
+            if line.startswith("## ")
+        ),
+        len(recent_and_suffix),
+    )
+    recent_section = recent_and_suffix[:next_section_index]
+    suffix = recent_and_suffix[next_section_index:]
+    rolling_bullets = [line.strip() for line in rolling_body if line.strip().startswith("- ")]
+
+    return prefix, rolling_bullets, recent_section, suffix
+
+
+def _materialize_decision_log_change_proposal(
+    decision_log_markdown: str,
+    proposal: DecisionLogChangeProposalResponse,
+) -> ArtifactChangeSummary:
+    """
+    Applies proposed decision-log operations into deterministic markdown.
+
+    Deletions and modifications require exact Current Rolling Context bullet
+    matches. This keeps the LLM in a proposal role and lets application code
+    refuse ambiguous edits instead of silently mutating durable memory.
+    """
+    prefix, rolling_bullets, recent_section, suffix = _extract_decision_log_sections(
+        decision_log_markdown
+    )
+    updated_bullets = list(rolling_bullets)
+
+    deletions = [
+        _normalize_decision_log_bullet(item)
+        for item in proposal.proposed_rolling_context_deletions
+        if _normalize_decision_log_bullet(item)
+    ]
+    modifications = {
+        _normalize_decision_log_bullet(old): _normalize_decision_log_bullet(new)
+        for old, new in proposal.proposed_rolling_context_modifications.items()
+        if _normalize_decision_log_bullet(old) and _normalize_decision_log_bullet(new)
+    }
+    additions = [
+        _normalize_decision_log_bullet(item)
+        for item in proposal.proposed_rolling_context_additions
+        if _normalize_decision_log_bullet(item)
+    ]
+
+    for bullet in deletions:
+        if bullet not in updated_bullets:
+            raise ValueError(f"Decision-log deletion anchor was not found: {bullet}")
+        updated_bullets.remove(bullet)
+
+    for old_bullet, new_bullet in modifications.items():
+        if old_bullet not in updated_bullets:
+            raise ValueError(f"Decision-log modification anchor was not found: {old_bullet}")
+        updated_bullets[updated_bullets.index(old_bullet)] = new_bullet
+
+    for bullet in additions:
+        if bullet not in updated_bullets:
+            updated_bullets.append(bullet)
+
+    if proposal.proposed_recent_decisions_reset:
+        recent_section = [
+            "## Recent Decisions (Appended Daily)",
+            "*(New session notes will be appended here throughout the week.)*",
+        ]
+    elif proposal.proposed_recent_decisions_carry_forward:
+        recent_section = ["## Recent Decisions (Appended Daily)", ""]
+        recent_section.extend(
+            _normalize_decision_log_bullet(item)
+            for item in proposal.proposed_recent_decisions_carry_forward
+            if _normalize_decision_log_bullet(item)
+        )
+
+    proposed_lines = [*prefix, *updated_bullets, "", *recent_section, *suffix]
+    proposed_markdown = "\n".join(proposed_lines).strip() + "\n"
+
+    return ArtifactChangeSummary(
+        additions=additions,
+        deletions=deletions,
+        modifications=[
+            f"{old_bullet} -> {new_bullet}"
+            for old_bullet, new_bullet in modifications.items()
+        ],
+        proposed_markdown=proposed_markdown,
+    )
 
 
 def _select_review_model(
@@ -747,8 +890,9 @@ async def run_memory_audit_stage(
     """
     Runs and checkpoints the memory-audit stage using prior review evidence.
 
-    This stage surfaces memory quality and stores compact proposed decision-log
-    changes for user confirmation without rewriting the full artifact.
+    This stage uses two internal passes: first it checkpoints memory-quality
+    findings, then it proposes exact decision-log operations from that
+    checkpoint and materializes proposed markdown for user confirmation.
     """
     prompt = _with_revision_context(
         _render_memory_audit_prompt(record),
@@ -782,18 +926,53 @@ async def run_memory_audit_stage(
         )
 
     record.memory_audit = _response_to_stage_checkpoint(response)
-    if (
-        response.decision_log_additions
-        or response.decision_log_deletions
-        or response.decision_log_modifications
-    ):
-        record.decision_log_changes = ArtifactChangeSummary(
-            additions=response.decision_log_additions,
-            deletions=response.decision_log_deletions,
-            modifications=response.decision_log_modifications,
+    proposal_prompt = _with_revision_context(
+        _render_decision_log_change_prompt(record),
+        record=record,
+        stage=ReviewStage.MEMORY_AUDIT,
+        revision_feedback=revision_feedback,
+    )
+    proposal_model = _select_review_model(
+        ReviewStage.MEMORY_AUDIT,
+        context_chars=len(proposal_prompt),
+    )
+    proposal_operation = (
+        "decision_log_change_revision"
+        if revision_feedback
+        else "decision_log_change"
+    )
+
+    try:
+        proposal = await asyncio.to_thread(
+            _generate_review_structured,
+            prompt=proposal_prompt,
+            response_schema=DecisionLogChangeProposalResponse,
+            model=proposal_model,
+            operation=proposal_operation,
         )
-    else:
-        record.decision_log_changes = None
+    except Exception:
+        if proposal_model == GEMINI_PRO_MODEL:
+            raise
+
+        retry_operation = f"{proposal_operation}_retry"
+        logger.warning(
+            "Retrying {} with {} after {} failed.",
+            proposal_operation,
+            GEMINI_PRO_MODEL,
+            proposal_model,
+        )
+        proposal = await asyncio.to_thread(
+            _generate_review_structured,
+            prompt=proposal_prompt,
+            response_schema=DecisionLogChangeProposalResponse,
+            model=GEMINI_PRO_MODEL,
+            operation=retry_operation,
+        )
+
+    record.decision_log_changes = _materialize_decision_log_change_proposal(
+        record.source_snapshot.decision_log_markdown,
+        proposal,
+    )
     record.last_completed_stage = ReviewStage.MEMORY_AUDIT
     return await save_review_workflow(record)
 
@@ -1218,6 +1397,23 @@ async def advance_review_from_current_stage(
         )
 
     if (
+        record.current_stage == ReviewStage.MEMORY_AUDIT
+        and record.stage_status == StageStatus.COMPLETED
+    ):
+        record = await transition_review_stage(
+            record,
+            stage=ReviewStage.WEEKLY_PLAN,
+            stage_status=StageStatus.RUNNING,
+        )
+        record = await run_weekly_plan_stage(record)
+        return await transition_review_stage(
+            record,
+            workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            stage=ReviewStage.WEEKLY_PLAN,
+            stage_status=StageStatus.AWAITING_FEEDBACK,
+        )
+
+    if (
         record.current_stage == ReviewStage.WEEKLY_PLAN
         and record.stage_status == StageStatus.COMPLETED
     ):
@@ -1284,38 +1480,9 @@ async def complete_review_after_event_feedback(
 
 def execute_weekly_state_update(content: str) -> bool:
     """
-    Backs up the current weekly_state.md and overwrites it with new content.
-    Returns True on success, False on failure.
-    This is a pure file I/O function.
-    """
-    try:
-        context_dir = get_context_dir()
-        context_dir.mkdir(parents=True, exist_ok=True)
-        weekly_state_path = context_dir / "weekly_state.md"
-        
-        if weekly_state_path.exists():
-            backup_filename = f"weekly_state_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-            backup_path = context_dir / backup_filename
-            with weekly_state_path.open("r", encoding="utf-8") as src, backup_path.open("w", encoding="utf-8") as dst:
-                dst.write(src.read())
-            logger.info(f"Backed up weekly state to {backup_filename}")
-                
-        with weekly_state_path.open("w", encoding="utf-8") as f:
-            f.write(content)
+    Replaces weekly_state.md with confirmed markdown and snapshots the result.
 
-        snapshot_id = f"wsnap_{uuid.uuid4().hex[:8]}"
-        logger.info(f"Persisting weekly snapshot {snapshot_id}...")
-        db = get_db()
-        db["weekly_snapshots"].insert({  # type: ignore
-            "id": snapshot_id,
-            "timestamp": datetime.now().isoformat(),
-            "weekly_state_content": content,
-        })
-        logger.success(f"Persisted weekly snapshot {snapshot_id}.")
-        
-        logger.success("Successfully updated weekly_state.md")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to execute weekly state update: {e}")
-        capture_sentry_exception(e, component="review_manager", operation="execute_weekly_state_update")
-        return False
+    Kept as a named wrapper because weekly-state writes are a common Sunday
+    review path and existing handlers/tests call this specific operation.
+    """
+    return execute_artifact_replacement(ArtifactType.WEEKLY_STATE, content)

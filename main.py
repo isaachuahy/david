@@ -18,6 +18,7 @@ from observability.sentry import (
     capture_exception as capture_sentry_exception,
     init_sentry as bootstrap_sentry,
 )
+from orchestrator.artifact_writes import reconcile_artifact_writes
 from orchestrator.review_manager import reconcile_review_workflows
 from orchestrator.trigger_scheduler import setup_scheduler
 from orchestrator.session_manager import (
@@ -109,6 +110,17 @@ def main() -> int:
                 tags={"error_kind": "review_reconciliation"},
             )
             raise
+        try:
+            reconcile_artifact_writes()
+        except Exception as exc:
+            capture_sentry_exception(
+                exc,
+                component="startup",
+                operation="reconcile_artifact_writes",
+                message="Failed to restore retryable artifact writes during startup.",
+                tags={"error_kind": "artifact_write_reconciliation"},
+            )
+            raise
         persistence = PicklePersistence(
             filepath=str(get_telegram_persistence_path()),
             store_data=PersistenceInput(
@@ -134,6 +146,7 @@ def main() -> int:
         app.add_handler(CommandHandler("test_trigger", test_trigger, filters=user_filter))
         app.add_handler(CommandHandler("test_schedule", test_schedule, filters=user_filter))
         app.add_handler(CallbackQueryHandler(handle_confirm, pattern=r"^confirm_"))
+        app.add_handler(CallbackQueryHandler(handle_confirm, pattern=r"^retry_artifact_write_"))
         app.add_handler(CallbackQueryHandler(handle_reject, pattern=r"^reject_"))
         app.add_handler(CallbackQueryHandler(handle_start_trigger, pattern=r"^start_trigger_"))
         app.add_handler(CallbackQueryHandler(handle_delay_trigger, pattern=r"^delay_trigger$"))

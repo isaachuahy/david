@@ -122,6 +122,54 @@ class WeeklySnapshotRecord(BaseModel):
     weekly_state_content: str
 
 
+class ArtifactType(str, Enum):
+    """Managed markdown artifacts that can be replaced after confirmation."""
+
+    DECISION_LOG = "decision_log"
+    WEEKLY_STATE = "weekly_state"
+    GOALS = "goals"
+
+
+class ArtifactWriteStatus(str, Enum):
+    """Retryable lifecycle for confirmed artifact side effects."""
+
+    PENDING = "pending"
+    EXECUTING = "executing"
+    EXECUTED = "executed"
+    FAILED_RETRYABLE = "failed_retryable"
+    FAILED_TERMINAL = "failed_terminal"
+
+
+class ArtifactWriteSourceType(str, Enum):
+    """Known origins for confirmed artifact writes."""
+
+    SUNDAY_REVIEW = "sunday_review"
+    MANUAL_EDIT = "manual_edit"
+
+
+class ArtifactWriteRecord(BaseModel):
+    """
+    Durable executable write for confirmed markdown artifact changes.
+
+    Review stages and future manual-edit flows should create one of these only
+    after user confirmation. The workflow advances after execution succeeds;
+    failures keep the operation retryable without rerunning the LLM.
+    """
+
+    id: str
+    artifact_type: ArtifactType
+    content: str
+    status: ArtifactWriteStatus = ArtifactWriteStatus.PENDING
+    source_type: ArtifactWriteSourceType
+    source_id: Optional[str] = None
+    source_stage: Optional[str] = None
+    attempts: int = 0
+    last_error: Optional[str] = None
+    created_at: str
+    updated_at: str
+    executed_at: Optional[str] = None
+
+
 class ReviewWorkflowStatus(str, Enum):
     """Top-level lifecycle for a durable Sunday review workflow."""
 

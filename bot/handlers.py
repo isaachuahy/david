@@ -28,11 +28,11 @@ from orchestrator.session_manager import (
     is_session_active, track_confirmation_message, get_tracked_confirmation_messages, 
     untrack_confirmation_message, clear_tracked_confirmation_messages
 )
+from orchestrator.artifact_writes import create_artifact_write, execute_artifact_write, retry_artifact_write
 from orchestrator.review_manager import (
     advance_review_from_current_stage,
     build_weekly_state_change_summary,
     complete_review_after_event_feedback,
-    execute_weekly_state_update,
     load_review_workflow,
     revise_review_stage,
     start_weekly_review_workflow,
@@ -40,6 +40,9 @@ from orchestrator.review_manager import (
 )
 from orchestrator.time_utils import USER_TIMEZONE, calendar_event_sort_key, parse_iso, parse_user_datetime, format_user_datetime
 from persistence.models import (
+    ArtifactType,
+    ArtifactWriteSourceType,
+    ArtifactWriteStatus,
     CalendarWriteStatus,
     ProposalItemRecord,
     ProposalItemStatus,
@@ -50,11 +53,18 @@ from persistence.models import (
 )
 from reasoning.flash_client import FlashResponse
 from reasoning.schemas import ProposalThreadDraft, ProposedEvent
-from bot.keyboards import build_proposal_item_keyboard, build_review_stage_keyboard, build_weekly_state_keyboard
+from bot.keyboards import (
+    build_artifact_write_retry_keyboard,
+    build_proposal_item_keyboard,
+    build_review_stage_keyboard,
+    build_weekly_state_keyboard,
+)
 from observability.sentry import capture_exception as capture_sentry_exception
+from persistence.artifact_writes import list_retryable_artifact_writes_sync
 
 ACTIVE_REVIEW_WORKFLOW_ID_KEY = "active_review_workflow_id"
 ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY = "active_review_stage_confirmation"
+ACTIVE_ARTIFACT_WRITE_RETRY_KEY = "active_artifact_write_retry"
 UNAUTHORIZED_CALLBACK_TEXT = "This action is not available."
 CALENDAR_AUTH_ERROR_TEXT = (
     "Google Calendar is currently unavailable because the saved Google authorization "
@@ -338,6 +348,111 @@ async def send_review_stage_gate(
         return
 
     raise ValueError(f"Unsupported review-stage gate: {record.current_stage.value}.")
+
+
+async def apply_confirmed_review_stage_artifacts(
+    context: ContextTypes.DEFAULT_TYPE,
+    stage: ReviewStage,
+    record,
+) -> bool:
+    """
+    Applies confirmed markdown artifacts that belong to a review-stage gate.
+
+    Most checkpoint stages only advance. Memory audit is different because its
+    confirmation approves a deterministic proposed decision_log.md replacement
+    before downstream planning is allowed to use the updated memory.
+    """
+    if stage != ReviewStage.MEMORY_AUDIT:
+        return True
+
+    changes = record.decision_log_changes
+    if changes is None or not changes.proposed_markdown:
+        return True
+
+    write = create_artifact_write(
+        artifact_type=ArtifactType.DECISION_LOG,
+        content=changes.proposed_markdown,
+        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
+        source_id=record.id,
+        source_stage=stage.value,
+    )
+    executed_write = execute_artifact_write(write)
+    if executed_write.status == ArtifactWriteStatus.EXECUTED:
+        context.user_data.pop(ACTIVE_ARTIFACT_WRITE_RETRY_KEY, None)
+        return True
+
+    context.user_data[ACTIVE_ARTIFACT_WRITE_RETRY_KEY] = {
+        "write_id": executed_write.id,
+        "review_id": record.id,
+        "stage": stage.value,
+    }
+    return False
+
+
+async def advance_review_after_confirmed_stage(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    record,
+    stage: ReviewStage,
+) -> None:
+    """
+    Marks a confirmed review stage complete and presents the next review gate.
+
+    Normal confirmation and artifact-write retry both converge here once their
+    required side effects have succeeded.
+    """
+    record = await transition_review_stage(
+        record,
+        workflow_status=ReviewWorkflowStatus.ACTIVE,
+        stage=stage,
+        stage_status=StageStatus.COMPLETED,
+        last_completed_stage=stage,
+    )
+    record = await advance_review_from_current_stage(record)
+    context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = record.id
+    context.user_data.pop(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY, None)
+    await send_review_stage_gate(context, chat_id, record)
+
+
+async def send_retryable_artifact_write_notice(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+) -> bool:
+    """
+    Surfaces one confirmed artifact write that still needs explicit retry.
+
+    Startup reconciliation may recover writes that were already confirmed but
+    interrupted before completion. We keep this operational state out of model
+    context and show one retry at a time so the user can resolve it deliberately.
+    """
+    retry_state = context.user_data.get(ACTIVE_ARTIFACT_WRITE_RETRY_KEY)
+    write_id = retry_state.get("write_id") if isinstance(retry_state, dict) else None
+
+    if not write_id:
+        retryable_writes = list_retryable_artifact_writes_sync()
+        if not retryable_writes:
+            return False
+
+        retryable_writes.sort(key=lambda write: write.created_at)
+        write = retryable_writes[0]
+        write_id = write.id
+        context.user_data[ACTIVE_ARTIFACT_WRITE_RETRY_KEY] = {
+            "write_id": write.id,
+            "review_id": write.source_id,
+            "stage": write.source_stage,
+        }
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "⚠️ *A confirmed context update still needs to be applied.*\n\n"
+            "Please retry this write before we continue, so downstream review "
+            "steps do not use stale context."
+        ),
+        reply_markup=build_artifact_write_retry_keyboard(write_id),
+        parse_mode="Markdown",
+    )
+    return True
 
 
 async def revise_active_review_stage(
@@ -1011,6 +1126,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logger.info(f"User {user_id} started the bot.")
     await update.message.reply_text("Hello! I am David.")
+    await send_retryable_artifact_write_notice(context, update.effective_chat.id)
 
 @authorized_only
 async def test_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1041,6 +1157,52 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    if query.data.startswith("retry_artifact_write_"):
+        write_id = query.data.split("retry_artifact_write_")[1]
+        executed_write = retry_artifact_write(write_id)
+        if executed_write is None:
+            await query.edit_message_text("❌ *This retry is no longer available.*", parse_mode="Markdown")
+            return
+        if executed_write.status != ArtifactWriteStatus.EXECUTED:
+            context.user_data[ACTIVE_ARTIFACT_WRITE_RETRY_KEY] = {
+                "write_id": executed_write.id,
+                "review_id": executed_write.source_id,
+                "stage": executed_write.source_stage,
+            }
+            await query.edit_message_text(
+                "❌ *The write still could not be applied. The review remains paused.*",
+                reply_markup=build_artifact_write_retry_keyboard(executed_write.id),
+                parse_mode="Markdown",
+            )
+            return
+
+        retry_state = context.user_data.pop(ACTIVE_ARTIFACT_WRITE_RETRY_KEY, {})
+        review_id = (
+            retry_state.get("review_id")
+            if isinstance(retry_state, dict)
+            else executed_write.source_id
+        ) or executed_write.source_id
+        stage_value = (
+            retry_state.get("stage")
+            if isinstance(retry_state, dict)
+            else executed_write.source_stage
+        ) or executed_write.source_stage
+        record = await load_review_workflow(review_id) if review_id else None
+        if record is None or not stage_value:
+            await query.edit_message_text(
+                "✅ *Write retried successfully, but I could not resume the review automatically.*",
+                parse_mode="Markdown",
+            )
+            return
+
+        stage = ReviewStage(stage_value)
+        await query.edit_message_text(
+            f"✅ *{stage.value.replace('_', ' ').title()} write retried successfully.*",
+            parse_mode="Markdown",
+        )
+        await advance_review_after_confirmed_stage(context, query.message.chat_id, record, stage)
+        return
+
     if query.data.startswith("confirm_review_stage_"):
         stage = ReviewStage(query.data.split("confirm_review_stage_")[1])
         active_confirmation = context.user_data.get(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY)
@@ -1054,22 +1216,30 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ *This review stage is no longer available.*", parse_mode="Markdown")
             return
 
-        record = await transition_review_stage(
-            record,
-            workflow_status=ReviewWorkflowStatus.ACTIVE,
-            stage=stage,
-            stage_status=StageStatus.COMPLETED,
-            last_completed_stage=stage,
-        )
-        record = await advance_review_from_current_stage(record)
-        context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = record.id
-        context.user_data.pop(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY, None)
+        artifacts_applied = await apply_confirmed_review_stage_artifacts(context, stage, record)
+        if not artifacts_applied:
+            retry_state = context.user_data.get(ACTIVE_ARTIFACT_WRITE_RETRY_KEY)
+            retry_write_id = (
+                retry_state.get("write_id")
+                if isinstance(retry_state, dict)
+                else None
+            )
+            await query.edit_message_text(
+                "❌ *I could not apply the confirmed review changes. The review is still paused here.*",
+                reply_markup=(
+                    build_artifact_write_retry_keyboard(retry_write_id)
+                    if retry_write_id
+                    else None
+                ),
+                parse_mode="Markdown",
+            )
+            return
+
         await query.edit_message_text(
             f"✅ *{stage.value.replace('_', ' ').title()} confirmed.*",
             parse_mode="Markdown",
         )
-
-        await send_review_stage_gate(context, query.message.chat_id, record)
+        await advance_review_after_confirmed_stage(context, query.message.chat_id, record, stage)
         return
 
     if query.data.startswith("confirm_item_"):
@@ -1330,7 +1500,15 @@ async def handle_confirm_weekly_state(update: Update, context: ContextTypes.DEFA
         await query.edit_message_text("❌ *This weekly state proposal has expired (older than 2 hours).*", parse_mode="Markdown")
         return
 
-    success = execute_weekly_state_update(proposed_state["content"])
+    write = create_artifact_write(
+        artifact_type=ArtifactType.WEEKLY_STATE,
+        content=proposed_state["content"],
+        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
+        source_id=review_id,
+        source_stage=ReviewStage.WEEKLY_PLAN.value,
+    )
+    executed_write = execute_artifact_write(write)
+    success = executed_write.status == ArtifactWriteStatus.EXECUTED
     
     del context.user_data['proposed_weekly_state']
     
@@ -1423,6 +1601,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Block new messages if the session is currently synthesising
     if get_session_state(context) == SessionStatus.CLOSING:
         await update.message.reply_text("⏳ *I am currently synthesizing our last session. Please give me a moment...*", parse_mode="Markdown")
+        return
+
+    if await send_retryable_artifact_write_notice(context, update.effective_chat.id):
         return
 
     active_stage_confirmation = context.user_data.get(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY)

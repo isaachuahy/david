@@ -163,6 +163,24 @@ def init_db():
         }, pk="id")
         logger.info("Created table: proposal_items")
 
+    # 8. Artifact Writes
+    if "artifact_writes" not in db.table_names():
+        db["artifact_writes"].create({
+            "id": str,
+            "artifact_type": str,
+            "content": str,
+            "status": str,
+            "source_type": str,
+            "source_id": str,
+            "source_stage": str,
+            "attempts": int,
+            "last_error": str,
+            "created_at": str,
+            "updated_at": str,
+            "executed_at": str,
+        }, pk="id")
+        logger.info("Created table: artifact_writes")
+
     logger.info("Database initialization complete.")
 
 

@@ -26,6 +26,7 @@ from persistence.models import (
     StageStatus,
 )
 from reasoning.schemas import (
+    DecisionLogChangeProposalResponse,
     GoalsAuditResponse,
     MemoryAuditResponse,
     ProposedEvent,
@@ -55,8 +56,21 @@ This file tracks this week's active priorities.
 """
 
 
-@patch("orchestrator.review_manager.get_db")
-@patch("orchestrator.review_manager.get_context_dir")
+VALID_DECISION_LOG_MARKDOWN = """# Decision Log
+
+This file stores durable memory for David across weeks.
+
+## Current Rolling Context
+- David prefers fewer, higher-confidence commitments.
+- Late-evening commitments are currently experimental.
+
+## Recent Decisions (Appended Daily)
+- Dentist appointment was missed in the original week review.
+"""
+
+
+@patch("orchestrator.artifact_writes.get_db")
+@patch("orchestrator.artifact_writes.get_context_dir")
 def test_execute_weekly_state_update_persists_snapshot_and_writes_file(
     mock_get_context_dir,
     mock_get_db,
@@ -137,7 +151,7 @@ async def test_run_goals_audit_stage_persists_goals_audit_checkpoint(
         source_snapshot=SourceSnapshot(
             goals_markdown="# Goals",
             weekly_state_markdown="# Weekly State",
-            decision_log_markdown="# Decision Log",
+            decision_log_markdown=VALID_DECISION_LOG_MARKDOWN,
         ),
         week_review=StageCheckpoint(
             summary="The week progressed but left a prioritization question.",
@@ -183,7 +197,7 @@ async def test_run_goals_audit_stage_requires_week_review_checkpoint():
         source_snapshot=SourceSnapshot(
             goals_markdown="# Goals",
             weekly_state_markdown="# Weekly State",
-            decision_log_markdown="# Decision Log",
+            decision_log_markdown=VALID_DECISION_LOG_MARKDOWN,
         ),
     )
 
@@ -209,7 +223,7 @@ async def test_run_memory_audit_stage_persists_memory_audit_checkpoint(
         source_snapshot=SourceSnapshot(
             goals_markdown="# Goals",
             weekly_state_markdown="# Weekly State",
-            decision_log_markdown="# Decision Log",
+            decision_log_markdown=VALID_DECISION_LOG_MARKDOWN,
         ),
         week_review=StageCheckpoint(
             summary="The week surfaced a recurring evening-energy constraint.",
@@ -218,15 +232,27 @@ async def test_run_memory_audit_stage_persists_memory_audit_checkpoint(
             summary="The goals still hold, with job-search emphasis to reconfirm.",
         ),
     )
-    mock_generate_review_structured.return_value = MemoryAuditResponse(
-        summary="Rolling memory is mostly useful, but evening constraints should be made durable.",
-        key_findings=["The decision log should preserve the recurring evening-energy pattern."],
-        constraints=["Avoid treating one-off schedule details as durable memory."],
-        carry_forward=["Consider adding a compact evening-energy preference to rolling context."],
-        decision_log_additions=["David works better when late-evening commitments are avoided."],
-        decision_log_deletions=["Remove duplicated weekly implementation note."],
-        decision_log_modifications=["Tighten the rolling-context entry about energy constraints."],
-    )
+    mock_generate_review_structured.side_effect = [
+        MemoryAuditResponse(
+            summary="Rolling memory is mostly useful, but evening constraints should be made durable.",
+            key_findings=["The decision log should preserve the recurring evening-energy pattern."],
+            constraints=["Avoid treating one-off schedule details as durable memory."],
+            carry_forward=["Consider adding a compact evening-energy preference to rolling context."],
+        ),
+        DecisionLogChangeProposalResponse(
+            proposed_rolling_context_additions=[
+                "- David works better when late-evening commitments are avoided.",
+            ],
+            proposed_rolling_context_deletions=[],
+            proposed_rolling_context_modifications={
+                "- Late-evening commitments are currently experimental.": (
+                    "- Late-evening commitments should be avoided unless explicitly requested."
+                ),
+            },
+            proposed_recent_decisions_reset=True,
+            proposed_recent_decisions_carry_forward=[],
+        ),
+    ]
 
     updated_record = await run_memory_audit_stage(record)
 
@@ -245,16 +271,20 @@ async def test_run_memory_audit_stage_persists_memory_audit_checkpoint(
     ]
     assert updated_record.decision_log_changes is not None
     assert updated_record.decision_log_changes.additions == [
-        "David works better when late-evening commitments are avoided.",
+        "- David works better when late-evening commitments are avoided.",
     ]
-    assert updated_record.decision_log_changes.deletions == [
-        "Remove duplicated weekly implementation note.",
-    ]
+    assert updated_record.decision_log_changes.deletions == []
     assert updated_record.decision_log_changes.modifications == [
-        "Tighten the rolling-context entry about energy constraints.",
+        "- Late-evening commitments are currently experimental. -> "
+        "- Late-evening commitments should be avoided unless explicitly requested.",
     ]
+    assert updated_record.decision_log_changes.proposed_markdown is not None
+    assert "- David works better when late-evening commitments are avoided." in (
+        updated_record.decision_log_changes.proposed_markdown
+    )
+    assert "Dentist appointment was missed" not in updated_record.decision_log_changes.proposed_markdown
     assert updated_record.last_completed_stage == ReviewStage.MEMORY_AUDIT
-    mock_generate_review_structured.assert_called_once()
+    assert mock_generate_review_structured.call_count == 2
     mock_save_review_workflow_sync.assert_called_once()
 
 
@@ -680,8 +710,8 @@ async def test_advance_review_from_completed_weekly_plan_runs_downstream_stages(
     assert updated_record.last_completed_stage == ReviewStage.FINAL_REVIEW
 
 
-@patch("orchestrator.review_manager.capture_sentry_exception")
-@patch("orchestrator.review_manager.get_context_dir", side_effect=OSError("disk error"))
+@patch("orchestrator.artifact_writes.capture_sentry_exception")
+@patch("orchestrator.artifact_writes.get_context_dir", side_effect=OSError("disk error"))
 def test_execute_weekly_state_update_reports_failures(
     mock_get_context_dir,
     mock_capture_exception,
@@ -693,6 +723,7 @@ def test_execute_weekly_state_update_reports_failures(
     assert "disk error" in str(error)
     mock_capture_exception.assert_called_once_with(
         error,
-        component="review_manager",
-        operation="execute_weekly_state_update",
+        component="artifact_writes",
+        operation="execute_artifact_replacement",
+        tags={"artifact_type": "weekly_state"},
     )

@@ -35,6 +35,15 @@ def build_review_stage_keyboard(stage: str) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(keyboard)
 
+def build_artifact_write_retry_keyboard(write_id: str) -> InlineKeyboardMarkup:
+    """Builds a retry keyboard for one failed confirmed artifact write."""
+    keyboard = [
+        [
+            InlineKeyboardButton("Retry Write", callback_data=f"retry_artifact_write_{write_id}")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 def build_trigger_keyboard(trigger_type: str) -> InlineKeyboardMarkup:
     """Builds the Start/Delay inline keyboard for scheduled triggers."""
     keyboard = [
