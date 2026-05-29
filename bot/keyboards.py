@@ -10,16 +10,6 @@ def build_proposal_item_keyboard(item_id: str) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def build_weekly_state_keyboard() -> InlineKeyboardMarkup:
-    """Builds the Confirm/Reject inline keyboard for weekly state updates."""
-    keyboard = [
-        [
-            InlineKeyboardButton("Confirm", callback_data="confirm_weekly_state"),
-            InlineKeyboardButton("Reject", callback_data="reject_weekly_state")
-        ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
 def build_review_stage_keyboard(stage: str) -> InlineKeyboardMarkup:
     """
     Builds the Confirm/Revise inline keyboard for a Sunday review stage.

@@ -37,7 +37,7 @@ from orchestrator.review_manager import (
     start_weekly_review_workflow,
     transition_review_stage,
 )
-from orchestrator.time_utils import USER_TIMEZONE, calendar_event_sort_key, parse_iso, parse_user_datetime, format_user_datetime
+from orchestrator.time_utils import USER_TIMEZONE, calendar_event_sort_key, parse_user_datetime, format_user_datetime
 from persistence.models import (
     ArtifactType,
     ArtifactWriteSourceType,
@@ -160,17 +160,6 @@ def has_pending_weekly_review_event_feedback(context: ContextTypes.DEFAULT_TYPE)
         pending_id.startswith("pi_")
         for pending_id, _message_id in get_tracked_confirmation_messages(context)
     )
-
-
-def has_pending_weekly_state_feedback(context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """
-    Returns whether the Sunday review still has a weekly-state confirmation open.
-
-    This is intentionally separate from calendar-event feedback because the
-    review may still be incomplete even after all event proposals are resolved.
-    """
-    proposed_state = context.user_data.get("proposed_weekly_state")
-    return isinstance(proposed_state, dict)
 
 
 def _get_review_stage_checkpoint(record, stage: ReviewStage):
@@ -1312,7 +1301,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if review_id:
                     review_workflow = await complete_review_after_event_feedback(
                         review_id,
-                        has_pending_weekly_state_feedback=has_pending_weekly_state_feedback(context),
+                        has_pending_weekly_state_feedback=False,
                     )
                     if (
                         review_workflow is not None
@@ -1427,7 +1416,7 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if review_id:
                     review_workflow = await complete_review_after_event_feedback(
                         review_id,
-                        has_pending_weekly_state_feedback=has_pending_weekly_state_feedback(context),
+                        has_pending_weekly_state_feedback=False,
                     )
                     if (
                         review_workflow is not None
@@ -1492,116 +1481,6 @@ async def handle_delay_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("Got it - let's chat first. I'll hold onto this trigger until you're ready.", parse_mode="Markdown")
-
-@authorized_only
-async def handle_confirm_weekly_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles confirmation to overwrite the weekly state."""
-    query = update.callback_query
-    await query.answer()
-    
-    proposed_state = context.user_data.get('proposed_weekly_state')
-    if not proposed_state or not isinstance(proposed_state, dict):
-        await query.edit_message_text("❌ *No proposed weekly state found.*", parse_mode="Markdown")
-        return
-        
-    review_id = proposed_state.get("review_id") or context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
-
-    # Lazy Expiration: Check if the proposal is older than 2 hours
-    proposal_time = parse_iso(proposed_state["timestamp"])
-    if datetime.now(timezone.utc) - proposal_time > timedelta(hours=2):
-        del context.user_data['proposed_weekly_state']
-        if review_id:
-            record = await load_review_workflow(review_id)
-            if record is not None:
-                await transition_review_stage(
-                    record,
-                    stage=ReviewStage.WEEKLY_PLAN,
-                    stage_status=StageStatus.IN_REVISION,
-                )
-        await query.edit_message_text("❌ *This weekly state proposal has expired (older than 2 hours).*", parse_mode="Markdown")
-        return
-
-    write = create_artifact_write(
-        artifact_type=ArtifactType.WEEKLY_STATE,
-        content=proposed_state["content"],
-        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
-        source_id=review_id,
-        source_stage=ReviewStage.WEEKLY_PLAN.value,
-    )
-    executed_write = execute_artifact_write(write)
-    success = executed_write.status == ArtifactWriteStatus.EXECUTED
-    
-    del context.user_data['proposed_weekly_state']
-    
-    if success:
-        await query.edit_message_text(
-            "✅ *Weekly State successfully updated and backed up.*\n\n"
-            "I’ll now prepare any calendar proposals from the accepted weekly plan.",
-            parse_mode="Markdown",
-        )
-        if review_id:
-            review_workflow = await load_review_workflow(review_id)
-            if review_workflow is None:
-                logger.warning("Weekly state accepted, but review workflow {} could not be loaded.", review_id)
-                return
-
-            review_workflow = await transition_review_stage(
-                review_workflow,
-                workflow_status=ReviewWorkflowStatus.ACTIVE,
-                stage=ReviewStage.WEEKLY_PLAN,
-                stage_status=StageStatus.COMPLETED,
-                last_completed_stage=ReviewStage.WEEKLY_PLAN,
-            )
-            review_workflow = await advance_review_from_current_stage(review_workflow)
-            proposals_sent = await send_weekly_review_scheduling_proposals(
-                context,
-                update.effective_chat.id,
-                review_workflow,
-            )
-            if not proposals_sent:
-                review_workflow = await complete_review_after_event_feedback(
-                    review_workflow.id,
-                    has_pending_weekly_state_feedback=False,
-                )
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="No calendar events were proposed from this accepted weekly plan.",
-                )
-
-            if review_workflow and review_workflow.workflow_status == ReviewWorkflowStatus.COMPLETED:
-                context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
-    else:
-        await query.edit_message_text("❌ *Failed to update weekly state. Please check the logs.*", parse_mode="Markdown")
-
-@authorized_only
-async def handle_reject_weekly_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles rejection of the weekly state update."""
-    query = update.callback_query
-    await query.answer()
-
-    proposed_state = context.user_data.get('proposed_weekly_state')
-    review_id = (
-        proposed_state.get("review_id")
-        if isinstance(proposed_state, dict)
-        else context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
-    )
-
-    if 'proposed_weekly_state' in context.user_data:
-        del context.user_data['proposed_weekly_state']
-
-    if review_id:
-        record = await load_review_workflow(review_id)
-        if record is not None:
-            await transition_review_stage(
-                record,
-                stage=ReviewStage.WEEKLY_PLAN,
-                stage_status=StageStatus.IN_REVISION,
-            )
-
-    await query.edit_message_text(
-        "🚫 *Weekly state update rejected. The Sunday review remains open for revision.*",
-        parse_mode="Markdown",
-    )
 
 @authorized_only
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

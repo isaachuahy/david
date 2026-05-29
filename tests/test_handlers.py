@@ -1,5 +1,4 @@
 import pytest
-from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch, ANY
 from bot.handlers import (
     done_command,
@@ -8,8 +7,6 @@ from bot.handlers import (
     handle_reject,
     handle_start_trigger,
     handle_delay_trigger,
-    handle_confirm_weekly_state,
-    handle_reject_weekly_state,
     send_calendar_proposal,
     send_proposal_thread,
     send_review_stage_gate,
@@ -1436,7 +1433,7 @@ async def test_handle_message_revises_active_review_stage(
 @patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
 @patch('bot.handlers.execute_artifact_write')
 @patch('bot.handlers.create_artifact_write')
-async def test_handle_confirm_weekly_state_advances_and_sends_scheduling_proposals(
+async def test_handle_confirm_weekly_plan_advances_and_sends_scheduling_proposals(
     mock_create_artifact_write,
     mock_execute_artifact_write,
     mock_load_review_workflow,
@@ -1448,17 +1445,18 @@ async def test_handle_confirm_weekly_state_advances_and_sends_scheduling_proposa
     update.effective_chat.id = 456
     update.effective_user.id = 123
     update.callback_query = MagicMock()
+    update.callback_query.data = "confirm_review_stage_weekly_plan"
     update.callback_query.answer = AsyncMock()
     update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.chat_id = 456
 
     context = MagicMock()
     context.user_data = {
         'active_review_workflow_id': 'review_test',
-        'proposed_weekly_state': {
-            'content': '# Updated Weekly State',
-            'timestamp': datetime.now(timezone.utc).isoformat(),
+        'active_review_stage_confirmation': {
             'review_id': 'review_test',
-        }
+            'stage': ReviewStage.WEEKLY_PLAN.value,
+        },
     }
     context.bot_data = {"allowed_user_id": 123}
     context.bot.send_message = AsyncMock()
@@ -1482,6 +1480,9 @@ async def test_handle_confirm_weekly_state_advances_and_sends_scheduling_proposa
             goals_markdown="# Goals",
             weekly_state_markdown="# Weekly State",
             decision_log_markdown="# Decision Log",
+        ),
+        weekly_state_changes=ArtifactChangeSummary(
+            proposed_markdown="# Updated Weekly State",
         ),
     )
     advanced_record = loaded_record.model_copy(
@@ -1517,7 +1518,7 @@ async def test_handle_confirm_weekly_state_advances_and_sends_scheduling_proposa
     mock_transition_review_stage.return_value = loaded_record
     mock_advance_review_from_current_stage.return_value = advanced_record
 
-    await handle_confirm_weekly_state(update, context)
+    await handle_confirm(update, context)
 
     update.callback_query.answer.assert_awaited_once()
     mock_create_artifact_write.assert_called_once_with(
@@ -1544,10 +1545,9 @@ async def test_handle_confirm_weekly_state_advances_and_sends_scheduling_proposa
         "Workout",
     ]
     assert kwargs["proposal_thread"].rationale == "Protect deep work first, then schedule recovery."
-    assert 'proposed_weekly_state' not in context.user_data
+    assert 'active_review_stage_confirmation' not in context.user_data
     update.callback_query.edit_message_text.assert_awaited_once_with(
-        "✅ *Weekly State successfully updated and backed up.*\n\n"
-        "I’ll now prepare any calendar proposals from the accepted weekly plan.",
+        "✅ *Weekly Plan confirmed.*",
         parse_mode="Markdown",
     )
 
@@ -1776,60 +1776,6 @@ async def test_handle_delay_trigger():
     )
 
 @pytest.mark.asyncio
-@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
-@patch('bot.handlers.execute_artifact_write')
-@patch('bot.handlers.create_artifact_write')
-async def test_handle_confirm_weekly_state_without_review_id(
-    mock_create_artifact_write,
-    mock_execute_artifact_write,
-    mock_load_review_workflow,
-):
-    update = MagicMock()
-    update.effective_user.id = 123
-    update.callback_query = MagicMock()
-    update.callback_query.answer = AsyncMock()
-    update.callback_query.edit_message_text = AsyncMock()
-    context = MagicMock()
-    context.user_data = {
-        'proposed_weekly_state': {
-            'content': '# Updated Weekly State',
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-        }
-    }
-    context.bot_data = {"allowed_user_id": 123}
-    artifact_write = ArtifactWriteRecord(
-        id="awrite_weekly",
-        artifact_type=ArtifactType.WEEKLY_STATE,
-        content="# Updated Weekly State",
-        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
-        created_at="2026-04-29T00:00:00+00:00",
-        updated_at="2026-04-29T00:00:00+00:00",
-    )
-    mock_create_artifact_write.return_value = artifact_write
-    mock_execute_artifact_write.return_value = artifact_write.model_copy(
-        update={"status": ArtifactWriteStatus.EXECUTED}
-    )
-    
-    await handle_confirm_weekly_state(update, context)
-    
-    update.callback_query.answer.assert_awaited_once()
-    mock_create_artifact_write.assert_called_once_with(
-        artifact_type=ArtifactType.WEEKLY_STATE,
-        content="# Updated Weekly State",
-        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
-        source_id=None,
-        source_stage=ReviewStage.WEEKLY_PLAN.value,
-    )
-    mock_execute_artifact_write.assert_called_once_with(artifact_write)
-    assert 'proposed_weekly_state' not in context.user_data
-    mock_load_review_workflow.assert_not_awaited()
-    update.callback_query.edit_message_text.assert_awaited_once_with(
-        "✅ *Weekly State successfully updated and backed up.*\n\n"
-        "I’ll now prepare any calendar proposals from the accepted weekly plan.",
-        parse_mode="Markdown"
-    )
-
-@pytest.mark.asyncio
 @patch('bot.handlers.send_calendar_proposal', new_callable=AsyncMock)
 async def test_test_schedule_uses_calendar_proposal_helper(mock_send_calendar_proposal):
     update = MagicMock()
@@ -1920,52 +1866,3 @@ async def test_send_calendar_proposal_displays_toronto_time(
     assert "End: 2026-03-31 09:30 EDT" in kwargs["text"]
     assert "UTC" not in kwargs["text"]
     mock_track_confirmation_message.assert_called_once_with(context, "pi_123", 999)
-
-@pytest.mark.asyncio
-@patch('bot.handlers.transition_review_stage', new_callable=AsyncMock)
-@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
-async def test_handle_reject_weekly_state_marks_weekly_plan_in_revision(
-    mock_load_review_workflow,
-    mock_transition_review_stage,
-):
-    update = MagicMock()
-    update.effective_user.id = 123
-    update.callback_query = MagicMock()
-    update.callback_query.answer = AsyncMock()
-    update.callback_query.edit_message_text = AsyncMock()
-    
-    context = MagicMock()
-    context.user_data = {
-        'proposed_weekly_state': {
-            'content': 'test',
-            'timestamp': '2026-03-22T10:00:00Z',
-            'review_id': 'review_test',
-        }
-    }
-    context.bot_data = {"allowed_user_id": 123}
-    record = ReviewWorkflowRecord(
-        id="review_test",
-        created_at="2026-04-29T00:00:00+00:00",
-        updated_at="2026-04-29T00:00:00+00:00",
-        source_snapshot=SourceSnapshot(
-            goals_markdown="# Goals",
-            weekly_state_markdown="# Weekly State",
-            decision_log_markdown="# Decision Log",
-        ),
-    )
-    mock_load_review_workflow.return_value = record
-    
-    await handle_reject_weekly_state(update, context)
-    
-    update.callback_query.answer.assert_awaited_once()
-    assert 'proposed_weekly_state' not in context.user_data
-    mock_load_review_workflow.assert_awaited_once_with("review_test")
-    mock_transition_review_stage.assert_awaited_once_with(
-        record,
-        stage=ReviewStage.WEEKLY_PLAN,
-        stage_status=StageStatus.IN_REVISION,
-    )
-    update.callback_query.edit_message_text.assert_awaited_once_with(
-        "🚫 *Weekly state update rejected. The Sunday review remains open for revision.*",
-        parse_mode="Markdown",
-    )

@@ -30,7 +30,7 @@ from config import ConfigError, load_config
 from bot.handlers import (
     start, done_command, test_trigger, test_schedule,
     handle_confirm, handle_reject, handle_start_trigger,
-    handle_delay_trigger, handle_confirm_weekly_state, handle_reject_weekly_state, 
+    handle_delay_trigger,
     handle_message
 )
 
@@ -150,8 +150,6 @@ def main() -> int:
         app.add_handler(CallbackQueryHandler(handle_reject, pattern=r"^reject_"))
         app.add_handler(CallbackQueryHandler(handle_start_trigger, pattern=r"^start_trigger_"))
         app.add_handler(CallbackQueryHandler(handle_delay_trigger, pattern=r"^delay_trigger$"))
-        app.add_handler(CallbackQueryHandler(handle_confirm_weekly_state, pattern=r"^confirm_weekly_state$"))
-        app.add_handler(CallbackQueryHandler(handle_reject_weekly_state, pattern=r"^reject_weekly_state$"))
         # MessageHandler is a catch-all for any text messsages that aren't commands
         app.add_handler(MessageHandler(user_filter & filters.TEXT & ~filters.COMMAND, handle_message))
         app.add_error_handler(_handle_application_error)
