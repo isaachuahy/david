@@ -1,6 +1,6 @@
 import asyncio
 from functools import wraps
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from loguru import logger
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -8,61 +8,56 @@ from telegram.ext import ContextTypes
 from orchestrator.router import process_message
 from orchestrator.confirmation_queue import (
     accept_proposal_item,
-    activate_next_proposal_item,
-    add_proposal_item,
     confirm_write,
-    create_proposal_thread,
     get_pending_write,
     get_proposal_item,
-    list_proposal_items,
-    mark_proposal_item_in_revision,
     mark_proposal_item_accepted,
     reject_proposal_item,
     reject_write,
-    revise_proposal_item,
 )
 from orchestrator.trigger_scheduler import queue_trigger, consume_trigger
-from integrations.calendar import resolve_calendar_reference, get_upcoming_events
 from orchestrator.session_manager import (
     start_session, end_session, reset_session_timeout, cancel_session_timeout, get_session_state,
-    is_session_active, track_confirmation_message, get_tracked_confirmation_messages, 
+    is_session_active, get_tracked_confirmation_messages, 
     untrack_confirmation_message, clear_tracked_confirmation_messages
 )
-from orchestrator.artifact_writes import create_artifact_write, execute_artifact_write, retry_artifact_write
+from orchestrator.artifact_writes import retry_artifact_write
 from orchestrator.review_manager import (
-    advance_review_from_current_stage,
     complete_review_after_event_feedback,
     load_review_workflow,
-    revise_review_stage,
     start_weekly_review_workflow,
     transition_review_stage,
 )
-from orchestrator.time_utils import USER_TIMEZONE, calendar_event_sort_key, parse_user_datetime, format_user_datetime
+from orchestrator.time_utils import USER_TIMEZONE, calendar_event_sort_key
 from persistence.models import (
-    ArtifactType,
-    ArtifactWriteSourceType,
     ArtifactWriteStatus,
     CalendarWriteStatus,
-    ProposalItemRecord,
     ProposalItemStatus,
     ReviewStage,
     ReviewWorkflowStatus,
     SessionStatus,
     StageStatus,
 )
-from reasoning.flash_client import FlashResponse
-from reasoning.schemas import ProposalThreadDraft, ProposedEvent
-from bot.keyboards import (
-    build_artifact_write_retry_keyboard,
-    build_proposal_item_keyboard,
-    build_review_stage_keyboard,
+from reasoning.schemas import ProposedEvent
+from bot.keyboards import build_artifact_write_retry_keyboard
+from bot.proposal_flow import (
+    advance_proposal_thread_after_item_resolution,
+    revise_active_proposal_item,
+    send_calendar_proposal,
+    send_proposal_thread,
+)
+from bot.review_flow import (
+    ACTIVE_ARTIFACT_WRITE_RETRY_KEY,
+    ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY,
+    ACTIVE_REVIEW_WORKFLOW_ID_KEY,
+    advance_review_after_confirmed_stage,
+    apply_confirmed_review_stage_artifacts,
+    revise_active_review_stage,
+    send_retryable_artifact_write_notice,
+    send_review_stage_gate,
 )
 from observability.sentry import capture_exception as capture_sentry_exception
-from persistence.artifact_writes import list_retryable_artifact_writes_sync
 
-ACTIVE_REVIEW_WORKFLOW_ID_KEY = "active_review_workflow_id"
-ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY = "active_review_stage_confirmation"
-ACTIVE_ARTIFACT_WRITE_RETRY_KEY = "active_artifact_write_retry"
 UNAUTHORIZED_CALLBACK_TEXT = "This action is not available."
 CALENDAR_AUTH_ERROR_TEXT = (
     "Google Calendar is currently unavailable because the saved Google authorization "
@@ -135,10 +130,8 @@ def _is_calendar_auth_error(error: Exception) -> bool:
 
 def authorized_only(handler):
     """Decorator that enforces the single-user Telegram access policy."""
-    # This is a critical security measure to ensure that only the intended user can interact with the bot, 
-    # especially since it has powerful capabilities like reading calendar data, scheduling events and LLM calls.
-    # wraps is a standard Python decorator that preserves the original function's metadata (like its name and docstring) 
-    # when it's wrapped by another function.
+    # David can read calendars and schedule events, so every Telegram entrypoint
+    # needs this guard before touching stateful orchestration.
     @wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         if not await _is_authorized(update, context):
@@ -148,589 +141,13 @@ def authorized_only(handler):
     return wrapper
 
 
-def has_pending_weekly_review_event_feedback(context: ContextTypes.DEFAULT_TYPE) -> bool:
+def _rollback_failed_router_turn(context: ContextTypes.DEFAULT_TYPE, user_text: str) -> None:
     """
-    Returns whether the weekly review still has event proposals awaiting feedback.
-
-    Weekly state confirmation is only one part of the review flow. The review
-    should remain open if calendar proposals from that same Sunday review are
-    still waiting for confirmation.
-    """
-    return any(
-        pending_id.startswith("pi_")
-        for pending_id, _message_id in get_tracked_confirmation_messages(context)
-    )
-
-
-def _get_review_stage_checkpoint(record, stage: ReviewStage):
-    """Returns the checkpoint field that belongs to one review stage."""
-    return {
-        ReviewStage.WEEK_REVIEW: record.week_review,
-        ReviewStage.GOALS_AUDIT: record.goals_audit,
-        ReviewStage.MEMORY_AUDIT: record.memory_audit,
-        ReviewStage.WEEKLY_PLAN: record.weekly_plan,
-        ReviewStage.SCHEDULING_PASS: record.scheduling_pass,
-        ReviewStage.FINAL_REVIEW: record.final_review,
-    }.get(stage)
-
-
-def _format_review_stage_summary(stage: ReviewStage, record) -> str:
-    """
-    Formats one review checkpoint for user confirmation.
-
-    The summary is intentionally compact; detailed revision generation will be
-    handled by stage-specific feedback loops rather than this presentation step.
-    """
-    checkpoint = _get_review_stage_checkpoint(record, stage)
-    if checkpoint is None:
-        raise ValueError(f"Review stage {stage.value} has no checkpoint to confirm.")
-
-    lines = [
-        f"*{stage.value.replace('_', ' ').title()} Ready*",
-        "",
-        checkpoint.summary or "No summary was provided.",
-    ]
-    if checkpoint.key_findings:
-        lines.append("")
-        lines.append("*Key findings:*")
-        lines.extend(f"- {finding}" for finding in checkpoint.key_findings)
-    if checkpoint.constraints:
-        lines.append("")
-        lines.append("*Constraints:*")
-        lines.extend(f"- {constraint}" for constraint in checkpoint.constraints)
-    return "\n".join(lines)
-
-
-def _format_artifact_change_summary(changes) -> str:
-    """
-    Formats compact artifact-change proposals for confirmation messages.
-
-    Sunday review stages store semantic diffs rather than raw line diffs. This
-    keeps Telegram output readable while still showing what would change.
-    """
-    if changes is None:
-        return "No artifact changes were proposed."
-
-    lines: list[str] = []
-    for label, values in (
-        ("Additions", changes.additions),
-        ("Deletions", changes.deletions),
-        ("Modifications", changes.modifications),
-    ):
-        if values:
-            lines.append(f"*{label}:*")
-            lines.extend(f"- {value}" for value in values)
-
-    return "\n".join(lines) if lines else "No artifact changes were proposed."
-
-
-async def send_review_stage_confirmation(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    record,
-    stage: ReviewStage,
-) -> None:
-    """Presents one Sunday review stage checkpoint for confirm/revise feedback."""
-    context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = {
-        "review_id": record.id,
-        "stage": stage.value,
-    }
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=_format_review_stage_summary(stage, record),
-        reply_markup=build_review_stage_keyboard(stage.value),
-        parse_mode="Markdown",
-    )
-
-
-async def send_memory_audit_confirmation(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    record,
-) -> None:
-    """Presents memory-audit findings plus proposed decision-log changes."""
-    context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = {
-        "review_id": record.id,
-        "stage": ReviewStage.MEMORY_AUDIT.value,
-    }
-    text = (
-        f"{_format_review_stage_summary(ReviewStage.MEMORY_AUDIT, record)}\n\n"
-        "*Proposed Decision Log Changes:*\n"
-        f"{_format_artifact_change_summary(record.decision_log_changes)}"
-    )
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=build_review_stage_keyboard(ReviewStage.MEMORY_AUDIT.value),
-        parse_mode="Markdown",
-    )
-
-
-async def send_weekly_plan_confirmation(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    record,
-) -> None:
-    """Presents the proposed weekly-state artifact for acceptance or revision."""
-    if record.weekly_state_changes is None or not record.weekly_state_changes.proposed_markdown:
-        raise ValueError("Sunday review has no proposed weekly-state markdown to confirm.")
-
-    context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = {
-        "review_id": record.id,
-        "stage": ReviewStage.WEEKLY_PLAN.value,
-    }
-    text = (
-        f"{_format_review_stage_summary(ReviewStage.WEEKLY_PLAN, record)}\n\n"
-        "*Proposed Weekly State Changes:*\n"
-        f"{_format_artifact_change_summary(record.weekly_state_changes)}"
-    )
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=build_review_stage_keyboard(ReviewStage.WEEKLY_PLAN.value),
-        parse_mode="Markdown",
-    )
-
-
-async def send_review_stage_gate(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    record,
-) -> None:
-    """
-    Presents the correct user-facing gate for the workflow's current stage.
-
-    The review manager owns stage transitions. This dispatcher only chooses the
-    Telegram surface for the persisted stage, keeping stage-specific UI details
-    out of callback and message handlers.
-    """
-    if record.current_stage == ReviewStage.WEEKLY_PLAN:
-        await send_weekly_plan_confirmation(context, chat_id, record)
-        return
-
-    if record.current_stage == ReviewStage.MEMORY_AUDIT:
-        await send_memory_audit_confirmation(context, chat_id, record)
-        return
-
-    if record.current_stage in {
-        ReviewStage.WEEK_REVIEW,
-        ReviewStage.GOALS_AUDIT,
-        ReviewStage.FINAL_REVIEW,
-    }:
-        await send_review_stage_confirmation(
-            context,
-            chat_id,
-            record,
-            record.current_stage,
-        )
-        return
-
-    raise ValueError(f"Unsupported review-stage gate: {record.current_stage.value}.")
-
-
-async def apply_confirmed_review_stage_artifacts(
-    context: ContextTypes.DEFAULT_TYPE,
-    stage: ReviewStage,
-    record,
-) -> bool:
-    """
-    Applies confirmed markdown artifacts that belong to a review-stage gate.
-
-    Most checkpoint stages only advance. Memory audit and weekly plan also
-    approve deterministic markdown replacements that downstream stages must see
-    before the workflow can continue.
-    """
-    artifact_by_stage = {
-        ReviewStage.MEMORY_AUDIT: ArtifactType.DECISION_LOG,
-        ReviewStage.WEEKLY_PLAN: ArtifactType.WEEKLY_STATE,
-    }
-    changes_by_stage = {
-        ReviewStage.MEMORY_AUDIT: record.decision_log_changes,
-        ReviewStage.WEEKLY_PLAN: record.weekly_state_changes,
-    }
-
-    if stage not in artifact_by_stage:
-        return True
-
-    changes = changes_by_stage[stage]
-    if changes is None or not changes.proposed_markdown:
-        return True
-
-    write = create_artifact_write(
-        artifact_type=artifact_by_stage[stage],
-        content=changes.proposed_markdown,
-        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
-        source_id=record.id,
-        source_stage=stage.value,
-    )
-    executed_write = execute_artifact_write(write)
-    if executed_write.status == ArtifactWriteStatus.EXECUTED:
-        context.user_data.pop(ACTIVE_ARTIFACT_WRITE_RETRY_KEY, None)
-        return True
-
-    context.user_data[ACTIVE_ARTIFACT_WRITE_RETRY_KEY] = {
-        "write_id": executed_write.id,
-        "review_id": record.id,
-        "stage": stage.value,
-    }
-    return False
-
-
-async def advance_review_after_confirmed_stage(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    record,
-    stage: ReviewStage,
-) -> None:
-    """
-    Marks a confirmed review stage complete and presents the next review gate.
-
-    Normal confirmation and artifact-write retry both converge here once their
-    required side effects have succeeded.
-    """
-    record = await transition_review_stage(
-        record,
-        workflow_status=ReviewWorkflowStatus.ACTIVE,
-        stage=stage,
-        stage_status=StageStatus.COMPLETED,
-        last_completed_stage=stage,
-    )
-    record = await advance_review_from_current_stage(record)
-    context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = record.id
-    context.user_data.pop(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY, None)
-
-    if stage == ReviewStage.WEEKLY_PLAN:
-        # Weekly-plan confirmation is the handoff from markdown artifact review
-        # into normal proposal-thread confirmation. The review manager prepares
-        # the scheduling artifact; handlers own the Telegram proposal queue.
-        proposals_sent = await send_weekly_review_scheduling_proposals(
-            context,
-            chat_id,
-            record,
-        )
-        if not proposals_sent:
-            record = await complete_review_after_event_feedback(
-                record.id,
-                has_pending_weekly_state_feedback=False,
-            )
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="No calendar events were proposed from this accepted weekly plan.",
-            )
-            if record is not None and record.workflow_status == ReviewWorkflowStatus.COMPLETED:
-                context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
-        return
-
-    await send_review_stage_gate(context, chat_id, record)
-
-
-async def send_retryable_artifact_write_notice(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-) -> bool:
-    """
-    Surfaces one confirmed artifact write that still needs explicit retry.
-
-    Startup reconciliation may recover writes that were already confirmed but
-    interrupted before completion. We keep this operational state out of model
-    context and show one retry at a time so the user can resolve it deliberately.
-    """
-    retry_state = context.user_data.get(ACTIVE_ARTIFACT_WRITE_RETRY_KEY)
-    write_id = retry_state.get("write_id") if isinstance(retry_state, dict) else None
-
-    if not write_id:
-        retryable_writes = list_retryable_artifact_writes_sync()
-        if not retryable_writes:
-            return False
-
-        retryable_writes.sort(key=lambda write: write.created_at)
-        write = retryable_writes[0]
-        write_id = write.id
-        context.user_data[ACTIVE_ARTIFACT_WRITE_RETRY_KEY] = {
-            "write_id": write.id,
-            "review_id": write.source_id,
-            "stage": write.source_stage,
-        }
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "⚠️ *A confirmed context update still needs to be applied.*\n\n"
-            "Please retry this write before we continue, so downstream review "
-            "steps do not use stale context."
-        ),
-        reply_markup=build_artifact_write_retry_keyboard(write_id),
-        parse_mode="Markdown",
-    )
-    return True
-
-
-async def revise_active_review_stage(
-    context: ContextTypes.DEFAULT_TYPE,
-    review_id: str,
-    stage: ReviewStage,
-    feedback: str,
-) -> object | None:
-    """
-    Revises the active Sunday review stage from user feedback.
-
-    The review manager owns stage-specific regeneration. The handler only keeps
-    the Telegram confirmation pointer active so the revised stage can be shown
-    again and iterated until the user confirms it.
-    """
-    record = await load_review_workflow(review_id)
-    if record is None:
-        return None
-
-    revised_record = await revise_review_stage(
-        record,
-        stage=stage,
-        feedback=feedback,
-    )
-    context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = {
-        "review_id": revised_record.id,
-        "stage": stage.value,
-    }
-    return revised_record
-
-
-async def _send_proposal_item_confirmation(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    item: ProposalItemRecord,
-    *,
-    prefix_text: str = "",
-    calendar_display_name: str | None = None,
-) -> str:
-    """
-    Presents one active proposal item with confirmation controls.
-
-    The buttons point at the proposal item, not a calendar write. Calendar
-    writes are created only after the user confirms the active item.
-    """
-    start_dt = parse_user_datetime(item.start_time)
-    end_dt = parse_user_datetime(item.end_time)
-    reply_markup = build_proposal_item_keyboard(item.id)
-
-    display_name = calendar_display_name or item.calendar_id
-    calendar_line = (
-        f"Calendar: {display_name} (`{item.calendar_id}`)"
-        if display_name != item.calendar_id
-        else f"Calendar ID: `{item.calendar_id}`"
-    )
-
-    full_text = f"{prefix_text}\n\n" if prefix_text else ""
-    if item.action_type == "cancel":
-        full_text += (
-            f"🗓️ *Proposed Cancellation:*\n*{item.summary}*\n_{item.description}_\n\n"
-            f"{calendar_line}\n"
-            f"Current Start: {format_user_datetime(start_dt)}\n"
-            f"Current End: {format_user_datetime(end_dt)}"
-        )
-    elif item.action_type == "reschedule":
-        full_text += (
-            f"🗓️ *Proposed Reschedule:*\n*{item.summary}*\n_{item.description}_\n\n"
-            f"{calendar_line}\n"
-            f"New Start: {format_user_datetime(start_dt)}\n"
-            f"New End: {format_user_datetime(end_dt)}"
-        )
-    else:
-        full_text += (
-            f"🗓️ *Proposed Event:*\n*{item.summary}*\n_{item.description}_\n\n"
-            f"{calendar_line}\n"
-            f"Start: {format_user_datetime(start_dt)}\n"
-            f"End: {format_user_datetime(end_dt)}"
-        )
-
-    message = await context.bot.send_message(
-        chat_id=chat_id,
-        text=full_text.strip(),
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
-    )
-    track_confirmation_message(context, item.id, message.message_id)
-    return item.id
-
-
-async def _normalize_calendar_action(
-    context: ContextTypes.DEFAULT_TYPE,
-    action: ProposedEvent,
-) -> ProposedEvent:
-    """
-    Resolves and normalizes one proposed calendar action before persistence.
-
-    This keeps initial proposals and revised proposals on the same path: both
-    get canonical calendar metadata, target-event matching, and ISO datetime
-    normalization before becoming durable ProposalItemRecord data.
-    """
-    resolved_calendar = await asyncio.to_thread(
-        resolve_calendar_reference,
-        action.requested_calendar_text,
-    )
-    action.calendar_id = resolved_calendar["calendar_id"]
-    action.calendar_display_name = resolved_calendar["calendar_display_name"]
-
-    if action.action_type in ("cancel", "reschedule"):
-        if "cached_events" not in context.user_data:
-            context.user_data["cached_events"] = await asyncio.to_thread(get_upcoming_events)
-        matched_event = _match_existing_event(context.user_data["cached_events"], action)
-        if not matched_event:
-            raise ValueError(
-                "I couldn't identify a single calendar event to "
-                f"{action.action_type}. Please include the event title and/or start time."
-            )
-        action.target_event_id = matched_event.get("id")
-        action.target_event_calendar_id = matched_event.get("calendar_id", action.calendar_id)
-        if not action.target_event_id:
-            raise ValueError("Matched event is missing an event ID and cannot be modified.")
-
-    start_dt = parse_user_datetime(action.start_time)
-    end_dt = parse_user_datetime(action.end_time)
-    action.start_time = start_dt.isoformat()
-    action.end_time = end_dt.isoformat()
-    return action
-
-
-def _extract_revised_calendar_action(response: FlashResponse) -> ProposedEvent | None:
-    """
-    Extracts the concrete revised event from a Flash response, if present.
-
-    Proposal threads are the only calendar proposal contract; revision turns
-    use the first proposed event as the replacement for the active item.
-    """
-    if response.proposal_thread and response.proposal_thread.proposed_events:
-        return response.proposal_thread.proposed_events[0]
-    return None
-
-
-def _format_calendar_cache_for_revision(context: ContextTypes.DEFAULT_TYPE) -> str:
-    """
-    Formats the session calendar cache for proposal-item revision turns.
-
-    The cache mirrors the Google Calendar snapshot used by normal routing. Adding
-    it to revision prompts lets the model compare draft proposal changes against
-    the user's real calendar without relying on fragile chat history alone.
-    """
-    events = context.user_data.get("cached_events", [])
-    if not events:
-        return "No cached calendar events."
-
-    lines = []
-    for event in events:
-        start = event.get("start", {}).get("dateTime", event.get("start", {}).get("date", "Unknown start"))
-        end = event.get("end", {}).get("dateTime", event.get("end", {}).get("date", "Unknown end"))
-        summary = event.get("summary", "Busy / No Title")
-        calendar_id = event.get("calendar_id", "primary")
-        event_id = event.get("id", "unknown")
-        lines.append(
-            f"- {summary} | {start} to {end} | calendar_id={calendar_id} | event_id={event_id}"
-        )
-
-    return "\n".join(lines)
-
-
-def _format_proposal_thread_context(item: ProposalItemRecord) -> str:
-    """
-    Formats the durable proposal thread state for a revision turn.
-
-    Each feedback turn includes the latest stored state for the whole thread so
-    later proposal items can be revised with awareness of prior accepted,
-    rejected, queued, or still-unresolved items in the same batch.
-    """
-    try:
-        thread_items = list_proposal_items(item.thread_id)
-    except Exception as error:
-        logger.error(f"Failed to load proposal thread context for {item.thread_id}: {error}")
-        thread_items = [item]
-
-    lines = []
-    for thread_item in thread_items:
-        validation_note = (
-            f"\n  Validation/feedback note: {thread_item.last_feedback}"
-            if thread_item.last_feedback
-            else ""
-        )
-        target_line = (
-            f"\n  Target event ID: {thread_item.target_event_id}"
-            if thread_item.target_event_id
-            else ""
-        )
-        lines.append(
-            f"Item {thread_item.sequence_index + 1} ({thread_item.status.value})\n"
-            f"  Action: {thread_item.action_type}\n"
-            f"  Summary: {thread_item.summary}\n"
-            f"  Start: {thread_item.start_time}\n"
-            f"  End: {thread_item.end_time}\n"
-            f"  Description: {thread_item.description}\n"
-            f"  Calendar ID: {thread_item.calendar_id}"
-            f"{target_line}"
-            f"{validation_note}"
-        )
-
-    return "\n\n".join(lines)
-
-
-def _format_revision_request(
-    context: ContextTypes.DEFAULT_TYPE,
-    item: ProposalItemRecord,
-    feedback: str,
-) -> str:
-    """
-    Builds an explicit revision turn for the router.
-
-    The message includes the real calendar cache and the whole proposal thread
-    because chat history alone is not durable enough for multi-turn revisions.
-    """
-    return (
-        "Revise the active calendar proposal using this feedback. "
-        "Return a concrete revised proposal only if it is ready for confirmation; "
-        "otherwise ask a clarifying question.\n\n"
-        "<CURRENT_CALENDAR_CONTEXT>\n"
-        f"{_format_calendar_cache_for_revision(context)}\n"
-        "</CURRENT_CALENDAR_CONTEXT>\n\n"
-        "<PROPOSAL_THREAD_CONTEXT>\n"
-        f"{_format_proposal_thread_context(item)}\n"
-        "</PROPOSAL_THREAD_CONTEXT>\n\n"
-        "<ACTIVE_PROPOSAL_ITEM>\n"
-        f"Action: {item.action_type}\n"
-        f"Summary: {item.summary}\n"
-        f"Start: {item.start_time}\n"
-        f"End: {item.end_time}\n"
-        f"Description: {item.description}\n"
-        f"Calendar ID: {item.calendar_id}\n"
-        "</ACTIVE_PROPOSAL_ITEM>\n\n"
-        f"<USER_FEEDBACK>\n{feedback}\n</USER_FEEDBACK>"
-    )
-
-
-def _proposal_event_from_item(item: ProposalItemRecord) -> ProposedEvent:
-    """
-    Rebuilds the proposal schema from a persisted item.
-
-    This is used as a recovery path when a revision cannot be validated: the
-    active proposal should stay confirmable instead of being stranded in an
-    in-revision state after the old inline keyboard has been retired.
-    """
-    return ProposedEvent(
-        action_type=item.action_type,
-        summary=item.summary,
-        start_time=item.start_time,
-        end_time=item.end_time,
-        description=item.description,
-        requested_calendar_text=item.calendar_id,
-        calendar_id=item.calendar_id,
-        target_event_id=item.target_event_id,
-        target_event_calendar_id=item.target_event_calendar_id,
-    )
-
-
-def _rollback_latest_chat_turn(context: ContextTypes.DEFAULT_TYPE, user_text: str) -> None:
-    """
-    Removes the most recent model turn when downstream validation rejects it.
-
-    The router appends chat history before the Telegram handler validates and
-    displays calendar proposals. If validation fails afterward, this rollback
-    keeps short-term memory from treating an undelivered proposal as real context.
+    Removes the latest router turn when handler-side validation rejects it.
+
+    The router writes chat history before this Telegram layer validates calendar
+    proposals. If validation fails here, we remove only that failed pair so
+    David does not remember an undelivered proposal as real conversation state.
     """
     chat_history = context.user_data.get("chat_history")
     if not isinstance(chat_history, list) or len(chat_history) < 2:
@@ -743,387 +160,10 @@ def _rollback_latest_chat_turn(context: ContextTypes.DEFAULT_TYPE, user_text: st
         and latest_user_turn.get("content") == user_text
         and latest_assistant_turn.get("role") == "assistant"
     ):
-        # Remove the paired user/assistant entries for only this failed turn;
-        # older session context remains intact for the next normal message.
+        # Only remove the failed turn pair; older context remains available for
+        # the next normal message in the same session.
         chat_history.pop()
         chat_history.pop()
-
-
-def _format_unresolved_proposal_prompt(item: ProposalItemRecord, prefix_text: str = "") -> str:
-    """
-    Builds the user-facing prompt for a recoverable but not-yet-confirmable item.
-
-    These items stay in the proposal thread as IN_REVISION drafts. They need more
-    user detail before we can safely present confirm/reject calendar controls.
-    """
-    start_text = item.start_time
-    end_text = item.end_time
-    try:
-        start_text = format_user_datetime(parse_user_datetime(item.start_time))
-        end_text = format_user_datetime(parse_user_datetime(item.end_time))
-    except Exception:
-        logger.debug("Using raw proposal times for unresolved item {}.", item.id)
-
-    validation_note = (
-        f"\n\nIssue: {item.last_feedback}"
-        if item.last_feedback
-        else ""
-    )
-    prompt = (
-        f"📝 *Needs clarification:*\n"
-        f"*{item.summary}*\n"
-        f"_{item.description}_\n\n"
-        f"Action: {item.action_type}\n"
-        f"Calendar ID: `{item.calendar_id}`\n"
-        f"Draft Start: {start_text}\n"
-        f"Draft End: {end_text}"
-        f"{validation_note}\n\n"
-        "Please send the event title and/or start time so I can update this proposal."
-    )
-    return f"{prefix_text}\n\n{prompt}".strip() if prefix_text else prompt
-
-
-async def _send_proposal_item_clarification(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    item: ProposalItemRecord,
-    *,
-    prefix_text: str = "",
-) -> str:
-    """
-    Presents an unresolved proposal item and tracks it for the next text reply.
-
-    Unlike confirmation UI, this message has no inline buttons because the item
-    is not safe to accept until calendar validation succeeds.
-    """
-    message = await context.bot.send_message(
-        chat_id=chat_id,
-        text=_format_unresolved_proposal_prompt(item, prefix_text=prefix_text),
-        parse_mode="Markdown",
-    )
-    track_confirmation_message(context, item.id, message.message_id)
-    return item.id
-
-
-async def _revise_active_proposal_item(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    item_id: str,
-    message_id: int,
-    feedback: str,
-) -> bool:
-    """
-    Revises one active proposal item in place from user feedback.
-
-    The old confirmation message is retired before reasoning starts so stale
-    buttons cannot confirm an outdated proposal while the revision is underway.
-    """
-    item = get_proposal_item(item_id)
-    if not item or item.status not in {
-        ProposalItemStatus.ACTIVE,
-        ProposalItemStatus.IN_REVISION,
-    }:
-        return False
-
-    try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text="Revision requested. Retiring this proposal while I update it.",
-        )
-    except Exception as error:
-        logger.error(f"Failed to retire proposal item UI for {item_id}: {error}")
-
-    mark_proposal_item_in_revision(item_id, feedback=feedback)
-    untrack_confirmation_message(context, item_id)
-
-    if "cached_events" not in context.user_data:
-        context.user_data["cached_events"] = await asyncio.to_thread(get_upcoming_events)
-
-    revision_request = _format_revision_request(context, item, feedback)
-    response = await process_message(revision_request, context)
-    revised_action = _extract_revised_calendar_action(response)
-
-    if revised_action is None:
-        message = await context.bot.send_message(chat_id=chat_id, text=response.message)
-        track_confirmation_message(context, item_id, message.message_id)
-        return True
-
-    try:
-        normalized_action = await _normalize_calendar_action(context, revised_action)
-    except ValueError as error:
-        _rollback_latest_chat_turn(context, revision_request)
-        updated_item = revise_proposal_item(
-            item_id,
-            revised_action,
-            feedback=feedback,
-        )
-        unresolved_item = (
-            mark_proposal_item_in_revision(item_id, feedback=str(error))
-            if updated_item is not None
-            else None
-        )
-        if unresolved_item is not None:
-            await _send_proposal_item_clarification(
-                context,
-                chat_id,
-                unresolved_item,
-                prefix_text="I still need more detail before I can confirm this calendar change.",
-            )
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=str(error))
-        return True
-
-    revised_item = revise_proposal_item(
-        item_id,
-        normalized_action,
-        feedback=feedback,
-    )
-    if revised_item is None:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="I couldn't update the active proposal. Please try again.",
-        )
-        return True
-
-    await _send_proposal_item_confirmation(
-        context,
-        chat_id,
-        revised_item,
-        prefix_text=response.message,
-        calendar_display_name=normalized_action.calendar_display_name,
-    )
-    return True
-
-
-async def _advance_proposal_thread_after_item_resolution(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    item: ProposalItemRecord,
-    *,
-    outcome_text: str,
-) -> bool:
-    """
-    Presents the next queued item after one proposal item is resolved.
-
-    This advances exactly one step. The next item still needs its own
-    confirm/reject/revision turn, so the queue depletes through user decisions
-    rather than a single handler call.
-    """
-    next_item = activate_next_proposal_item(item.thread_id)
-    if next_item is None:
-        return False
-
-    if next_item.status == ProposalItemStatus.IN_REVISION:
-        await _send_proposal_item_clarification(
-            context,
-            chat_id,
-            next_item,
-            prefix_text=f"{outcome_text}. I need one clarification before the next related proposal.",
-        )
-        return True
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"{outcome_text}. Sending the next related proposal now.",
-    )
-    await _send_proposal_item_confirmation(
-        context,
-        chat_id,
-        next_item,
-    )
-    return True
-
-
-async def send_calendar_proposal(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    action,
-    prefix_text: str = "",
-    *,
-    source_type: str = "conversation",
-    source_id: str | None = None,
-    thread_title: str | None = None,
-) -> str:
-    """
-    Compatibility wrapper for one-item calendar proposals.
-
-    New code should prefer send_proposal_thread. This helper keeps older call
-    sites working while routing through the same durable proposal-thread path.
-    """
-    proposal_thread = ProposalThreadDraft(
-        title=thread_title or action.summary,
-        rationale="Single calendar action proposed from the current conversation turn.",
-        proposed_events=[action],
-    )
-    item_id = await send_proposal_thread(
-        context,
-        chat_id,
-        proposal_thread,
-        prefix_text=prefix_text,
-        source_type=source_type,
-        source_id=source_id,
-    )
-    if item_id is None:
-        raise RuntimeError("Failed to create a proposal item for the calendar action.")
-    return item_id
-
-
-async def send_proposal_thread(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    proposal_thread,
-    *,
-    prefix_text: str = "",
-    source_type: str = "conversation",
-    source_id: str | None = None,
-) -> str | None:
-    """
-    Persists a proposed thread and presents its first proposal item.
-
-    calendar_planning_mode is a per-turn model decision; this durable thread is
-    the longer-lived state that lets later turns discuss, revise, or confirm
-    individual items without losing the shared proposal scope.
-    """
-    if not proposal_thread.proposed_events:
-        return None
-
-    proposal_actions: list[tuple[ProposedEvent, ProposalItemStatus, str | None]] = []
-    first_display_name: str | None = None
-    for index, action in enumerate(proposal_thread.proposed_events):
-        # Validate every model-proposed calendar action before creating durable
-        # thread state, but keep failed actions as recoverable drafts in sequence.
-        try:
-            normalized_action = await _normalize_calendar_action(context, action)
-        except ValueError as error:
-            proposal_actions.append((action, ProposalItemStatus.IN_REVISION, str(error)))
-            continue
-        if first_display_name is None:
-            first_display_name = normalized_action.calendar_display_name
-        proposal_actions.append((normalized_action, ProposalItemStatus.QUEUED, None))
-
-    thread = create_proposal_thread(
-        source_type=source_type,
-        source_id=source_id or context.user_data.get("current_session_id"),
-        title=proposal_thread.title,
-    )
-
-    for index, (action, status, validation_error) in enumerate(proposal_actions):
-        item = add_proposal_item(
-            thread.id,
-            action,
-            sequence_index=index,
-            status=status,
-        )
-        if validation_error:
-            mark_proposal_item_in_revision(item.id, feedback=validation_error)
-
-    item = activate_next_proposal_item(thread.id)
-    if item is None:
-        raise RuntimeError("Failed to activate the first item in the proposal thread.")
-
-    if item.status == ProposalItemStatus.IN_REVISION:
-        return await _send_proposal_item_clarification(
-            context,
-            chat_id,
-            item,
-            prefix_text=prefix_text,
-        )
-
-    return await _send_proposal_item_confirmation(
-        context,
-        chat_id,
-        item,
-        prefix_text=prefix_text,
-        calendar_display_name=first_display_name,
-    )
-
-
-async def send_weekly_review_scheduling_proposals(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    review_workflow,
-) -> bool:
-    """
-    Presents scheduling-pass proposals after the weekly plan has been accepted.
-
-    Scheduling proposals are stage artifacts until this point. Once the weekly
-    plan is confirmed, they become a normal proposal thread with item-by-item
-    confirmation and revision behavior.
-    """
-    scheduling_proposals = review_workflow.scheduling_proposals
-    if not scheduling_proposals or not scheduling_proposals.proposed_events:
-        return False
-
-    proposed_events = [
-        ProposedEvent.model_validate(event)
-        for event in scheduling_proposals.proposed_events
-    ]
-    sorted_events = sorted(
-        proposed_events,
-        key=lambda event: parse_user_datetime(event.start_time),
-    )
-    await send_proposal_thread(
-        context=context,
-        chat_id=chat_id,
-        proposal_thread=ProposalThreadDraft(
-            title="Weekly review calendar proposals",
-            rationale=(
-                scheduling_proposals.scheduling_rationale
-                or "Calendar proposals generated from the Sunday review."
-            ),
-            proposed_events=sorted_events,
-        ),
-        prefix_text=(
-            "📅 *Weekly Review Proposal 1 of "
-            f"{len(sorted_events)}*\n"
-            "Please confirm, reject, or send feedback on this event before I move to the next one."
-        ),
-        source_type="weekly_review",
-        source_id=review_workflow.id,
-    )
-    return True
-
-
-def _match_existing_event(cached_events: list[dict], action: ProposedEvent):
-    """Attempts to match a cancel/reschedule action to one specific upcoming event."""
-    target_summary = (action.target_event_summary or action.summary or "").strip().lower()
-    target_start_dt = parse_user_datetime(action.target_event_start_time) if action.target_event_start_time else None
-
-    best_event = None
-    best_score = float("-inf")
-    for event in cached_events:
-        event_summary = event.get("summary", "").strip().lower()
-        event_calendar_id = event.get("calendar_id", "primary")
-        event_start_raw = event.get("start", {}).get("dateTime", event.get("start", {}).get("date"))
-        if not event_start_raw:
-            continue
-
-        score = 0.0
-        if target_summary:
-            if event_summary == target_summary:
-                score += 3.0
-            elif target_summary in event_summary or event_summary in target_summary:
-                score += 1.5
-            else:
-                continue
-
-        if target_start_dt:
-            try:
-                event_start_dt = parse_user_datetime(event_start_raw)
-                delta_minutes = abs((event_start_dt - target_start_dt).total_seconds()) / 60.0
-                score += max(0.0, 2.0 - min(delta_minutes, 120.0) / 60.0)
-            except Exception:
-                continue
-
-        if action.calendar_id and event_calendar_id == action.calendar_id:
-            score += 1.0
-
-        if score > best_score:
-            best_score = score
-            best_event = event
-
-    return best_event
 
 
 # Handlers for Telegram bot commands and messages.
@@ -1290,7 +330,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.edit_message_text(text=text, parse_mode="Markdown")
         if created_event:
-            advanced_thread = await _advance_proposal_thread_after_item_resolution(
+            advanced_thread = await advance_proposal_thread_after_item_resolution(
                 context=context,
                 chat_id=query.message.chat_id,
                 outcome_text="Confirmed",
@@ -1405,7 +445,7 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await query.edit_message_text(text=text, parse_mode="Markdown")
         if rejected_item:
-            advanced_thread = await _advance_proposal_thread_after_item_resolution(
+            advanced_thread = await advance_proposal_thread_after_item_resolution(
                 context=context,
                 chat_id=query.message.chat_id,
                 outcome_text="Rejected",
@@ -1545,7 +585,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 untrack_confirmation_message(context, item_id)
                 continue
 
-            revised = await _revise_active_proposal_item(
+            revised = await revise_active_proposal_item(
                 context,
                 update.effective_chat.id,
                 item_id,
@@ -1592,7 +632,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(response.message)
     except ValueError as e:
         logger.error(f"Calendar proposal validation error: {e}")
-        _rollback_latest_chat_turn(context, text)
+        _rollback_failed_router_turn(context, text)
         await update.message.reply_text(str(e))
     except Exception as e:
         logger.error(f"Error handling message: {e}")

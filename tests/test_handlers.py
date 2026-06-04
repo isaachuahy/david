@@ -7,11 +7,14 @@ from bot.handlers import (
     handle_reject,
     handle_start_trigger,
     handle_delay_trigger,
-    send_calendar_proposal,
-    send_proposal_thread,
-    send_review_stage_gate,
     test_schedule as handler_test_schedule,
 )
+from bot.proposal_flow import (
+    revise_active_proposal_item,
+    send_calendar_proposal,
+    send_proposal_thread,
+)
+from bot.review_flow import send_review_stage_gate
 from orchestrator.session_manager import (
     SESSION_INACTIVITY_TIMEOUT,
     get_session_timeout_job_name,
@@ -210,31 +213,23 @@ async def test_handle_message_rolls_back_failed_proposal_turn_from_chat_history(
 
 
 @pytest.mark.asyncio
-@patch('bot.handlers._send_proposal_item_confirmation', new_callable=AsyncMock)
-@patch('bot.handlers.revise_proposal_item')
-@patch('bot.handlers.mark_proposal_item_in_revision')
-@patch('bot.handlers.get_proposal_item')
-@patch('bot.handlers.process_message', new_callable=AsyncMock)
-async def test_handle_message_revises_active_proposal_item_in_place(
+@patch('bot.proposal_flow._send_proposal_item_confirmation', new_callable=AsyncMock)
+@patch('bot.proposal_flow.revise_proposal_item')
+@patch('bot.proposal_flow.mark_proposal_item_in_revision')
+@patch('bot.proposal_flow.get_proposal_item')
+@patch('bot.proposal_flow.process_message', new_callable=AsyncMock)
+async def test_revise_active_proposal_item_updates_proposal_in_place(
     mock_process_message,
     mock_get_proposal_item,
     mock_mark_in_revision,
     mock_revise_proposal_item,
     mock_send_confirmation,
 ):
-    update = MagicMock()
-    update.effective_chat.id = 456
-    update.effective_user.id = 123
-    update.message.text = "Move it to 10 instead"
-    update.message.reply_text = AsyncMock()
-
     context = MagicMock()
     context.user_data = {
-        "pending_confirmations": [("pi_123", 999)],
         "session_state": "ACTIVE",
         "cached_events": [],
     }
-    context.bot_data = {"allowed_user_id": 123}
     context.bot.edit_message_text = AsyncMock()
 
     original_item = make_proposal_item()
@@ -258,7 +253,13 @@ async def test_handle_message_revises_active_proposal_item_in_place(
     )
     mock_revise_proposal_item.return_value = revised_item
 
-    await handle_message(update, context)
+    await revise_active_proposal_item(
+        context,
+        456,
+        "pi_123",
+        999,
+        "Move it to 10 instead",
+    )
 
     context.bot.edit_message_text.assert_awaited_once_with(
         chat_id=456,
@@ -269,16 +270,15 @@ async def test_handle_message_revises_active_proposal_item_in_place(
     assert mock_process_message.await_args.args[0].startswith("Revise the active calendar proposal")
     mock_revise_proposal_item.assert_called_once()
     mock_send_confirmation.assert_awaited_once()
-    update.message.reply_text.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@patch('bot.handlers._send_proposal_item_clarification', new_callable=AsyncMock)
-@patch('bot.handlers.activate_next_proposal_item')
-@patch('bot.handlers.mark_proposal_item_in_revision')
-@patch('bot.handlers._normalize_calendar_action', new_callable=AsyncMock)
-@patch('bot.handlers.add_proposal_item')
-@patch('bot.handlers.create_proposal_thread')
+@patch('bot.proposal_flow._send_proposal_item_clarification', new_callable=AsyncMock)
+@patch('bot.proposal_flow.activate_next_proposal_item')
+@patch('bot.proposal_flow.mark_proposal_item_in_revision')
+@patch('bot.proposal_flow._normalize_calendar_action', new_callable=AsyncMock)
+@patch('bot.proposal_flow.add_proposal_item')
+@patch('bot.proposal_flow.create_proposal_thread')
 async def test_send_proposal_thread_keeps_invalid_item_recoverable(
     mock_create_proposal_thread,
     mock_add_proposal_item,
@@ -349,12 +349,12 @@ async def test_send_proposal_thread_keeps_invalid_item_recoverable(
 
 
 @pytest.mark.asyncio
-@patch('bot.handlers._send_proposal_item_confirmation', new_callable=AsyncMock)
-@patch('bot.handlers.activate_next_proposal_item')
-@patch('bot.handlers.mark_proposal_item_in_revision')
-@patch('bot.handlers._normalize_calendar_action', new_callable=AsyncMock)
-@patch('bot.handlers.add_proposal_item')
-@patch('bot.handlers.create_proposal_thread')
+@patch('bot.proposal_flow._send_proposal_item_confirmation', new_callable=AsyncMock)
+@patch('bot.proposal_flow.activate_next_proposal_item')
+@patch('bot.proposal_flow.mark_proposal_item_in_revision')
+@patch('bot.proposal_flow._normalize_calendar_action', new_callable=AsyncMock)
+@patch('bot.proposal_flow.add_proposal_item')
+@patch('bot.proposal_flow.create_proposal_thread')
 async def test_send_proposal_thread_persists_mixed_batch_in_original_order(
     mock_create_proposal_thread,
     mock_add_proposal_item,
@@ -484,13 +484,13 @@ async def test_handle_message_untracks_stale_proposal_and_routes_normally(
 
 
 @pytest.mark.asyncio
-@patch('bot.handlers._send_proposal_item_clarification', new_callable=AsyncMock)
-@patch('bot.handlers._normalize_calendar_action', new_callable=AsyncMock)
-@patch('bot.handlers.revise_proposal_item')
-@patch('bot.handlers.mark_proposal_item_in_revision')
-@patch('bot.handlers.get_proposal_item')
-@patch('bot.handlers.process_message', new_callable=AsyncMock)
-async def test_handle_message_keeps_revised_item_unresolved_when_validation_fails(
+@patch('bot.proposal_flow._send_proposal_item_clarification', new_callable=AsyncMock)
+@patch('bot.proposal_flow._normalize_calendar_action', new_callable=AsyncMock)
+@patch('bot.proposal_flow.revise_proposal_item')
+@patch('bot.proposal_flow.mark_proposal_item_in_revision')
+@patch('bot.proposal_flow.get_proposal_item')
+@patch('bot.proposal_flow.process_message', new_callable=AsyncMock)
+async def test_revise_active_proposal_item_keeps_revised_item_unresolved_when_validation_fails(
     mock_process_message,
     mock_get_proposal_item,
     mock_mark_in_revision,
@@ -498,19 +498,11 @@ async def test_handle_message_keeps_revised_item_unresolved_when_validation_fail
     mock_normalize_calendar_action,
     mock_send_clarification,
 ):
-    update = MagicMock()
-    update.effective_chat.id = 456
-    update.effective_user.id = 123
-    update.message.text = "Cancel this event instead"
-    update.message.reply_text = AsyncMock()
-
     context = MagicMock()
     context.user_data = {
-        "pending_confirmations": [("pi_123", 999)],
         "session_state": "ACTIVE",
         "cached_events": [],
     }
-    context.bot_data = {"allowed_user_id": 123}
     context.bot.edit_message_text = AsyncMock()
     context.bot.send_message = AsyncMock()
 
@@ -541,7 +533,13 @@ async def test_handle_message_keeps_revised_item_unresolved_when_validation_fail
     mock_revise_proposal_item.return_value = updated_item
     mock_mark_in_revision.side_effect = [None, unresolved_item]
 
-    await handle_message(update, context)
+    await revise_active_proposal_item(
+        context,
+        456,
+        "pi_123",
+        999,
+        "Cancel this event instead",
+    )
 
     assert mock_mark_in_revision.call_args_list[0].args == ("pi_123",)
     assert mock_mark_in_revision.call_args_list[0].kwargs == {
@@ -561,31 +559,23 @@ async def test_handle_message_keeps_revised_item_unresolved_when_validation_fail
         prefix_text="I still need more detail before I can confirm this calendar change.",
     )
     context.bot.send_message.assert_not_awaited()
-    update.message.reply_text.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@patch('bot.handlers.track_confirmation_message')
-@patch('bot.handlers.list_proposal_items')
-@patch('bot.handlers.mark_proposal_item_in_revision')
-@patch('bot.handlers.get_proposal_item')
-@patch('bot.handlers.process_message', new_callable=AsyncMock)
-async def test_handle_message_keeps_unresolved_item_tracked_across_clarifications(
+@patch('bot.proposal_flow.track_confirmation_message')
+@patch('bot.proposal_flow.list_proposal_items')
+@patch('bot.proposal_flow.mark_proposal_item_in_revision')
+@patch('bot.proposal_flow.get_proposal_item')
+@patch('bot.proposal_flow.process_message', new_callable=AsyncMock)
+async def test_revise_active_proposal_item_keeps_unresolved_item_tracked_across_clarifications(
     mock_process_message,
     mock_get_proposal_item,
     mock_mark_in_revision,
     mock_list_proposal_items,
     mock_track_confirmation_message,
 ):
-    update = MagicMock()
-    update.effective_chat.id = 456
-    update.effective_user.id = 123
-    update.message.text = "It is the sync with Alex"
-    update.message.reply_text = AsyncMock()
-
     context = MagicMock()
     context.user_data = {
-        "pending_confirmations": [("pi_456", 999)],
         "session_state": "ACTIVE",
         "cached_events": [
             {
@@ -597,7 +587,6 @@ async def test_handle_message_keeps_unresolved_item_tracked_across_clarification
             },
         ],
     }
-    context.bot_data = {"allowed_user_id": 123}
     context.bot.edit_message_text = AsyncMock()
     context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=777))
 
@@ -619,7 +608,13 @@ async def test_handle_message_keeps_unresolved_item_tracked_across_clarification
         message="Which Alex sync should I use?"
     )
 
-    await handle_message(update, context)
+    await revise_active_proposal_item(
+        context,
+        456,
+        "pi_456",
+        999,
+        "It is the sync with Alex",
+    )
 
     revision_prompt = mock_process_message.await_args.args[0]
     assert "<CURRENT_CALENDAR_CONTEXT>" in revision_prompt
@@ -634,7 +629,6 @@ async def test_handle_message_keeps_unresolved_item_tracked_across_clarification
         text="Which Alex sync should I use?",
     )
     mock_track_confirmation_message.assert_called_once_with(context, "pi_456", 777)
-    update.message.reply_text.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -922,9 +916,9 @@ async def test_handle_start_trigger_weekly_pauses_at_week_review_confirmation(
 
 
 @pytest.mark.asyncio
-@patch('bot.handlers.send_review_stage_gate', new_callable=AsyncMock)
-@patch('bot.handlers.advance_review_from_current_stage', new_callable=AsyncMock)
-@patch('bot.handlers.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.review_flow.send_review_stage_gate', new_callable=AsyncMock)
+@patch('bot.review_flow.advance_review_from_current_stage', new_callable=AsyncMock)
+@patch('bot.review_flow.transition_review_stage', new_callable=AsyncMock)
 @patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
 async def test_handle_confirm_review_stage_advances_to_next_stage_confirmation(
     mock_load_review_workflow,
@@ -1005,12 +999,12 @@ async def test_handle_confirm_review_stage_advances_to_next_stage_confirmation(
 
 
 @pytest.mark.asyncio
-@patch('bot.handlers.send_review_stage_gate', new_callable=AsyncMock)
-@patch('bot.handlers.advance_review_from_current_stage', new_callable=AsyncMock)
-@patch('bot.handlers.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.review_flow.send_review_stage_gate', new_callable=AsyncMock)
+@patch('bot.review_flow.advance_review_from_current_stage', new_callable=AsyncMock)
+@patch('bot.review_flow.transition_review_stage', new_callable=AsyncMock)
 @patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
-@patch('bot.handlers.execute_artifact_write')
-@patch('bot.handlers.create_artifact_write')
+@patch('bot.review_flow.execute_artifact_write')
+@patch('bot.review_flow.create_artifact_write')
 async def test_handle_confirm_memory_audit_executes_decision_log_artifact_write(
     mock_create_artifact_write,
     mock_execute_artifact_write,
@@ -1110,11 +1104,11 @@ async def test_handle_confirm_memory_audit_executes_decision_log_artifact_write(
 
 
 @pytest.mark.asyncio
-@patch('bot.handlers.advance_review_from_current_stage', new_callable=AsyncMock)
-@patch('bot.handlers.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.review_flow.advance_review_from_current_stage', new_callable=AsyncMock)
+@patch('bot.review_flow.transition_review_stage', new_callable=AsyncMock)
 @patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
-@patch('bot.handlers.execute_artifact_write')
-@patch('bot.handlers.create_artifact_write')
+@patch('bot.review_flow.execute_artifact_write')
+@patch('bot.review_flow.create_artifact_write')
 async def test_handle_confirm_memory_audit_failed_artifact_write_shows_retry(
     mock_create_artifact_write,
     mock_execute_artifact_write,
@@ -1185,9 +1179,9 @@ async def test_handle_confirm_memory_audit_failed_artifact_write_shows_retry(
 
 
 @pytest.mark.asyncio
-@patch('bot.handlers.send_review_stage_gate', new_callable=AsyncMock)
-@patch('bot.handlers.advance_review_from_current_stage', new_callable=AsyncMock)
-@patch('bot.handlers.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.review_flow.send_review_stage_gate', new_callable=AsyncMock)
+@patch('bot.review_flow.advance_review_from_current_stage', new_callable=AsyncMock)
+@patch('bot.review_flow.transition_review_stage', new_callable=AsyncMock)
 @patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
 @patch('bot.handlers.retry_artifact_write')
 async def test_handle_retry_artifact_write_success_advances_review(
@@ -1360,8 +1354,8 @@ async def test_send_review_stage_gate_presents_memory_audit_decision_log_changes
 
 @pytest.mark.asyncio
 @patch('bot.handlers.send_review_stage_gate', new_callable=AsyncMock)
-@patch('bot.handlers.revise_review_stage', new_callable=AsyncMock)
-@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
+@patch('bot.review_flow.revise_review_stage', new_callable=AsyncMock)
+@patch('bot.review_flow.load_review_workflow', new_callable=AsyncMock)
 async def test_handle_message_revises_active_review_stage(
     mock_load_review_workflow,
     mock_revise_review_stage,
@@ -1427,12 +1421,12 @@ async def test_handle_message_revises_active_review_stage(
 
 
 @pytest.mark.asyncio
-@patch('bot.handlers.send_proposal_thread', new_callable=AsyncMock)
-@patch('bot.handlers.advance_review_from_current_stage', new_callable=AsyncMock)
-@patch('bot.handlers.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.proposal_flow.send_proposal_thread', new_callable=AsyncMock)
+@patch('bot.review_flow.advance_review_from_current_stage', new_callable=AsyncMock)
+@patch('bot.review_flow.transition_review_stage', new_callable=AsyncMock)
 @patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
-@patch('bot.handlers.execute_artifact_write')
-@patch('bot.handlers.create_artifact_write')
+@patch('bot.review_flow.execute_artifact_write')
+@patch('bot.review_flow.create_artifact_write')
 async def test_handle_confirm_weekly_plan_advances_and_sends_scheduling_proposals(
     mock_create_artifact_write,
     mock_execute_artifact_write,
@@ -1553,8 +1547,8 @@ async def test_handle_confirm_weekly_plan_advances_and_sends_scheduling_proposal
 
 
 @pytest.mark.asyncio
-@patch('bot.handlers._send_proposal_item_confirmation', new_callable=AsyncMock)
-@patch('bot.handlers.activate_next_proposal_item')
+@patch('bot.proposal_flow._send_proposal_item_confirmation', new_callable=AsyncMock)
+@patch('bot.proposal_flow.activate_next_proposal_item')
 @patch('bot.handlers.mark_proposal_item_accepted')
 @patch('bot.handlers.confirm_write')
 @patch('bot.handlers.accept_proposal_item')
@@ -1614,8 +1608,8 @@ async def test_handle_confirm_advances_durable_proposal_thread(
 
 
 @pytest.mark.asyncio
-@patch('bot.handlers._send_proposal_item_clarification', new_callable=AsyncMock)
-@patch('bot.handlers.activate_next_proposal_item')
+@patch('bot.proposal_flow._send_proposal_item_clarification', new_callable=AsyncMock)
+@patch('bot.proposal_flow.activate_next_proposal_item')
 @patch('bot.handlers.mark_proposal_item_accepted')
 @patch('bot.handlers.confirm_write')
 @patch('bot.handlers.accept_proposal_item')
@@ -1716,7 +1710,7 @@ async def test_handle_confirm_keeps_cached_events_in_chronological_order(
 
 @pytest.mark.asyncio
 @patch('bot.handlers.complete_review_after_event_feedback', new_callable=AsyncMock)
-@patch('bot.handlers.activate_next_proposal_item')
+@patch('bot.proposal_flow.activate_next_proposal_item')
 @patch('bot.handlers.reject_proposal_item')
 @patch('bot.handlers.get_proposal_item')
 @patch('bot.handlers.untrack_confirmation_message')
@@ -1795,12 +1789,12 @@ async def test_test_schedule_uses_calendar_proposal_helper(mock_send_calendar_pr
     assert kwargs["prefix_text"] == "I propose scheduling 'David UI Test Event' for the next 15 minutes. Does this look good?"
 
 @pytest.mark.asyncio
-@patch('bot.handlers.resolve_calendar_reference')
-@patch('bot.handlers.track_confirmation_message')
-@patch('bot.handlers.build_proposal_item_keyboard')
-@patch('bot.handlers.activate_next_proposal_item')
-@patch('bot.handlers.add_proposal_item')
-@patch('bot.handlers.create_proposal_thread')
+@patch('bot.proposal_flow.resolve_calendar_reference')
+@patch('bot.proposal_flow.track_confirmation_message')
+@patch('bot.proposal_flow.build_proposal_item_keyboard')
+@patch('bot.proposal_flow.activate_next_proposal_item')
+@patch('bot.proposal_flow.add_proposal_item')
+@patch('bot.proposal_flow.create_proposal_thread')
 async def test_send_calendar_proposal_displays_toronto_time(
     mock_create_proposal_thread,
     mock_add_proposal_item,
