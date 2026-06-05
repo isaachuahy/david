@@ -208,149 +208,227 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data.startswith("retry_artifact_write_"):
-        write_id = query.data.split("retry_artifact_write_")[1]
-        executed_write = retry_artifact_write(write_id)
-        if executed_write is None:
-            await query.edit_message_text("❌ *This retry is no longer available.*", parse_mode="Markdown")
-            return
-        if executed_write.status != ArtifactWriteStatus.EXECUTED:
-            context.user_data[ACTIVE_ARTIFACT_WRITE_RETRY_KEY] = {
-                "write_id": executed_write.id,
-                "review_id": executed_write.source_id,
-                "stage": executed_write.source_stage,
-            }
-            await query.edit_message_text(
-                "❌ *The write still could not be applied. The review remains paused.*",
-                reply_markup=build_artifact_write_retry_keyboard(executed_write.id),
-                parse_mode="Markdown",
-            )
-            return
-
-        retry_state = context.user_data.pop(ACTIVE_ARTIFACT_WRITE_RETRY_KEY, {})
-        review_id = (
-            retry_state.get("review_id")
-            if isinstance(retry_state, dict)
-            else executed_write.source_id
-        ) or executed_write.source_id
-        stage_value = (
-            retry_state.get("stage")
-            if isinstance(retry_state, dict)
-            else executed_write.source_stage
-        ) or executed_write.source_stage
-        record = await load_review_workflow(review_id) if review_id else None
-        if record is None or not stage_value:
-            await query.edit_message_text(
-                "✅ *Write retried successfully, but I could not resume the review automatically.*",
-                parse_mode="Markdown",
-            )
-            return
-
-        stage = ReviewStage(stage_value)
-        await query.edit_message_text(
-            f"✅ *{stage.value.replace('_', ' ').title()} write retried successfully.*",
-            parse_mode="Markdown",
-        )
-        await advance_review_after_confirmed_stage(context, query.message.chat_id, record, stage)
+        await _handle_artifact_write_retry(update, context)
         return
 
     if query.data.startswith("confirm_review_stage_"):
-        stage = ReviewStage(query.data.split("confirm_review_stage_")[1])
-        active_confirmation = context.user_data.get(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY)
-        review_id = (
-            active_confirmation.get("review_id")
-            if isinstance(active_confirmation, dict)
-            else context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
-        )
-        record = await load_review_workflow(review_id) if review_id else None
-        if record is None:
-            await query.edit_message_text("❌ *This review stage is no longer available.*", parse_mode="Markdown")
-            return
-
-        artifacts_applied = await apply_confirmed_review_stage_artifacts(context, stage, record)
-        if not artifacts_applied:
-            retry_state = context.user_data.get(ACTIVE_ARTIFACT_WRITE_RETRY_KEY)
-            retry_write_id = (
-                retry_state.get("write_id")
-                if isinstance(retry_state, dict)
-                else None
-            )
-            await query.edit_message_text(
-                "❌ *I could not apply the confirmed review changes. The review is still paused here.*",
-                reply_markup=(
-                    build_artifact_write_retry_keyboard(retry_write_id)
-                    if retry_write_id
-                    else None
-                ),
-                parse_mode="Markdown",
-            )
-            return
-
-        await query.edit_message_text(
-            f"✅ *{stage.value.replace('_', ' ').title()} confirmed.*",
-            parse_mode="Markdown",
-        )
-        await advance_review_after_confirmed_stage(context, query.message.chat_id, record, stage)
+        await _handle_review_stage_confirm(update, context)
         return
 
     if query.data.startswith("confirm_item_"):
-        item_id = query.data.split("confirm_item_")[1]
-        untrack_confirmation_message(context, item_id)
-
-        item = get_proposal_item(item_id)
-        if not item or item.status != ProposalItemStatus.ACTIVE:
-            await query.edit_message_text(text="❌ *This proposal is no longer valid or has already been processed.*", parse_mode="Markdown")
-            return
-
-        write_id = accept_proposal_item(item_id)
-        created_event = await asyncio.to_thread(confirm_write, write_id) if write_id else None
-        if created_event:
-            mark_proposal_item_accepted(item_id)
-            action_label = item.action_type.capitalize()
-            text = f"{query.message.text}\n\n✅ *{action_label} confirmed and executed.*"
-            if 'cached_events' not in context.user_data:
-                context.user_data['cached_events'] = []
-            if item.action_type == "cancel":
-                context.user_data['cached_events'] = [
-                    event
-                    for event in context.user_data['cached_events']
-                    if event.get("id") != item.target_event_id
-                ]
-            elif item.action_type == "reschedule":
-                existing = [
-                    event for event in context.user_data['cached_events']
-                    if event.get("id") != item.target_event_id
-                ]
-                existing.append(created_event)
-                context.user_data['cached_events'] = existing
-            else:
-                context.user_data['cached_events'].append(created_event)
-            context.user_data['cached_events'].sort(key=calendar_event_sort_key)
-        else:
-            text = f"{query.message.text}\n\n❌ *Failed to execute calendar action.*"
-
-        await query.edit_message_text(text=text, parse_mode="Markdown")
-        if created_event:
-            advanced_thread = await advance_proposal_thread_after_item_resolution(
-                context=context,
-                chat_id=query.message.chat_id,
-                outcome_text="Confirmed",
-                item=item,
-            )
-            if not advanced_thread:
-                review_id = context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
-                if review_id:
-                    review_workflow = await complete_review_after_event_feedback(
-                        review_id,
-                        has_pending_weekly_state_feedback=False,
-                    )
-                    if (
-                        review_workflow is not None
-                        and review_workflow.workflow_status == ReviewWorkflowStatus.COMPLETED
-                    ):
-                        context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
+        await _handle_proposal_item_confirm(update, context)
         return
 
     write_id = query.data.split("confirm_")[1]
+    await _handle_legacy_calendar_write_confirm(update, context, write_id)
+
+
+async def _handle_artifact_write_retry(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Retries a previously confirmed artifact write and resumes its review stage.
+
+    These retries are operational recovery for confirmed markdown changes; they
+    replay stored content and should not rerun the model or mutate proposals.
+    """
+    query = update.callback_query
+    write_id = query.data.split("retry_artifact_write_")[1]
+    executed_write = retry_artifact_write(write_id)
+    if executed_write is None:
+        await query.edit_message_text("❌ *This retry is no longer available.*", parse_mode="Markdown")
+        return
+
+    if executed_write.status != ArtifactWriteStatus.EXECUTED:
+        context.user_data[ACTIVE_ARTIFACT_WRITE_RETRY_KEY] = {
+            "write_id": executed_write.id,
+            "review_id": executed_write.source_id,
+            "stage": executed_write.source_stage,
+        }
+        await query.edit_message_text(
+            "❌ *The write still could not be applied. The review remains paused.*",
+            reply_markup=build_artifact_write_retry_keyboard(executed_write.id),
+            parse_mode="Markdown",
+        )
+        return
+
+    retry_state = context.user_data.pop(ACTIVE_ARTIFACT_WRITE_RETRY_KEY, {})
+    review_id = (
+        retry_state.get("review_id")
+        if isinstance(retry_state, dict)
+        else executed_write.source_id
+    ) or executed_write.source_id
+    stage_value = (
+        retry_state.get("stage")
+        if isinstance(retry_state, dict)
+        else executed_write.source_stage
+    ) or executed_write.source_stage
+    record = await load_review_workflow(review_id) if review_id else None
+    if record is None or not stage_value:
+        await query.edit_message_text(
+            "✅ *Write retried successfully, but I could not resume the review automatically.*",
+            parse_mode="Markdown",
+        )
+        return
+
+    stage = ReviewStage(stage_value)
+    await query.edit_message_text(
+        f"✅ *{stage.value.replace('_', ' ').title()} write retried successfully.*",
+        parse_mode="Markdown",
+    )
+    await advance_review_after_confirmed_stage(context, query.message.chat_id, record, stage)
+
+
+async def _handle_review_stage_confirm(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Confirms the active Sunday-review stage and advances the gated workflow.
+
+    Artifact-producing stages must execute their confirmed markdown writes
+    before downstream stages run, otherwise later prompts could read stale
+    decision-log or weekly-state context.
+    """
+    query = update.callback_query
+    stage = ReviewStage(query.data.split("confirm_review_stage_")[1])
+    active_confirmation = context.user_data.get(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY)
+    review_id = (
+        active_confirmation.get("review_id")
+        if isinstance(active_confirmation, dict)
+        else context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
+    )
+    record = await load_review_workflow(review_id) if review_id else None
+    if record is None:
+        await query.edit_message_text("❌ *This review stage is no longer available.*", parse_mode="Markdown")
+        return
+
+    artifacts_applied = await apply_confirmed_review_stage_artifacts(context, stage, record)
+    if not artifacts_applied:
+        retry_state = context.user_data.get(ACTIVE_ARTIFACT_WRITE_RETRY_KEY)
+        retry_write_id = (
+            retry_state.get("write_id")
+            if isinstance(retry_state, dict)
+            else None
+        )
+        await query.edit_message_text(
+            "❌ *I could not apply the confirmed review changes. The review is still paused here.*",
+            reply_markup=(
+                build_artifact_write_retry_keyboard(retry_write_id)
+                if retry_write_id
+                else None
+            ),
+            parse_mode="Markdown",
+        )
+        return
+
+    await query.edit_message_text(
+        f"✅ *{stage.value.replace('_', ' ').title()} confirmed.*",
+        parse_mode="Markdown",
+    )
+    await advance_review_after_confirmed_stage(context, query.message.chat_id, record, stage)
+
+
+async def _handle_proposal_item_confirm(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Converts one accepted proposal item into a calendar write and executes it.
+
+    Proposal items become terminal only after the calendar side effect succeeds;
+    if this item was the last one in a Sunday-review thread, the review can
+    complete after the proposal queue is depleted.
+    """
+    query = update.callback_query
+    item_id = query.data.split("confirm_item_")[1]
+    untrack_confirmation_message(context, item_id)
+
+    item = get_proposal_item(item_id)
+    if not item or item.status != ProposalItemStatus.ACTIVE:
+        await query.edit_message_text(text="❌ *This proposal is no longer valid or has already been processed.*", parse_mode="Markdown")
+        return
+
+    write_id = accept_proposal_item(item_id)
+    created_event = await asyncio.to_thread(confirm_write, write_id) if write_id else None
+    if created_event:
+        mark_proposal_item_accepted(item_id)
+        action_label = item.action_type.capitalize()
+        text = f"{query.message.text}\n\n✅ *{action_label} confirmed and executed.*"
+        _update_cached_events_after_calendar_write(context, item, created_event)
+    else:
+        text = f"{query.message.text}\n\n❌ *Failed to execute calendar action.*"
+
+    await query.edit_message_text(text=text, parse_mode="Markdown")
+    if not created_event:
+        return
+
+    advanced_thread = await advance_proposal_thread_after_item_resolution(
+        context=context,
+        chat_id=query.message.chat_id,
+        outcome_text="Confirmed",
+        item=item,
+    )
+    if not advanced_thread:
+        review_id = context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
+        if review_id:
+            review_workflow = await complete_review_after_event_feedback(
+                review_id,
+                has_pending_weekly_state_feedback=False,
+            )
+            if (
+                review_workflow is not None
+                and review_workflow.workflow_status == ReviewWorkflowStatus.COMPLETED
+            ):
+                context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
+
+
+def _update_cached_events_after_calendar_write(
+    context: ContextTypes.DEFAULT_TYPE,
+    record,
+    created_event: dict,
+) -> None:
+    """
+    Keeps the session calendar cache aligned after a confirmed calendar write.
+
+    The cache is only per-session, but updating it immediately lets follow-up
+    routing see the new calendar state without waiting for another API fetch.
+    """
+    if "cached_events" not in context.user_data:
+        context.user_data["cached_events"] = []
+
+    if record.action_type == "cancel":
+        context.user_data["cached_events"] = [
+            event
+            for event in context.user_data["cached_events"]
+            if event.get("id") != record.target_event_id
+        ]
+    elif record.action_type == "reschedule":
+        existing = [
+            event for event in context.user_data["cached_events"]
+            if event.get("id") != record.target_event_id
+        ]
+        existing.append(created_event)
+        context.user_data["cached_events"] = existing
+    else:
+        context.user_data["cached_events"].append(created_event)
+
+    context.user_data["cached_events"].sort(key=calendar_event_sort_key)
+
+
+async def _handle_legacy_calendar_write_confirm(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    write_id: str,
+) -> None:
+    """
+    Confirms an older pending CalendarWriteRecord that is not proposal-threaded.
+
+    Most new calendar paths use proposal items. This branch remains for any
+    still-pending legacy writes and keeps their cache update behavior intact.
+    """
+    query = update.callback_query
     untrack_confirmation_message(context, write_id)
 
     record = get_pending_write(write_id)
@@ -362,33 +440,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if created_event:
         action_label = record.action_type.capitalize()
         text = f"{query.message.text}\n\n✅ *{action_label} confirmed and executed.*"
-        # Immediately update the local cache so the LLM knows about this new event
-        # Note: This cache is only for the current session and will not persist across sessions.
-        # This is a workaround to ensure that if the user schedules an event and then immediately asks David about their schedule, 
-        # the new event will be included in the context without needing to wait for the next API fetch cycle.
-
-        # Initialize the in-memory calendar cache if it hasn't been populated yet,
-        # then append the newly created event so subsequent context builds see it
-        # without waiting for another Calendar API fetch.
-
-        if 'cached_events' not in context.user_data:
-            context.user_data['cached_events'] = []
-        if record.action_type == "cancel":
-            context.user_data['cached_events'] = [
-                event
-                for event in context.user_data['cached_events']
-                if event.get("id") != record.target_event_id
-            ]
-        elif record.action_type == "reschedule":
-            existing = [
-                event for event in context.user_data['cached_events']
-                if event.get("id") != record.target_event_id
-            ]
-            existing.append(created_event)
-            context.user_data['cached_events'] = existing
-        else:
-            context.user_data['cached_events'].append(created_event)
-        context.user_data['cached_events'].sort(key=calendar_event_sort_key)
+        _update_cached_events_after_calendar_write(context, record, created_event)
     else:
         text = f"{query.message.text}\n\n❌ *Failed to execute calendar action.*"
         
