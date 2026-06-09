@@ -2106,17 +2106,21 @@ async def test_handle_confirm_keeps_cached_events_in_chronological_order(
     ]
 
 @pytest.mark.asyncio
-@patch('bot.handlers.complete_review_after_event_feedback', new_callable=AsyncMock)
+@patch('bot.handlers.send_review_stage_gate', new_callable=AsyncMock)
+@patch('bot.handlers.prepare_final_review_stage', new_callable=AsyncMock)
+@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
 @patch('bot.proposal_flow.activate_next_proposal_item')
 @patch('bot.handlers.reject_proposal_item')
 @patch('bot.handlers.get_proposal_item')
 @patch('bot.handlers.untrack_confirmation_message')
-async def test_handle_reject_completes_weekly_review_proposal_thread(
+async def test_handle_reject_shows_final_review_after_weekly_review_proposal_thread(
     mock_remove_ui,
     mock_get_item,
     mock_reject_proposal_item,
     mock_activate_next_proposal_item,
-    mock_complete_review_after_event_feedback,
+    mock_load_review_workflow,
+    mock_prepare_final_review_stage,
+    mock_send_review_stage_gate,
 ):
     update = MagicMock()
     update.effective_user.id = 123
@@ -2139,14 +2143,32 @@ async def test_handle_reject_completes_weekly_review_proposal_thread(
     mock_get_item.return_value = item
     mock_reject_proposal_item.return_value = item
     mock_activate_next_proposal_item.return_value = None
+    review_record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+    )
+    final_record = review_record.model_copy(
+        update={
+            "current_stage": ReviewStage.FINAL_REVIEW,
+            "stage_status": StageStatus.AWAITING_FEEDBACK,
+            "final_review": StageCheckpoint(summary="Ready to close the review."),
+        }
+    )
+    mock_load_review_workflow.return_value = review_record
+    mock_prepare_final_review_stage.return_value = final_record
 
     await handle_reject(update, context)
 
     mock_activate_next_proposal_item.assert_called_once_with("pt_123")
-    mock_complete_review_after_event_feedback.assert_awaited_once_with(
-        "review_test",
-        has_pending_weekly_state_feedback=False,
-    )
+    mock_load_review_workflow.assert_awaited_once_with("review_test")
+    mock_prepare_final_review_stage.assert_awaited_once_with(review_record)
+    mock_send_review_stage_gate.assert_awaited_once_with(context, 456, final_record)
 
 @pytest.mark.asyncio
 async def test_handle_delay_trigger():

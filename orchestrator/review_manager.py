@@ -1619,38 +1619,6 @@ async def advance_review_from_current_stage(
     )
 
 
-async def complete_review_after_event_feedback(
-    review_id: str,
-    *,
-    has_pending_weekly_state_feedback: bool,
-) -> Optional[ReviewWorkflowRecord]:
-    """
-    Completes or pauses the review after calendar proposal feedback finishes.
-
-    This helper assumes it is called after the final weekly-review proposal
-    item has been resolved. If weekly-state feedback is still open,
-    the review remains in `AWAITING_FEEDBACK`; otherwise it is complete.
-    """
-    record = await load_review_workflow(review_id)
-    if record is None:
-        return None
-
-    if has_pending_weekly_state_feedback:
-        return await transition_review_stage(
-            record,
-            stage=ReviewStage.FINAL_REVIEW,
-            stage_status=StageStatus.AWAITING_FEEDBACK,
-        )
-
-    return await transition_review_stage(
-        record,
-        workflow_status=ReviewWorkflowStatus.COMPLETED,
-        stage=ReviewStage.FINAL_REVIEW,
-        stage_status=StageStatus.COMPLETED,
-        last_completed_stage=ReviewStage.FINAL_REVIEW,
-    )
-
-
 def execute_weekly_state_update(content: str) -> bool:
     """
     Replaces weekly_state.md with confirmed markdown and snapshots the result.

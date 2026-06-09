@@ -23,8 +23,8 @@ from orchestrator.session_manager import (
 )
 from orchestrator.artifact_writes import retry_artifact_write
 from orchestrator.review_manager import (
-    complete_review_after_event_feedback,
     load_review_workflow,
+    prepare_final_review_stage,
     start_weekly_review_workflow,
     transition_review_stage,
 )
@@ -371,17 +371,10 @@ async def _handle_proposal_item_confirm(
         item=item,
     )
     if not advanced_thread:
-        review_id = context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
-        if review_id:
-            review_workflow = await complete_review_after_event_feedback(
-                review_id,
-                has_pending_weekly_state_feedback=False,
-            )
-            if (
-                review_workflow is not None
-                and review_workflow.workflow_status == ReviewWorkflowStatus.COMPLETED
-            ):
-                context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
+        await _show_final_review_after_proposal_thread_depleted(
+            context,
+            query.message.chat_id,
+        )
 
 
 def _update_cached_events_after_calendar_write(
@@ -415,6 +408,30 @@ def _update_cached_events_after_calendar_write(
         context.user_data["cached_events"].append(created_event)
 
     context.user_data["cached_events"].sort(key=calendar_event_sort_key)
+
+
+async def _show_final_review_after_proposal_thread_depleted(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+) -> None:
+    """
+    Shows the final review after the last weekly-review proposal item resolves.
+
+    Calendar proposals are reviewed item by item. Once that queue is depleted,
+    the Sunday review should still pause at the deterministic final-review gate
+    instead of completing implicitly.
+    """
+    review_id = context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
+    if not review_id:
+        return
+
+    record = await load_review_workflow(review_id)
+    if record is None:
+        return
+
+    final_record = await prepare_final_review_stage(record)
+    context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = final_record.id
+    await send_review_stage_gate(context, chat_id, final_record)
 
 
 async def _handle_legacy_calendar_write_confirm(
@@ -504,17 +521,10 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 item=item,
             )
             if not advanced_thread:
-                review_id = context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY)
-                if review_id:
-                    review_workflow = await complete_review_after_event_feedback(
-                        review_id,
-                        has_pending_weekly_state_feedback=False,
-                    )
-                    if (
-                        review_workflow is not None
-                        and review_workflow.workflow_status == ReviewWorkflowStatus.COMPLETED
-                    ):
-                        context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
+                await _show_final_review_after_proposal_thread_depleted(
+                    context,
+                    query.message.chat_id,
+                )
         return
 
     write_id = query.data.split("reject_")[1]
