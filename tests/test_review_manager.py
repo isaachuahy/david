@@ -27,6 +27,7 @@ from persistence.models import (
 from reasoning.schemas import (
     DecisionLogChangeProposalResponse,
     GoalsAuditResponse,
+    GoalsChangeProposalResponse,
     MemoryAuditResponse,
     ProposedEvent,
     SchedulingPassResponse,
@@ -65,6 +66,21 @@ This file stores durable memory for David across weeks.
 
 ## Recent Decisions (Appended Daily)
 - Dentist appointment was missed in the original week review.
+"""
+
+
+VALID_GOALS_MARKDOWN = """# Goals
+
+This file stores durable goals and operating principles for David.
+
+## Long-Term
+- Build durable technical and product judgment.
+
+## Medium-Term
+- Complete the David MVP.
+
+## Operating Principles
+- Protect morning deep work.
 """
 
 
@@ -159,12 +175,19 @@ async def test_run_goals_audit_stage_persists_goals_audit_checkpoint(
             carry_forward=["Clarify job-search emphasis."],
         ),
     )
-    mock_generate_review_structured.return_value = GoalsAuditResponse(
-        summary="The goals still hold, but job-search emphasis should be reconfirmed.",
-        key_findings=["MVP and job-search goals both remain relevant."],
-        constraints=["Weekly planning should not overload evenings."],
-        carry_forward=["Ask whether job-search volume should increase next week."],
-    )
+    mock_generate_review_structured.side_effect = [
+        GoalsAuditResponse(
+            summary="The goals still hold, but job-search emphasis should be reconfirmed.",
+            key_findings=["MVP and job-search goals both remain relevant."],
+            constraints=["Weekly planning should not overload evenings."],
+            carry_forward=["Ask whether job-search volume should increase next week."],
+        ),
+        GoalsChangeProposalResponse(
+            proposed_change_summary="No durable goals change is justified yet.",
+            proposed_markdown=None,
+            requires_user_reconfirmation=False,
+        ),
+    ]
 
     updated_record = await run_goals_audit_stage(record)
 
@@ -181,9 +204,92 @@ async def test_run_goals_audit_stage_persists_goals_audit_checkpoint(
     assert updated_record.goals_audit.carry_forward == [
         "Ask whether job-search volume should increase next week.",
     ]
+    assert updated_record.goals_changes is None
     assert updated_record.last_completed_stage == ReviewStage.GOALS_AUDIT
-    mock_generate_review_structured.assert_called_once()
-    mock_save_review_workflow_sync.assert_called_once()
+    assert mock_generate_review_structured.call_count == 2
+    assert mock_save_review_workflow_sync.call_count == 2
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
+async def test_run_goals_audit_stage_persists_valid_goals_change(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """Tests that a validated goals proposal is stored for later confirmation."""
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown=VALID_GOALS_MARKDOWN,
+            weekly_state_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+            decision_log_markdown=VALID_DECISION_LOG_MARKDOWN,
+        ),
+        week_review=StageCheckpoint(
+            summary="The week showed that morning deep work remains important.",
+        ),
+    )
+    updated_goals = VALID_GOALS_MARKDOWN.replace(
+        "- Complete the David MVP.",
+        "- Complete the David MVP without overfilling evening recovery time.",
+    )
+    mock_generate_review_structured.side_effect = [
+        GoalsAuditResponse(
+            summary="The MVP goal still holds, with an added recovery constraint.",
+            key_findings=["Evening overload is recurring enough to affect goals wording."],
+        ),
+        GoalsChangeProposalResponse(
+            proposed_change_summary="Clarify that MVP work should not consume evening recovery time.",
+            proposed_markdown=updated_goals,
+            requires_user_reconfirmation=True,
+        ),
+    ]
+
+    updated_record = await run_goals_audit_stage(record)
+
+    assert updated_record.goals_changes is not None
+    assert updated_record.goals_changes.modifications == [
+        "Clarify that MVP work should not consume evening recovery time.",
+    ]
+    assert updated_record.goals_changes.proposed_markdown == updated_goals.strip()
+    assert mock_generate_review_structured.call_count == 2
+    mock_save_review_workflow_sync.assert_called()
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
+async def test_run_goals_audit_stage_rejects_invalid_goals_markdown(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """Tests that malformed goals proposals fail before reaching confirmation."""
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown=VALID_GOALS_MARKDOWN,
+            weekly_state_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+            decision_log_markdown=VALID_DECISION_LOG_MARKDOWN,
+        ),
+        week_review=StageCheckpoint(summary="The week progressed."),
+    )
+    mock_generate_review_structured.side_effect = [
+        GoalsAuditResponse(summary="A goals update may be useful."),
+        GoalsChangeProposalResponse(
+            proposed_change_summary="Invalid proposal missing operating principles.",
+            proposed_markdown="# Goals\n\n## Long-Term\n- Build David.\n",
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="missing required section"):
+        await run_goals_audit_stage(record)
+
+    assert mock_generate_review_structured.call_count == 2
+    assert mock_save_review_workflow_sync.call_count == 1
 
 
 @pytest.mark.asyncio

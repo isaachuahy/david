@@ -1,0 +1,38 @@
+You are proposing optional durable changes to `goals.md` for a gated weekly review workflow.
+
+Use the goals audit checkpoint as the primary reason to change goals. The week review, weekly state, and decision log are supporting evidence only.
+
+Propose a goals replacement only when the evidence supports a durable shift in direction, priority, or operating principle. It is valid and often preferred to propose no markdown change.
+
+If proposing replacement markdown:
+- Preserve the existing goals-file purpose and section structure.
+- Keep wording stable, concise, and grounded in explicit review evidence.
+- Do not turn weekly tasks into durable goals.
+- Do not infer major identity or priority changes from silence.
+- Flag durable identity, priority, or operating-principle assumptions for user reconfirmation.
+
+Do not:
+- Rewrite `weekly_state.md`
+- Rewrite `decision_log.md`
+- Propose calendar events
+- Add noisy implementation details or one-off weekly observations
+
+<CURRENT_GOALS>
+$goals_markdown
+</CURRENT_GOALS>
+
+<WEEK_REVIEW_CHECKPOINT>
+$week_review_checkpoint
+</WEEK_REVIEW_CHECKPOINT>
+
+<GOALS_AUDIT_CHECKPOINT>
+$goals_audit_checkpoint
+</GOALS_AUDIT_CHECKPOINT>
+
+<WEEKLY_STATE>
+$weekly_state_markdown
+</WEEKLY_STATE>
+
+<DECISION_LOG>
+$decision_log_markdown
+</DECISION_LOG>

@@ -1104,6 +1104,111 @@ async def test_handle_confirm_memory_audit_executes_decision_log_artifact_write(
 
 
 @pytest.mark.asyncio
+@patch('bot.review_flow.send_review_stage_gate', new_callable=AsyncMock)
+@patch('bot.review_flow.advance_review_from_current_stage', new_callable=AsyncMock)
+@patch('bot.review_flow.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
+@patch('bot.review_flow.execute_artifact_write')
+@patch('bot.review_flow.create_artifact_write')
+async def test_handle_confirm_goals_audit_executes_goals_artifact_write(
+    mock_create_artifact_write,
+    mock_execute_artifact_write,
+    mock_load_review_workflow,
+    mock_transition_review_stage,
+    mock_advance_review_from_current_stage,
+    mock_send_review_stage_gate,
+):
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.callback_query = MagicMock()
+    update.callback_query.data = "confirm_review_stage_goals_audit"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.chat_id = 456
+
+    context = MagicMock()
+    context.user_data = {
+        "active_review_workflow_id": "review_test",
+        "active_review_stage_confirmation": {
+            "review_id": "review_test",
+            "stage": "goals_audit",
+        },
+    }
+    context.bot_data = {"allowed_user_id": 123}
+
+    loaded_record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.GOALS_AUDIT,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        goals_audit=StageCheckpoint(summary="Goals audit is ready."),
+        goals_changes=ArtifactChangeSummary(
+            modifications=["Clarify the durable MVP goal."],
+            proposed_markdown="# Goals\n\n## Long-Term\n- Build David.\n\n## Medium-Term\n- Finish MVP.\n\n## Operating Principles\n- Protect mornings.",
+        ),
+    )
+    completed_record = loaded_record.model_copy(
+        update={
+            "workflow_status": ReviewWorkflowStatus.ACTIVE,
+            "current_stage": ReviewStage.GOALS_AUDIT,
+            "stage_status": StageStatus.COMPLETED,
+            "last_completed_stage": ReviewStage.GOALS_AUDIT,
+        }
+    )
+    advanced_record = completed_record.model_copy(
+        update={
+            "workflow_status": ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            "current_stage": ReviewStage.MEMORY_AUDIT,
+            "stage_status": StageStatus.AWAITING_FEEDBACK,
+        }
+    )
+    artifact_write = ArtifactWriteRecord(
+        id="awrite_goals",
+        artifact_type=ArtifactType.GOALS,
+        content=loaded_record.goals_changes.proposed_markdown,
+        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
+        source_id="review_test",
+        source_stage=ReviewStage.GOALS_AUDIT.value,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+    )
+    mock_load_review_workflow.return_value = loaded_record
+    mock_create_artifact_write.return_value = artifact_write
+    mock_execute_artifact_write.return_value = artifact_write.model_copy(
+        update={"status": ArtifactWriteStatus.EXECUTED}
+    )
+    mock_transition_review_stage.return_value = completed_record
+    mock_advance_review_from_current_stage.return_value = advanced_record
+
+    await handle_confirm(update, context)
+
+    mock_create_artifact_write.assert_called_once_with(
+        artifact_type=ArtifactType.GOALS,
+        content=loaded_record.goals_changes.proposed_markdown,
+        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
+        source_id="review_test",
+        source_stage=ReviewStage.GOALS_AUDIT.value,
+    )
+    mock_execute_artifact_write.assert_called_once_with(artifact_write)
+    mock_transition_review_stage.assert_awaited_once_with(
+        loaded_record,
+        workflow_status=ReviewWorkflowStatus.ACTIVE,
+        stage=ReviewStage.GOALS_AUDIT,
+        stage_status=StageStatus.COMPLETED,
+        last_completed_stage=ReviewStage.GOALS_AUDIT,
+    )
+    mock_advance_review_from_current_stage.assert_awaited_once_with(completed_record)
+    mock_send_review_stage_gate.assert_awaited_once_with(context, 456, advanced_record)
+
+
+@pytest.mark.asyncio
 @patch('bot.review_flow.advance_review_from_current_stage', new_callable=AsyncMock)
 @patch('bot.review_flow.transition_review_stage', new_callable=AsyncMock)
 @patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
@@ -1349,6 +1454,47 @@ async def test_send_review_stage_gate_presents_memory_audit_decision_log_changes
     assert context.user_data["active_review_stage_confirmation"] == {
         "review_id": "review_test",
         "stage": "memory_audit",
+    }
+
+
+@pytest.mark.asyncio
+async def test_send_review_stage_gate_presents_goals_audit_goals_changes():
+    context = MagicMock()
+    context.user_data = {}
+    context.bot.send_message = AsyncMock()
+
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.GOALS_AUDIT,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        goals_audit=StageCheckpoint(
+            summary="Goals remain accurate, but one priority should be clarified.",
+            key_findings=["MVP scope needs more explicit protection from evening overload."],
+        ),
+        goals_changes=ArtifactChangeSummary(
+            modifications=["Clarify the durable MVP goal."],
+            proposed_markdown="# Goals\n\n## Long-Term\n- Build David.\n\n## Medium-Term\n- Finish MVP.\n\n## Operating Principles\n- Protect mornings.",
+        ),
+    )
+
+    await send_review_stage_gate(context, 456, record)
+
+    context.bot.send_message.assert_awaited_once()
+    sent_text = context.bot.send_message.await_args.kwargs["text"]
+    assert "*Goals Audit Ready*" in sent_text
+    assert "*Proposed Goals Changes:*" in sent_text
+    assert "Clarify the durable MVP goal." in sent_text
+    assert context.user_data["active_review_stage_confirmation"] == {
+        "review_id": "review_test",
+        "stage": "goals_audit",
     }
 
 

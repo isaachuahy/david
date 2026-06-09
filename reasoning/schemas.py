@@ -159,6 +159,29 @@ class GoalsAuditResponse(BaseModel):
     )
 
 
+class GoalsChangeProposalResponse(BaseModel):
+    """
+    LLM-facing schema for the optional goals rewrite proposal pass.
+
+    The audit checkpoint decides whether durable goals need attention. This
+    response carries the concrete markdown proposal only when a change is
+    justified enough for explicit user confirmation.
+    """
+
+    proposed_change_summary: str = Field(
+        default="",
+        description="Compact summary of the proposed durable goals change, or why no change is needed.",
+    )
+    proposed_markdown: str | None = Field(
+        default=None,
+        description="Full replacement goals.md content when a durable change is proposed.",
+    )
+    requires_user_reconfirmation: bool = Field(
+        default=False,
+        description="Whether the proposal touches durable identity, priority, or operating-principle assumptions.",
+    )
+
+
 class MemoryAuditResponse(BaseModel):
     """
     LLM-facing schema for the memory audit stage of the Sunday review workflow.

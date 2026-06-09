@@ -135,6 +135,29 @@ async def send_memory_audit_confirmation(
     )
 
 
+async def send_goals_audit_confirmation(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    record,
+) -> None:
+    """Presents goals-audit findings plus optional proposed goals changes."""
+    context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = {
+        "review_id": record.id,
+        "stage": ReviewStage.GOALS_AUDIT.value,
+    }
+    text = (
+        f"{_format_review_stage_summary(ReviewStage.GOALS_AUDIT, record)}\n\n"
+        "*Proposed Goals Changes:*\n"
+        f"{_format_artifact_change_summary(record.goals_changes)}"
+    )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=build_review_stage_keyboard(ReviewStage.GOALS_AUDIT.value),
+        parse_mode="Markdown",
+    )
+
+
 async def send_weekly_plan_confirmation(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -181,6 +204,10 @@ async def send_review_stage_gate(
         await send_memory_audit_confirmation(context, chat_id, record)
         return
 
+    if record.current_stage == ReviewStage.GOALS_AUDIT and record.goals_changes is not None:
+        await send_goals_audit_confirmation(context, chat_id, record)
+        return
+
     if record.current_stage in {
         ReviewStage.WEEK_REVIEW,
         ReviewStage.GOALS_AUDIT,
@@ -210,10 +237,12 @@ async def apply_confirmed_review_stage_artifacts(
     before the workflow can continue.
     """
     artifact_by_stage = {
+        ReviewStage.GOALS_AUDIT: ArtifactType.GOALS,
         ReviewStage.MEMORY_AUDIT: ArtifactType.DECISION_LOG,
         ReviewStage.WEEKLY_PLAN: ArtifactType.WEEKLY_STATE,
     }
     changes_by_stage = {
+        ReviewStage.GOALS_AUDIT: record.goals_changes,
         ReviewStage.MEMORY_AUDIT: record.decision_log_changes,
         ReviewStage.WEEKLY_PLAN: record.weekly_state_changes,
     }

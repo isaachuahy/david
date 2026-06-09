@@ -31,6 +31,7 @@ from reasoning.parser import parse_model_response
 from reasoning.schemas import (
     DecisionLogChangeProposalResponse,
     GoalsAuditResponse,
+    GoalsChangeProposalResponse,
     MemoryAuditResponse,
     SchedulingPassResponse,
     WeekReviewResponse,
@@ -74,6 +75,18 @@ _WEEKLY_STATE_REQUIRED_MARKERS = (
 )
 _WEEKLY_STATE_FORBIDDEN_MARKERS = (
     "# Goals",
+    "# Decision Log",
+    "## Current Rolling Context",
+    "## Recent Decisions",
+)
+_GOALS_REQUIRED_MARKERS = (
+    "# Goals",
+    "## Long-Term",
+    "## Medium-Term",
+    "## Operating Principles",
+)
+_GOALS_FORBIDDEN_MARKERS = (
+    "# Weekly State",
     "# Decision Log",
     "## Current Rolling Context",
     "## Recent Decisions",
@@ -258,6 +271,29 @@ def _render_goals_audit_prompt(record: ReviewWorkflowRecord) -> str:
     )
 
 
+def _render_goals_change_prompt(record: ReviewWorkflowRecord) -> str:
+    """
+    Renders the optional goals-change proposal pass from the audit checkpoint.
+
+    The audit pass decides whether goals need attention. This second pass is
+    only responsible for proposing concrete markdown when the evidence supports
+    a durable change.
+    """
+    if record.week_review is None:
+        raise ValueError("Cannot propose goals changes before week_review is checkpointed.")
+    if record.goals_audit is None:
+        raise ValueError("Cannot propose goals changes before goals_audit is checkpointed.")
+
+    return _render_review_prompt(
+        "goals_change.txt",
+        goals_markdown=record.source_snapshot.goals_markdown,
+        week_review_checkpoint=_format_checkpoint_for_prompt(record.week_review),
+        goals_audit_checkpoint=_format_checkpoint_for_prompt(record.goals_audit),
+        weekly_state_markdown=record.source_snapshot.weekly_state_markdown,
+        decision_log_markdown=record.source_snapshot.decision_log_markdown,
+    )
+
+
 def _render_memory_audit_prompt(record: ReviewWorkflowRecord) -> str:
     """
     Renders the memory-audit stage prompt from prior checkpoints and memory.
@@ -387,6 +423,38 @@ def validate_weekly_state_markdown(content: str) -> None:
     if forbidden_markers:
         raise ValueError(
             "Weekly state markdown appears to include another artifact: "
+            + ", ".join(forbidden_markers)
+        )
+
+
+def validate_goals_markdown(content: str) -> None:
+    """
+    Performs deterministic sanity checks before confirming proposed goals.
+
+    Goals are David's durable compass, so the model may propose content, but it
+    must preserve the recognizable artifact shape and avoid cross-file leakage.
+    """
+    stripped = content.strip()
+    if not stripped:
+        raise ValueError("Goals markdown cannot be empty.")
+
+    missing_markers = [
+        marker for marker in _GOALS_REQUIRED_MARKERS
+        if marker not in stripped
+    ]
+    if missing_markers:
+        raise ValueError(
+            "Goals markdown is missing required section(s): "
+            + ", ".join(missing_markers)
+        )
+
+    forbidden_markers = [
+        marker for marker in _GOALS_FORBIDDEN_MARKERS
+        if marker in stripped
+    ]
+    if forbidden_markers:
+        raise ValueError(
+            "Goals markdown appears to include another artifact: "
             + ", ".join(forbidden_markers)
         )
 
@@ -873,13 +941,70 @@ async def run_goals_audit_stage(
     )
     operation = "goals_audit_revision" if revision_feedback else "goals_audit"
 
-    return await _run_checkpoint_stage(
+    record = await _run_checkpoint_stage(
         record=record,
         stage=ReviewStage.GOALS_AUDIT,
         prompt=prompt,
         response_schema=GoalsAuditResponse,
         operation=operation,
     )
+    proposal_prompt = _with_revision_context(
+        _render_goals_change_prompt(record),
+        record=record,
+        stage=ReviewStage.GOALS_AUDIT,
+        revision_feedback=revision_feedback,
+    )
+    proposal_model = _select_review_model(
+        ReviewStage.GOALS_AUDIT,
+        context_chars=len(proposal_prompt),
+    )
+    proposal_operation = "goals_change_revision" if revision_feedback else "goals_change"
+
+    try:
+        proposal = await asyncio.to_thread(
+            _generate_review_structured,
+            prompt=proposal_prompt,
+            response_schema=GoalsChangeProposalResponse,
+            model=proposal_model,
+            operation=proposal_operation,
+        )
+    except Exception:
+        if proposal_model == GEMINI_PRO_MODEL:
+            raise
+
+        retry_operation = f"{proposal_operation}_retry"
+        logger.warning(
+            "Retrying {} with {} after {} failed.",
+            proposal_operation,
+            GEMINI_PRO_MODEL,
+            proposal_model,
+        )
+        proposal = await asyncio.to_thread(
+            _generate_review_structured,
+            prompt=proposal_prompt,
+            response_schema=GoalsChangeProposalResponse,
+            model=GEMINI_PRO_MODEL,
+            operation=retry_operation,
+        )
+
+    proposed_markdown = (
+        proposal.proposed_markdown.strip()
+        if proposal.proposed_markdown and proposal.proposed_markdown.strip()
+        else None
+    )
+    if proposed_markdown:
+        validate_goals_markdown(proposed_markdown)
+        record.goals_changes = ArtifactChangeSummary(
+            modifications=[proposal.proposed_change_summary]
+            if proposal.proposed_change_summary
+            else [],
+            proposed_markdown=proposed_markdown,
+        )
+    else:
+        record.goals_changes = None
+
+    record.last_completed_stage = ReviewStage.GOALS_AUDIT
+    return await save_review_workflow(record)
 
 
 async def run_memory_audit_stage(
