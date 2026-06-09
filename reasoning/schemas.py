@@ -314,8 +314,8 @@ class SchedulingPassResponse(BaseModel):
     """
     LLM-facing schema for the scheduling pass stage of the Sunday review workflow.
 
-    This stage proposes calendar actions for later confirmation while also
-    persisting a compact checkpoint for restart safety and downstream review.
+    This stage decides scheduling intent. Concrete event proposals are generated
+    only after the user confirms this checkpoint.
     """
 
     summary: str = Field(
@@ -333,10 +333,24 @@ class SchedulingPassResponse(BaseModel):
         default_factory=list,
         description="Scheduling questions or unresolved items to preserve for later review.",
     )
+    scheduling_rationale: str = Field(
+        description="Concise explanation of the scheduling strategy to confirm before generating events.",
+    )
+
+
+class SchedulingProposalResponse(BaseModel):
+    """
+    LLM-facing schema for concrete calendar proposals after scheduling intent.
+
+    This runs only after the scheduling pass is confirmed, so proposed events
+    should instantiate that confirmed strategy rather than invent a new one.
+    """
+
     proposed_events: list[ProposedEvent] = Field(
         default_factory=list,
         description="Calendar actions proposed for later user confirmation.",
     )
-    scheduling_rationale: str = Field(
-        description="A concise explanation of why the proposed calendar actions make sense as a set.",
+    proposal_rationale: str = Field(
+        default="",
+        description="Compact explanation of how the proposals follow the confirmed scheduling pass.",
     )

@@ -1,0 +1,40 @@
+You are generating concrete calendar proposal candidates after the Sunday review scheduling intention has been confirmed.
+
+Use the confirmed scheduling pass checkpoint as the primary instruction. The goals, weekly state, memory, and upcoming events are supporting context only.
+
+Propose calendar actions only when they clearly instantiate the confirmed scheduling intention.
+
+Focus on:
+- Concrete events that directly follow the confirmed scheduling rationale
+- Existing calendar conflicts, buffers, and energy constraints
+- Fewer, higher-confidence proposals rather than filling open time
+- Clear summaries, descriptions, and start/end times suitable for later user confirmation
+
+Do not:
+- Change the scheduling strategy
+- Invent new priorities not present in the confirmed scheduling pass
+- Propose vague intentions as calendar writes
+- Ignore unsuitable times, rejected patterns, or existing calendar conflicts
+- Rewrite weekly state, goals, or decision log content
+
+If no concrete calendar action is sufficiently grounded, return no proposed events and explain why.
+
+<CONFIRMED_SCHEDULING_PASS>
+$scheduling_pass_checkpoint
+</CONFIRMED_SCHEDULING_PASS>
+
+<CURRENT_WEEKLY_STATE>
+$weekly_state_markdown
+</CURRENT_WEEKLY_STATE>
+
+<GOALS>
+$goals_markdown
+</GOALS>
+
+<DECISION_LOG>
+$decision_log_markdown
+</DECISION_LOG>
+
+<UPCOMING_EVENTS>
+$upcoming_events_block
+</UPCOMING_EVENTS>

@@ -6,6 +6,7 @@ from orchestrator.review_manager import (
     advance_review_from_current_stage,
     build_final_review_message,
     execute_weekly_state_update,
+    generate_scheduling_proposals,
     run_goals_audit_stage,
     run_memory_audit_stage,
     run_scheduling_pass_stage,
@@ -31,6 +32,7 @@ from reasoning.schemas import (
     MemoryAuditResponse,
     ProposedEvent,
     SchedulingPassResponse,
+    SchedulingProposalResponse,
     WeekReviewResponse,
     WeeklyPlanResponse,
 )
@@ -523,18 +525,11 @@ async def test_run_scheduling_pass_stage_persists_scheduling_checkpoint(
             proposed_markdown=VALID_WEEKLY_STATE_MARKDOWN,
         ),
     )
-    proposed_event = ProposedEvent(
-        summary="Workflow Implementation Block",
-        start_time="2026-05-01T09:00:00-04:00",
-        end_time="2026-05-01T11:00:00-04:00",
-        description="Focused work on the staged Sunday review workflow.",
-    )
     mock_generate_review_structured.return_value = SchedulingPassResponse(
         summary="One focus block would support the reviewed weekly plan.",
         key_findings=["A morning block best matches the stated constraints."],
         constraints=["Avoid late-evening event proposals."],
         carry_forward=[],
-        proposed_events=[proposed_event],
         scheduling_rationale="A single focused implementation block is enough for now.",
     )
 
@@ -550,14 +545,55 @@ async def test_run_scheduling_pass_stage_persists_scheduling_checkpoint(
     assert updated_record.scheduling_pass.constraints == [
         "Avoid late-evening event proposals.",
     ]
+    assert updated_record.scheduling_proposals is None
+    assert updated_record.last_completed_stage == ReviewStage.SCHEDULING_PASS
+    mock_generate_review_structured.assert_called_once()
+    mock_save_review_workflow_sync.assert_called_once()
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
+async def test_generate_scheduling_proposals_uses_confirmed_scheduling_pass(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """Tests that concrete event proposals are generated after scheduling intent."""
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+            decision_log_markdown="# Decision Log",
+            upcoming_events=["[2026-05-01T10:00:00-04:00] Existing Meeting"],
+        ),
+        scheduling_pass=StageCheckpoint(
+            summary="A single morning implementation block is the right direction.",
+            constraints=["Avoid late-evening event proposals."],
+        ),
+    )
+    proposed_event = ProposedEvent(
+        summary="Workflow Implementation Block",
+        start_time="2026-05-01T09:00:00-04:00",
+        end_time="2026-05-01T11:00:00-04:00",
+        description="Focused work on the staged Sunday review workflow.",
+    )
+    mock_generate_review_structured.return_value = SchedulingProposalResponse(
+        proposed_events=[proposed_event],
+        proposal_rationale="This implements the confirmed morning-focus scheduling intent.",
+    )
+
+    updated_record = await generate_scheduling_proposals(record)
+
     assert updated_record.scheduling_proposals is not None
     assert updated_record.scheduling_proposals.scheduling_rationale == (
-        "A single focused implementation block is enough for now."
+        "This implements the confirmed morning-focus scheduling intent."
     )
     assert updated_record.scheduling_proposals.proposed_events == [
         proposed_event.model_dump(mode="json"),
     ]
-    assert updated_record.last_completed_stage == ReviewStage.SCHEDULING_PASS
     mock_generate_review_structured.assert_called_once()
     mock_save_review_workflow_sync.assert_called_once()
 
@@ -778,14 +814,6 @@ async def test_advance_review_from_completed_weekly_plan_runs_downstream_stages(
         key_findings=["A morning implementation block fits the constraints."],
         constraints=["Do not overfill evenings."],
         carry_forward=[],
-        proposed_events=[
-            ProposedEvent(
-                summary="Review Workflow Focus Block",
-                start_time="2026-05-01T09:00:00-04:00",
-                end_time="2026-05-01T11:00:00-04:00",
-                description="Implement the staged Sunday review workflow.",
-            ),
-        ],
         scheduling_rationale="A single focus block supports the weekly plan without overcommitting.",
     )
 
@@ -793,26 +821,12 @@ async def test_advance_review_from_completed_weekly_plan_runs_downstream_stages(
 
     assert updated_record.scheduling_pass is not None
     assert updated_record.scheduling_pass.summary == "One focus block would support the staged review work."
-    assert updated_record.scheduling_proposals is not None
-    assert len(updated_record.scheduling_proposals.proposed_events) == 1
-    assert updated_record.final_review is not None
-    assert updated_record.final_review.summary == build_final_review_message(updated_record)
-    assert "*Scheduling Pass:* One focus block would support the staged review work." in updated_record.final_review.summary
-    assert updated_record.final_review.key_findings == [
-        "Context routing advanced.",
-        "MVP goal remains active.",
-        "Keep the current durable preference signal.",
-        "Staged review work is the highest-leverage priority.",
-        "A morning implementation block fits the constraints.",
-    ]
-    assert updated_record.final_review.carry_forward == [
-        "Weekly state proposal is awaiting confirmation.",
-        "1 scheduling-pass calendar proposal candidate(s) will be handed off for confirmation.",
-    ]
+    assert updated_record.scheduling_proposals is None
+    assert updated_record.final_review is None
     assert updated_record.workflow_status == ReviewWorkflowStatus.AWAITING_FEEDBACK
-    assert updated_record.current_stage == ReviewStage.FINAL_REVIEW
+    assert updated_record.current_stage == ReviewStage.SCHEDULING_PASS
     assert updated_record.stage_status == StageStatus.AWAITING_FEEDBACK
-    assert updated_record.last_completed_stage == ReviewStage.FINAL_REVIEW
+    assert updated_record.last_completed_stage == ReviewStage.SCHEDULING_PASS
 
 
 @patch("orchestrator.artifact_writes.capture_sentry_exception")

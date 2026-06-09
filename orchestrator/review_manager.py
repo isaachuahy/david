@@ -34,6 +34,7 @@ from reasoning.schemas import (
     GoalsChangeProposalResponse,
     MemoryAuditResponse,
     SchedulingPassResponse,
+    SchedulingProposalResponse,
     WeekReviewResponse,
     WeeklyPlanResponse,
 )
@@ -362,9 +363,9 @@ def _render_scheduling_pass_prompt(record: ReviewWorkflowRecord) -> str:
     """
     Renders the scheduling-pass prompt from completed review checkpoints.
 
-    This stage proposes calendar actions from the reviewed weekly plan. It does
-    not create proposal threads yet; that handoff belongs to the confirmation
-    layer shared with normal conversation sessions.
+    This stage decides scheduling intention from the reviewed weekly plan. It
+    deliberately does not generate concrete events until the user confirms the
+    direction.
     """
     if record.week_review is None:
         raise ValueError("Cannot run scheduling_pass before week_review is checkpointed.")
@@ -391,6 +392,26 @@ def _render_scheduling_pass_prompt(record: ReviewWorkflowRecord) -> str:
         weekly_plan_checkpoint=_format_checkpoint_for_prompt(record.weekly_plan),
         past_events_block=_format_snapshot_events_for_prompt(record.source_snapshot.past_week_events),
         upcoming_events_block=upcoming_events_block,
+    )
+
+
+def _render_scheduling_proposals_prompt(record: ReviewWorkflowRecord) -> str:
+    """
+    Renders concrete calendar proposals from confirmed scheduling intention.
+
+    Keeping this separate from scheduling_pass prevents one model call from
+    stating a strategy while generating events that drift away from it.
+    """
+    if record.scheduling_pass is None:
+        raise ValueError("Cannot generate scheduling proposals before scheduling_pass is checkpointed.")
+
+    return _render_review_prompt(
+        "scheduling_proposals.txt",
+        scheduling_pass_checkpoint=_format_checkpoint_for_prompt(record.scheduling_pass),
+        weekly_state_markdown=get_effective_artifact_content(record, ArtifactType.WEEKLY_STATE),
+        goals_markdown=get_effective_artifact_content(record, ArtifactType.GOALS),
+        decision_log_markdown=get_effective_artifact_content(record, ArtifactType.DECISION_LOG),
+        upcoming_events_block=_format_snapshot_events_for_prompt(record.source_snapshot.upcoming_events),
     )
 
 
@@ -1164,8 +1185,8 @@ async def run_scheduling_pass_stage(
     """
     Runs and checkpoints scheduling recommendations for the reviewed week.
 
-    This stage stores the compact checkpoint plus the concrete proposal artifact
-    that handlers later validate into proposal threads for user confirmation.
+    This stage stores the compact scheduling-intent checkpoint. Concrete event
+    proposals are generated only after the user confirms this direction.
     """
     prompt = _with_revision_context(
         _render_scheduling_pass_prompt(record),
@@ -1199,13 +1220,52 @@ async def run_scheduling_pass_stage(
         )
 
     record.scheduling_pass = _response_to_stage_checkpoint(response)
+    record.scheduling_proposals = None
+    record.last_completed_stage = ReviewStage.SCHEDULING_PASS
+    return await save_review_workflow(record)
+
+
+async def generate_scheduling_proposals(
+    record: ReviewWorkflowRecord,
+) -> ReviewWorkflowRecord:
+    """
+    Generates concrete calendar proposal candidates from confirmed scheduling intent.
+
+    This runs after the scheduling_pass gate is accepted, so the model's task is
+    narrower: instantiate the confirmed direction without re-deciding strategy.
+    """
+    prompt = _render_scheduling_proposals_prompt(record)
+    model = _select_review_model(ReviewStage.SCHEDULING_PASS, context_chars=len(prompt))
+    operation = "scheduling_proposals"
+
+    try:
+        response = await asyncio.to_thread(
+            _generate_review_structured,
+            prompt=prompt,
+            response_schema=SchedulingProposalResponse,
+            model=model,
+            operation=operation,
+        )
+    except Exception:
+        if model == GEMINI_PRO_MODEL:
+            raise
+
+        retry_operation = f"{operation}_retry"
+        logger.warning("Retrying {} with {} after {} failed.", operation, GEMINI_PRO_MODEL, model)
+        response = await asyncio.to_thread(
+            _generate_review_structured,
+            prompt=prompt,
+            response_schema=SchedulingProposalResponse,
+            model=GEMINI_PRO_MODEL,
+            operation=retry_operation,
+        )
+
     record.scheduling_proposals = SchedulingPassArtifact(
         proposed_events=[
             event.model_dump(mode="json") for event in response.proposed_events
         ],
-        scheduling_rationale=response.scheduling_rationale,
+        scheduling_rationale=response.proposal_rationale,
     )
-    record.last_completed_stage = ReviewStage.SCHEDULING_PASS
     return await save_review_workflow(record)
 
 
@@ -1232,7 +1292,7 @@ def _clear_outputs_after_stage(record: ReviewWorkflowRecord, stage: ReviewStage)
     if stage_index < _REVIEW_STAGE_INVALIDATION_ORDER.index(ReviewStage.WEEKLY_PLAN):
         record.weekly_state_changes = None
 
-    if stage_index < _REVIEW_STAGE_INVALIDATION_ORDER.index(ReviewStage.SCHEDULING_PASS):
+    if stage_index <= _REVIEW_STAGE_INVALIDATION_ORDER.index(ReviewStage.SCHEDULING_PASS):
         record.scheduling_proposals = None
 
 
@@ -1343,7 +1403,7 @@ def build_final_review_checkpoint(record: ReviewWorkflowRecord) -> StageCheckpoi
     weekly-state markdown confirmation and calendar proposal-thread review.
     """
     checkpoints = [checkpoint for _, checkpoint in _completed_review_checkpoints(record)]
-    carry_forward = ["Weekly state proposal is awaiting confirmation."]
+    carry_forward = ["Confirmed review artifacts have been handled before final review."]
     scheduling_proposal_count = (
         len(record.scheduling_proposals.proposed_events)
         if record.scheduling_proposals
@@ -1367,6 +1427,32 @@ def build_final_review_checkpoint(record: ReviewWorkflowRecord) -> StageCheckpoi
             for constraint in checkpoint.constraints
         ),
         carry_forward=carry_forward,
+    )
+
+
+async def prepare_final_review_stage(record: ReviewWorkflowRecord) -> ReviewWorkflowRecord:
+    """
+    Assembles the deterministic final-review checkpoint and pauses for confirmation.
+
+    This runs after scheduling intent has been confirmed and concrete proposal
+    candidates have been generated, so the final gate summarizes the workflow
+    without invoking another model pass.
+    """
+    record = await transition_review_stage(
+        record,
+        stage=ReviewStage.FINAL_REVIEW,
+        stage_status=StageStatus.RUNNING,
+    )
+    record = await save_stage_checkpoint(
+        record,
+        ReviewStage.FINAL_REVIEW,
+        build_final_review_checkpoint(record),
+    )
+    return await transition_review_stage(
+        record,
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        stage=ReviewStage.FINAL_REVIEW,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
     )
 
 
@@ -1520,20 +1606,10 @@ async def advance_review_from_current_stage(
             stage_status=StageStatus.RUNNING,
         )
         record = await run_scheduling_pass_stage(record)
-        record = await transition_review_stage(
-            record,
-            stage=ReviewStage.FINAL_REVIEW,
-            stage_status=StageStatus.RUNNING,
-        )
-        record = await save_stage_checkpoint(
-            record,
-            ReviewStage.FINAL_REVIEW,
-            build_final_review_checkpoint(record),
-        )
         return await transition_review_stage(
             record,
             workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
-            stage=ReviewStage.FINAL_REVIEW,
+            stage=ReviewStage.SCHEDULING_PASS,
             stage_status=StageStatus.AWAITING_FEEDBACK,
         )
 

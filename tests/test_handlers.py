@@ -999,6 +999,93 @@ async def test_handle_confirm_review_stage_advances_to_next_stage_confirmation(
 
 
 @pytest.mark.asyncio
+@patch('bot.review_flow.advance_review_from_current_stage', new_callable=AsyncMock)
+@patch('bot.review_flow.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
+async def test_handle_confirm_final_review_completes_workflow(
+    mock_load_review_workflow,
+    mock_transition_review_stage,
+    mock_advance_review_from_current_stage,
+):
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.callback_query = MagicMock()
+    update.callback_query.data = "confirm_review_stage_final_review"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.chat_id = 456
+
+    context = MagicMock()
+    context.user_data = {
+        "active_review_workflow_id": "review_test",
+        "active_review_stage_confirmation": {
+            "review_id": "review_test",
+            "stage": "final_review",
+        },
+    }
+    context.bot_data = {"allowed_user_id": 123}
+    context.bot.send_message = AsyncMock()
+
+    loaded_record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.FINAL_REVIEW,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        final_review=StageCheckpoint(summary="The Sunday review is ready to close."),
+    )
+    completed_stage_record = loaded_record.model_copy(
+        update={
+            "workflow_status": ReviewWorkflowStatus.ACTIVE,
+            "stage_status": StageStatus.COMPLETED,
+            "last_completed_stage": ReviewStage.FINAL_REVIEW,
+        }
+    )
+    completed_workflow_record = completed_stage_record.model_copy(
+        update={
+            "workflow_status": ReviewWorkflowStatus.COMPLETED,
+            "stage_status": StageStatus.COMPLETED,
+        }
+    )
+    mock_load_review_workflow.return_value = loaded_record
+    mock_transition_review_stage.side_effect = [
+        completed_stage_record,
+        completed_workflow_record,
+    ]
+
+    await handle_confirm(update, context)
+
+    assert mock_transition_review_stage.await_count == 2
+    mock_transition_review_stage.assert_any_await(
+        loaded_record,
+        workflow_status=ReviewWorkflowStatus.ACTIVE,
+        stage=ReviewStage.FINAL_REVIEW,
+        stage_status=StageStatus.COMPLETED,
+        last_completed_stage=ReviewStage.FINAL_REVIEW,
+    )
+    mock_transition_review_stage.assert_any_await(
+        completed_stage_record,
+        workflow_status=ReviewWorkflowStatus.COMPLETED,
+        stage=ReviewStage.FINAL_REVIEW,
+        stage_status=StageStatus.COMPLETED,
+        last_completed_stage=ReviewStage.FINAL_REVIEW,
+    )
+    mock_advance_review_from_current_stage.assert_not_awaited()
+    assert "active_review_workflow_id" not in context.user_data
+    assert "active_review_stage_confirmation" not in context.user_data
+    context.bot.send_message.assert_awaited_once_with(
+        chat_id=456,
+        text="Sunday review completed.",
+    )
+
+
+@pytest.mark.asyncio
 @patch('bot.review_flow.send_review_stage_gate', new_callable=AsyncMock)
 @patch('bot.review_flow.advance_review_from_current_stage', new_callable=AsyncMock)
 @patch('bot.review_flow.transition_review_stage', new_callable=AsyncMock)
@@ -1568,17 +1655,19 @@ async def test_handle_message_revises_active_review_stage(
 
 @pytest.mark.asyncio
 @patch('bot.proposal_flow.send_proposal_thread', new_callable=AsyncMock)
+@patch('bot.review_flow.send_review_stage_gate', new_callable=AsyncMock)
 @patch('bot.review_flow.advance_review_from_current_stage', new_callable=AsyncMock)
 @patch('bot.review_flow.transition_review_stage', new_callable=AsyncMock)
 @patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
 @patch('bot.review_flow.execute_artifact_write')
 @patch('bot.review_flow.create_artifact_write')
-async def test_handle_confirm_weekly_plan_advances_and_sends_scheduling_proposals(
+async def test_handle_confirm_weekly_plan_advances_to_scheduling_pass_gate(
     mock_create_artifact_write,
     mock_execute_artifact_write,
     mock_load_review_workflow,
     mock_transition_review_stage,
     mock_advance_review_from_current_stage,
+    mock_send_review_stage_gate,
     mock_send_proposal_thread,
 ):
     update = MagicMock()
@@ -1600,18 +1689,6 @@ async def test_handle_confirm_weekly_plan_advances_and_sends_scheduling_proposal
     }
     context.bot_data = {"allowed_user_id": 123}
     context.bot.send_message = AsyncMock()
-    first_event = ProposedEvent(
-        summary="Deep Work Block",
-        start_time="2026-03-31T09:00:00-04:00",
-        end_time="2026-03-31T11:00:00-04:00",
-        description="Focus on strategy.",
-    )
-    second_event = ProposedEvent(
-        summary="Workout",
-        start_time="2026-03-31T18:00:00-04:00",
-        end_time="2026-03-31T19:00:00-04:00",
-        description="Strength training.",
-    )
     loaded_record = ReviewWorkflowRecord(
         id="review_test",
         created_at="2026-04-29T00:00:00+00:00",
@@ -1628,14 +1705,10 @@ async def test_handle_confirm_weekly_plan_advances_and_sends_scheduling_proposal
     advanced_record = loaded_record.model_copy(
         update={
             "workflow_status": ReviewWorkflowStatus.AWAITING_FEEDBACK,
-            "current_stage": ReviewStage.FINAL_REVIEW,
+            "current_stage": ReviewStage.SCHEDULING_PASS,
             "stage_status": StageStatus.AWAITING_FEEDBACK,
-            "scheduling_proposals": SchedulingPassArtifact(
-                proposed_events=[
-                    second_event.model_dump(mode="json"),
-                    first_event.model_dump(mode="json"),
-                ],
-                scheduling_rationale="Protect deep work first, then schedule recovery.",
+            "scheduling_pass": StageCheckpoint(
+                summary="Use a small number of high-confidence planning blocks.",
             ),
         }
     )
@@ -1678,6 +1751,106 @@ async def test_handle_confirm_weekly_plan_advances_and_sends_scheduling_proposal
         last_completed_stage=ReviewStage.WEEKLY_PLAN,
     )
     mock_advance_review_from_current_stage.assert_awaited_once_with(loaded_record)
+    mock_send_review_stage_gate.assert_awaited_once_with(context, 456, advanced_record)
+    mock_send_proposal_thread.assert_not_awaited()
+    assert 'active_review_stage_confirmation' not in context.user_data
+    update.callback_query.edit_message_text.assert_awaited_once_with(
+        "✅ *Weekly Plan confirmed.*",
+        parse_mode="Markdown",
+    )
+
+
+@pytest.mark.asyncio
+@patch('bot.proposal_flow.send_proposal_thread', new_callable=AsyncMock)
+@patch('bot.review_flow.generate_scheduling_proposals', new_callable=AsyncMock)
+@patch('bot.review_flow.advance_review_from_current_stage', new_callable=AsyncMock)
+@patch('bot.review_flow.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
+async def test_handle_confirm_scheduling_pass_generates_and_sends_proposals(
+    mock_load_review_workflow,
+    mock_transition_review_stage,
+    mock_advance_review_from_current_stage,
+    mock_generate_scheduling_proposals,
+    mock_send_proposal_thread,
+):
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.callback_query = MagicMock()
+    update.callback_query.data = "confirm_review_stage_scheduling_pass"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.chat_id = 456
+
+    context = MagicMock()
+    context.user_data = {
+        "active_review_workflow_id": "review_test",
+        "active_review_stage_confirmation": {
+            "review_id": "review_test",
+            "stage": ReviewStage.SCHEDULING_PASS.value,
+        },
+    }
+    context.bot_data = {"allowed_user_id": 123}
+
+    first_event = ProposedEvent(
+        summary="Deep Work Block",
+        start_time="2026-03-31T09:00:00-04:00",
+        end_time="2026-03-31T11:00:00-04:00",
+        description="Focus on strategy.",
+    )
+    second_event = ProposedEvent(
+        summary="Workout",
+        start_time="2026-03-31T18:00:00-04:00",
+        end_time="2026-03-31T19:00:00-04:00",
+        description="Strength training.",
+    )
+    loaded_record = ReviewWorkflowRecord(
+        id="review_test",
+        current_stage=ReviewStage.SCHEDULING_PASS,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        scheduling_pass=StageCheckpoint(summary="Protect one deep work block."),
+    )
+    completed_record = loaded_record.model_copy(
+        update={
+            "workflow_status": ReviewWorkflowStatus.ACTIVE,
+            "stage_status": StageStatus.COMPLETED,
+            "last_completed_stage": ReviewStage.SCHEDULING_PASS,
+        }
+    )
+    proposal_record = completed_record.model_copy(
+        update={
+            "scheduling_proposals": SchedulingPassArtifact(
+                proposed_events=[
+                    second_event.model_dump(mode="json"),
+                    first_event.model_dump(mode="json"),
+                ],
+                scheduling_rationale="Protect deep work first, then schedule recovery.",
+            ),
+        }
+    )
+    mock_load_review_workflow.return_value = loaded_record
+    mock_transition_review_stage.return_value = completed_record
+    mock_advance_review_from_current_stage.side_effect = AssertionError(
+        "scheduling_pass confirmation should not use generic advancement"
+    )
+    mock_generate_scheduling_proposals.return_value = proposal_record
+
+    await handle_confirm(update, context)
+
+    mock_transition_review_stage.assert_awaited_once_with(
+        loaded_record,
+        workflow_status=ReviewWorkflowStatus.ACTIVE,
+        stage=ReviewStage.SCHEDULING_PASS,
+        stage_status=StageStatus.COMPLETED,
+        last_completed_stage=ReviewStage.SCHEDULING_PASS,
+    )
+    mock_generate_scheduling_proposals.assert_awaited_once_with(completed_record)
     mock_send_proposal_thread.assert_awaited_once()
     kwargs = mock_send_proposal_thread.await_args.kwargs
     assert [event.summary for event in kwargs["proposal_thread"].proposed_events] == [
@@ -1685,11 +1858,89 @@ async def test_handle_confirm_weekly_plan_advances_and_sends_scheduling_proposal
         "Workout",
     ]
     assert kwargs["proposal_thread"].rationale == "Protect deep work first, then schedule recovery."
-    assert 'active_review_stage_confirmation' not in context.user_data
-    update.callback_query.edit_message_text.assert_awaited_once_with(
-        "✅ *Weekly Plan confirmed.*",
-        parse_mode="Markdown",
+
+
+@pytest.mark.asyncio
+@patch('bot.review_flow.send_review_stage_gate', new_callable=AsyncMock)
+@patch('bot.review_flow.prepare_final_review_stage', new_callable=AsyncMock)
+@patch('bot.review_flow.generate_scheduling_proposals', new_callable=AsyncMock)
+@patch('bot.review_flow.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
+async def test_handle_confirm_scheduling_pass_without_proposals_shows_final_review(
+    mock_load_review_workflow,
+    mock_transition_review_stage,
+    mock_generate_scheduling_proposals,
+    mock_prepare_final_review_stage,
+    mock_send_review_stage_gate,
+):
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.callback_query = MagicMock()
+    update.callback_query.data = "confirm_review_stage_scheduling_pass"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.chat_id = 456
+
+    context = MagicMock()
+    context.user_data = {
+        "active_review_workflow_id": "review_test",
+        "active_review_stage_confirmation": {
+            "review_id": "review_test",
+            "stage": ReviewStage.SCHEDULING_PASS.value,
+        },
+    }
+    context.bot_data = {"allowed_user_id": 123}
+    context.bot.send_message = AsyncMock()
+
+    loaded_record = ReviewWorkflowRecord(
+        id="review_test",
+        current_stage=ReviewStage.SCHEDULING_PASS,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        scheduling_pass=StageCheckpoint(summary="No calendar proposals are needed."),
     )
+    completed_record = loaded_record.model_copy(
+        update={
+            "workflow_status": ReviewWorkflowStatus.ACTIVE,
+            "stage_status": StageStatus.COMPLETED,
+            "last_completed_stage": ReviewStage.SCHEDULING_PASS,
+        }
+    )
+    proposal_record = completed_record.model_copy(
+        update={
+            "scheduling_proposals": SchedulingPassArtifact(
+                proposed_events=[],
+                scheduling_rationale="No concrete calendar action is grounded enough.",
+            ),
+        }
+    )
+    final_record = proposal_record.model_copy(
+        update={
+            "current_stage": ReviewStage.FINAL_REVIEW,
+            "stage_status": StageStatus.AWAITING_FEEDBACK,
+            "final_review": StageCheckpoint(summary="Ready to close the review."),
+        }
+    )
+    mock_load_review_workflow.return_value = loaded_record
+    mock_transition_review_stage.return_value = completed_record
+    mock_generate_scheduling_proposals.return_value = proposal_record
+    mock_prepare_final_review_stage.return_value = final_record
+
+    await handle_confirm(update, context)
+
+    mock_generate_scheduling_proposals.assert_awaited_once_with(completed_record)
+    mock_prepare_final_review_stage.assert_awaited_once_with(proposal_record)
+    context.bot.send_message.assert_awaited_once_with(
+        chat_id=456,
+        text="No calendar events were proposed from the confirmed scheduling pass.",
+    )
+    mock_send_review_stage_gate.assert_awaited_once_with(context, 456, final_record)
 
 
 @pytest.mark.asyncio

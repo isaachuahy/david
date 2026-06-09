@@ -11,8 +11,9 @@ from orchestrator.artifact_writes import (
 )
 from orchestrator.review_manager import (
     advance_review_from_current_stage,
-    complete_review_after_event_feedback,
+    generate_scheduling_proposals,
     load_review_workflow,
+    prepare_final_review_stage,
     revise_review_stage,
     transition_review_stage,
 )
@@ -293,30 +294,46 @@ async def advance_review_after_confirmed_stage(
         stage_status=StageStatus.COMPLETED,
         last_completed_stage=stage,
     )
-    record = await advance_review_from_current_stage(record)
-    context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = record.id
-    context.user_data.pop(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY, None)
+    if stage == ReviewStage.FINAL_REVIEW:
+        record = await transition_review_stage(
+            record,
+            workflow_status=ReviewWorkflowStatus.COMPLETED,
+            stage=ReviewStage.FINAL_REVIEW,
+            stage_status=StageStatus.COMPLETED,
+            last_completed_stage=ReviewStage.FINAL_REVIEW,
+        )
+        context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
+        context.user_data.pop(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY, None)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Sunday review completed.",
+        )
+        return
 
-    if stage == ReviewStage.WEEKLY_PLAN:
-        # Weekly-plan confirmation hands off from markdown artifact review into
-        # normal proposal-thread confirmation. Proposal flow owns the item queue.
+    if stage == ReviewStage.SCHEDULING_PASS:
+        # Scheduling-pass confirmation is the handoff from confirmed scheduling
+        # intent into concrete proposal candidates. Proposal flow owns the item
+        # queue after this point.
+        context.user_data.pop(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY, None)
+        record = await generate_scheduling_proposals(record)
+        context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = record.id
         proposals_sent = await send_weekly_review_scheduling_proposals(
             context,
             chat_id,
             record,
         )
         if not proposals_sent:
-            record = await complete_review_after_event_feedback(
-                record.id,
-                has_pending_weekly_state_feedback=False,
-            )
+            record = await prepare_final_review_stage(record)
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="No calendar events were proposed from this accepted weekly plan.",
+                text="No calendar events were proposed from the confirmed scheduling pass.",
             )
-            if record is not None and record.workflow_status == ReviewWorkflowStatus.COMPLETED:
-                context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
+            await send_review_stage_gate(context, chat_id, record)
         return
+
+    record = await advance_review_from_current_stage(record)
+    context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = record.id
+    context.user_data.pop(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY, None)
 
     await send_review_stage_gate(context, chat_id, record)
 
