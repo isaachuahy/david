@@ -610,17 +610,12 @@ def _select_review_model(
     """
     Chooses the review model for a stage using a small, explicit heuristic.
 
-    Flash is the default because stage prompts are narrow. Pro is reserved for
-    retries or larger synthesis-heavy inputs where the extra reasoning budget
-    is more likely to matter.
+    Flash is the default for every stage. Pro is reserved only for explicit
+    retry paths, which keeps routine Sunday review behavior predictable while
+    preserving a higher-capacity fallback for transient structured-output
+    failures.
     """
     if retry_count > 0:
-        return GEMINI_PRO_MODEL
-
-    if stage == ReviewStage.WEEK_REVIEW and context_chars > 20_000:
-        return GEMINI_PRO_MODEL
-
-    if stage in {ReviewStage.MEMORY_AUDIT, ReviewStage.WEEKLY_PLAN} and context_chars > 12_000:
         return GEMINI_PRO_MODEL
 
     return GEMINI_FLASH_MODEL
