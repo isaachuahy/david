@@ -29,6 +29,7 @@ from persistence.database import get_telegram_persistence_path, init_db
 from config import ConfigError, load_config
 from bot.handlers import (
     start, done_command, test_trigger, test_schedule,
+    weekly_review_command,
     handle_confirm, handle_reject, handle_start_trigger,
     handle_delay_trigger,
     handle_message
@@ -145,6 +146,7 @@ def main() -> int:
         app.add_handler(CommandHandler("done", done_command, filters=user_filter))
         app.add_handler(CommandHandler("test_trigger", test_trigger, filters=user_filter))
         app.add_handler(CommandHandler("test_schedule", test_schedule, filters=user_filter))
+        app.add_handler(CommandHandler("weekly_review", weekly_review_command, filters=user_filter))
         app.add_handler(CallbackQueryHandler(handle_confirm, pattern=r"^confirm_"))
         app.add_handler(CallbackQueryHandler(handle_confirm, pattern=r"^retry_artifact_write_"))
         app.add_handler(CallbackQueryHandler(handle_reject, pattern=r"^reject_"))

@@ -7,6 +7,7 @@ from bot.handlers import (
     handle_reject,
     handle_start_trigger,
     handle_delay_trigger,
+    weekly_review_command,
     test_schedule as handler_test_schedule,
 )
 from bot.proposal_flow import (
@@ -913,6 +914,54 @@ async def test_handle_start_trigger_weekly_pauses_at_week_review_confirmation(
     assert "The week had useful progress." in sent_messages[0].kwargs["text"]
     assert "Context routing advanced." in sent_messages[0].kwargs["text"]
     assert sent_messages[0].kwargs["reply_markup"] is not None
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers.consume_trigger')
+@patch('bot.handlers.send_review_stage_gate', new_callable=AsyncMock)
+@patch('bot.handlers.start_weekly_review_workflow', new_callable=AsyncMock)
+async def test_weekly_review_command_starts_review_without_consuming_trigger(
+    mock_start_weekly_review_workflow,
+    mock_send_review_stage_gate,
+    mock_consume_trigger,
+):
+    update = MagicMock()
+    update.effective_chat.id = 456
+    update.effective_user.id = 123
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {}
+    context.bot_data = {"allowed_user_id": 123}
+
+    review_workflow = ReviewWorkflowRecord(
+        id="review_manual",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        week_review=StageCheckpoint(summary="Manual week review is ready."),
+    )
+    mock_start_weekly_review_workflow.return_value = review_workflow
+
+    await weekly_review_command(update, context)
+
+    update.message.reply_text.assert_awaited_once_with(
+        "📅 *Starting Sunday Review. Analysing your week...*",
+        parse_mode="Markdown",
+    )
+    mock_start_weekly_review_workflow.assert_awaited_once_with()
+    assert context.user_data["active_review_workflow_id"] == "review_manual"
+    mock_send_review_stage_gate.assert_awaited_once_with(
+        context,
+        456,
+        review_workflow,
+    )
+    # Manual review starts should not mutate the scheduled trigger queue.
+    mock_consume_trigger.assert_not_called()
 
 
 @pytest.mark.asyncio

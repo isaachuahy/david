@@ -201,6 +201,55 @@ async def test_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prefix_text="I propose scheduling 'David UI Test Event' for the next 15 minutes. Does this look good?"
     )
 
+
+async def _start_weekly_review_interaction(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+):
+    """
+    Starts the durable Sunday review workflow and shows the first review gate.
+
+    This is shared by both the scheduled trigger and the manual command so the
+    review id, persisted workflow state, and first confirmation boundary stay
+    aligned regardless of how David's review is launched.
+    """
+    review_workflow = await start_weekly_review_workflow()
+    context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = review_workflow.id
+    await send_review_stage_gate(
+        context,
+        chat_id,
+        review_workflow,
+    )
+    return review_workflow
+
+
+@authorized_only
+async def weekly_review_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually starts the gated Sunday review workflow for local testing."""
+    await update.message.reply_text(
+        "📅 *Starting Sunday Review. Analysing your week...*",
+        parse_mode="Markdown",
+    )
+    try:
+        await _start_weekly_review_interaction(
+            context,
+            update.effective_chat.id,
+        )
+    except Exception as e:
+        logger.error(f"Error during manual Sunday Review: {e}")
+        capture_sentry_exception(
+            e,
+            component="handlers",
+            operation="weekly_review_command",
+            message="Failed to start or execute the Sunday review flow from the manual command.",
+            tags={
+                "review_id": context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY, "unknown"),
+            },
+        )
+        context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
+        await update.message.reply_text("❌ An error occurred during the Sunday Review.")
+
+
 @authorized_only
 async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles confirmation of a proposed calendar item or legacy calendar write."""
@@ -553,16 +602,13 @@ async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
     elif trigger_type == "weekly_review":
         await query.edit_message_text("📅 *Starting Sunday Review. Analysing your week...*", parse_mode="Markdown")
         try:
-            review_workflow = await start_weekly_review_workflow()
-            context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = review_workflow.id
+            await _start_weekly_review_interaction(
+                context,
+                update.effective_chat.id,
+            )
             # Only consume the trigger after the review workflow is durable and has
             # actually started. This keeps the trigger retryable if startup fails.
             consume_trigger(context, trigger_type)
-            await send_review_stage_gate(
-                context,
-                update.effective_chat.id,
-                review_workflow,
-            )
         except Exception as e:
             logger.error(f"Error during Sunday Review: {e}")
             capture_sentry_exception(
