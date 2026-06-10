@@ -550,9 +550,10 @@ def _materialize_decision_log_change_proposal(
         if _normalize_decision_log_bullet(item)
     ]
     modifications = {
-        _normalize_decision_log_bullet(old): _normalize_decision_log_bullet(new)
-        for old, new in proposal.proposed_rolling_context_modifications.items()
-        if _normalize_decision_log_bullet(old) and _normalize_decision_log_bullet(new)
+        _normalize_decision_log_bullet(item.old_bullet): _normalize_decision_log_bullet(item.new_bullet)
+        for item in proposal.proposed_rolling_context_modifications
+        if _normalize_decision_log_bullet(item.old_bullet)
+        and _normalize_decision_log_bullet(item.new_bullet)
     }
     additions = [
         _normalize_decision_log_bullet(item)
@@ -665,6 +666,25 @@ def _generate_review_structured(
         raise
 
 
+def _is_non_retryable_review_generation_error(error: Exception) -> bool:
+    """
+    Identifies request/schema errors that should not be retried on Pro.
+
+    Pro fallback is useful for retryable generation or parsing failures, but an
+    unsupported schema/configuration will fail on every model. Treating those as
+    terminal keeps Sunday review failures honest and avoids surprise Pro calls.
+    """
+    current_error: BaseException | None = error
+    while current_error is not None:
+        message = str(current_error).lower()
+        if "additionalproperties is not supported" in message:
+            return True
+
+        current_error = current_error.__cause__ or current_error.__context__
+
+    return False
+
+
 def _response_to_stage_checkpoint(response: BaseModel) -> StageCheckpoint:
     """
     Maps a checkpoint-shaped LLM response into the durable checkpoint shape.
@@ -706,8 +726,8 @@ async def _run_checkpoint_stage(
             model=model,
             operation=operation,
         )
-    except Exception:
-        if model == GEMINI_PRO_MODEL:
+    except Exception as error:
+        if model == GEMINI_PRO_MODEL or _is_non_retryable_review_generation_error(error):
             raise
 
         retry_operation = f"{operation}_retry"
@@ -984,8 +1004,8 @@ async def run_goals_audit_stage(
             model=proposal_model,
             operation=proposal_operation,
         )
-    except Exception:
-        if proposal_model == GEMINI_PRO_MODEL:
+    except Exception as error:
+        if proposal_model == GEMINI_PRO_MODEL or _is_non_retryable_review_generation_error(error):
             raise
 
         retry_operation = f"{proposal_operation}_retry"
@@ -1052,8 +1072,8 @@ async def run_memory_audit_stage(
             model=model,
             operation=operation,
         )
-    except Exception:
-        if model == GEMINI_PRO_MODEL:
+    except Exception as error:
+        if model == GEMINI_PRO_MODEL or _is_non_retryable_review_generation_error(error):
             raise
 
         retry_operation = f"{operation}_retry"
@@ -1091,8 +1111,8 @@ async def run_memory_audit_stage(
             model=proposal_model,
             operation=proposal_operation,
         )
-    except Exception:
-        if proposal_model == GEMINI_PRO_MODEL:
+    except Exception as error:
+        if proposal_model == GEMINI_PRO_MODEL or _is_non_retryable_review_generation_error(error):
             raise
 
         retry_operation = f"{proposal_operation}_retry"
@@ -1147,8 +1167,8 @@ async def run_weekly_plan_stage(
             model=model,
             operation=operation,
         )
-    except Exception:
-        if model == GEMINI_PRO_MODEL:
+    except Exception as error:
+        if model == GEMINI_PRO_MODEL or _is_non_retryable_review_generation_error(error):
             raise
 
         retry_operation = f"{operation}_retry"
@@ -1200,8 +1220,8 @@ async def run_scheduling_pass_stage(
             model=model,
             operation=operation,
         )
-    except Exception:
-        if model == GEMINI_PRO_MODEL:
+    except Exception as error:
+        if model == GEMINI_PRO_MODEL or _is_non_retryable_review_generation_error(error):
             raise
 
         retry_operation = f"{operation}_retry"
@@ -1241,8 +1261,8 @@ async def generate_scheduling_proposals(
             model=model,
             operation=operation,
         )
-    except Exception:
-        if model == GEMINI_PRO_MODEL:
+    except Exception as error:
+        if model == GEMINI_PRO_MODEL or _is_non_retryable_review_generation_error(error):
             raise
 
         retry_operation = f"{operation}_retry"

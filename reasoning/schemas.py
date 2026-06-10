@@ -220,6 +220,23 @@ class MemoryAuditResponse(BaseModel):
     )
 
 
+class RollingContextModification(BaseModel):
+    """
+    One exact replacement operation for decision_log.md rolling context.
+
+    Gemini structured output does not reliably accept arbitrary dictionary keys
+    through `additionalProperties`, so modifications are represented as a list
+    of explicit operation records instead of an old->new mapping.
+    """
+
+    old_bullet: str = Field(
+        description="Exact existing Current Rolling Context bullet line to replace.",
+    )
+    new_bullet: str = Field(
+        description="Complete replacement bullet line for the same durable memory.",
+    )
+
+
 class DecisionLogChangeProposalResponse(BaseModel):
     """
     LLM-facing schema for proposed decision-log operations.
@@ -241,11 +258,10 @@ class DecisionLogChangeProposalResponse(BaseModel):
             "Candidate exact existing bullet lines from Current Rolling Context to remove."
         ),
     )
-    proposed_rolling_context_modifications: dict[str, str] = Field(
-        default_factory=dict,
+    proposed_rolling_context_modifications: list[RollingContextModification] = Field(
+        default_factory=list,
         description=(
-            "Candidate exact old bullet line to replacement bullet line mappings. "
-            "Keys must match existing Current Rolling Context bullets exactly."
+            "Candidate exact replacement operations for Current Rolling Context bullets."
         ),
     )
     proposed_recent_decisions_reset: bool = Field(

@@ -31,6 +31,7 @@ from reasoning.schemas import (
     GoalsChangeProposalResponse,
     MemoryAuditResponse,
     ProposedEvent,
+    RollingContextModification,
     SchedulingPassResponse,
     SchedulingProposalResponse,
     WeekReviewResponse,
@@ -148,6 +149,39 @@ async def test_run_week_review_stage_persists_week_review_checkpoint(
     assert updated_record.last_completed_stage == ReviewStage.WEEK_REVIEW
     mock_generate_review_structured.assert_called_once()
     mock_save_review_workflow_sync.assert_called_once()
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
+async def test_schema_request_errors_do_not_retry_with_pro(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """
+    Tests that unsupported structured-output schemas fail once instead of
+    triggering a Pro fallback that would receive the same invalid request.
+    """
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+    )
+    mock_generate_review_structured.side_effect = ValueError(
+        "additionalProperties is not supported in the Gemini API."
+    )
+
+    with pytest.raises(ValueError, match="additionalProperties is not supported"):
+        await run_week_review_stage(record)
+
+    mock_generate_review_structured.assert_called_once()
+    assert mock_generate_review_structured.call_args.kwargs["model"] == "gemini-3-flash-preview"
+    mock_save_review_workflow_sync.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -351,11 +385,12 @@ async def test_run_memory_audit_stage_persists_memory_audit_checkpoint(
                 "- David works better when late-evening commitments are avoided.",
             ],
             proposed_rolling_context_deletions=[],
-            proposed_rolling_context_modifications={
-                "- Late-evening commitments are currently experimental.": (
-                    "- Late-evening commitments should be avoided unless explicitly requested."
+            proposed_rolling_context_modifications=[
+                RollingContextModification(
+                    old_bullet="- Late-evening commitments are currently experimental.",
+                    new_bullet="- Late-evening commitments should be avoided unless explicitly requested.",
                 ),
-            },
+            ],
             proposed_recent_decisions_reset=True,
             proposed_recent_decisions_carry_forward=[],
         ),
