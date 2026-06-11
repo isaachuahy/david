@@ -154,6 +154,32 @@ def _format_checkpoint_for_prompt(checkpoint: StageCheckpoint) -> str:
     return "\n".join(lines)
 
 
+def _format_artifact_change_for_revision(changes: ArtifactChangeSummary) -> str:
+    """
+    Formats the latest visible artifact proposal for revision prompts.
+
+    Review-stage feedback usually refers to the proposal the user just saw in
+    Telegram. Including only that latest proposal keeps revisions focused and
+    avoids dragging older attempts into the model context.
+    """
+    lines: list[str] = []
+    for label, values in (
+        ("Additions", changes.additions),
+        ("Deletions", changes.deletions),
+        ("Modifications", changes.modifications),
+    ):
+        if values:
+            lines.append(f"{label}:")
+            lines.extend(f"- {value}" for value in values)
+
+    if changes.proposed_markdown:
+        lines.append("")
+        lines.append("Full proposed markdown:")
+        lines.append(changes.proposed_markdown)
+
+    return "\n".join(lines) if lines else "No concrete artifact changes were proposed."
+
+
 def _get_review_stage_checkpoint(
     record: ReviewWorkflowRecord,
     stage: ReviewStage,
@@ -188,14 +214,20 @@ def _format_revision_prompt_context(
         lines.append("Previous stage output to revise:")
         lines.append(_format_checkpoint_for_prompt(previous_checkpoint))
 
+    if stage == ReviewStage.GOALS_AUDIT and record.goals_changes:
+        lines.append("")
+        lines.append("Latest visible goals proposal to revise:")
+        lines.append(_format_artifact_change_for_revision(record.goals_changes))
+
+    if stage == ReviewStage.MEMORY_AUDIT and record.decision_log_changes:
+        lines.append("")
+        lines.append("Latest visible decision-log proposal to revise:")
+        lines.append(_format_artifact_change_for_revision(record.decision_log_changes))
+
     if stage == ReviewStage.WEEKLY_PLAN and record.weekly_state_changes:
         lines.append("")
-        lines.append("Previous weekly-state change summary:")
-        lines.extend(f"- {item}" for item in record.weekly_state_changes.modifications)
-        if record.weekly_state_changes.proposed_markdown:
-            lines.append("")
-            lines.append("Previous proposed weekly_state.md to revise:")
-            lines.append(record.weekly_state_changes.proposed_markdown)
+        lines.append("Latest visible weekly-state proposal to revise:")
+        lines.append(_format_artifact_change_for_revision(record.weekly_state_changes))
 
     if stage == ReviewStage.SCHEDULING_PASS and record.scheduling_proposals:
         lines.append("")

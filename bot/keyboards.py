@@ -25,6 +25,20 @@ def build_review_stage_keyboard(stage: str) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(keyboard)
 
+def build_review_resume_keyboard(review_id: str) -> InlineKeyboardMarkup:
+    """
+    Builds the startup recovery keyboard for one durable Sunday review.
+
+    The review id is embedded so a restart can recover volatile Telegram state
+    from the persisted ReviewWorkflowRecord, or deliberately mark the stale
+    review failed so it stops resurfacing on future restarts.
+    """
+    keyboard = [
+        [InlineKeyboardButton("Continue Review", callback_data=f"resume_review_{review_id}")],
+        [InlineKeyboardButton("Discard Review", callback_data=f"discard_review_{review_id}")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 def build_artifact_write_retry_keyboard(write_id: str) -> InlineKeyboardMarkup:
     """Builds a retry keyboard for one failed confirmed artifact write."""
     keyboard = [

@@ -48,11 +48,14 @@ from bot.proposal_flow import (
 )
 from bot.review_flow import (
     ACTIVE_ARTIFACT_WRITE_RETRY_KEY,
+    ACTIVE_REVIEW_RESUME_PROMPT_KEY,
     ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY,
     ACTIVE_REVIEW_WORKFLOW_ID_KEY,
     advance_review_after_confirmed_stage,
     apply_confirmed_review_stage_artifacts,
+    discard_review_workflow,
     revise_active_review_stage,
+    resume_review_workflow,
     send_retryable_artifact_write_notice,
     send_review_stage_gate,
 )
@@ -270,6 +273,27 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     write_id = query.data.split("confirm_")[1]
     await _handle_legacy_calendar_write_confirm(update, context, write_id)
+
+
+@authorized_only
+async def handle_review_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles explicit startup recovery actions for interrupted reviews."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data.startswith("resume_review_"):
+        review_id = query.data.split("resume_review_")[1]
+        await query.edit_message_text(
+            "Continuing the interrupted Sunday review...",
+        )
+        await resume_review_workflow(context, query.message.chat_id, review_id)
+        return
+
+    review_id = query.data.split("discard_review_")[1]
+    await discard_review_workflow(context, review_id)
+    await query.edit_message_text(
+        "Discarded the interrupted Sunday review. It will not be resumed on the next restart.",
+    )
 
 
 async def _handle_artifact_write_retry(
@@ -643,6 +667,43 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("There is no active session to close.")
 
+
+async def _close_active_review_stage_keyboard(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    active_stage_confirmation: dict,
+) -> None:
+    """
+    Removes the stale review-gate keyboard before applying text feedback.
+
+    A message during a review gate is treated as revision feedback for the
+    latest visible proposal. Closing the old inline keyboard prevents a delayed
+    button press from confirming or rejecting the pre-revision proposal.
+    """
+    message_id = active_stage_confirmation.get("message_id")
+    if not isinstance(message_id, int):
+        return
+
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=update.effective_chat.id,
+            message_id=message_id,
+            reply_markup=None,
+        )
+    except Exception as error:
+        logger.error(f"Failed to close stale review-stage keyboard: {error}")
+        capture_sentry_exception(
+            error,
+            component="handlers",
+            operation="close_review_stage_keyboard",
+            message="Failed to close stale review-stage keyboard before revision.",
+            tags={
+                "review_id": str(active_stage_confirmation.get("review_id", "unknown")),
+                "stage": str(active_stage_confirmation.get("stage", "unknown")),
+            },
+        )
+
+
 @authorized_only
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles ad-hoc messages by checking UI state and passing text to the Router."""
@@ -651,14 +712,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ *I am currently synthesizing our last session. Please give me a moment...*", parse_mode="Markdown")
         return
 
-    if await send_retryable_artifact_write_notice(context, update.effective_chat.id):
-        return
+    resume_prompt = context.user_data.get(ACTIVE_REVIEW_RESUME_PROMPT_KEY)
+    if isinstance(resume_prompt, dict):
+        review_id = resume_prompt.get("review_id")
+        if review_id:
+            try:
+                await discard_review_workflow(context, review_id)
+                await update.message.reply_text(
+                    "I discarded the interrupted Sunday review and will treat this as a new message."
+                )
+            except Exception as error:
+                logger.error(f"Failed to discard interrupted review before handling message: {error}")
+                capture_sentry_exception(
+                    error,
+                    component="handlers",
+                    operation="discard_review_on_message",
+                    message="Failed to discard interrupted review before normal message routing.",
+                    tags={"review_id": review_id},
+                )
+                await update.message.reply_text(
+                    "I couldn't discard the interrupted Sunday review yet. Please try the resume or discard button first."
+                )
+                return
 
     active_stage_confirmation = context.user_data.get(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY)
     if isinstance(active_stage_confirmation, dict):
         review_id = active_stage_confirmation.get("review_id")
         stage_value = active_stage_confirmation.get("stage")
         if review_id and stage_value:
+            await _close_active_review_stage_keyboard(
+                update,
+                context,
+                active_stage_confirmation,
+            )
             revised_record = await revise_active_review_stage(
                 context,
                 review_id,
@@ -673,6 +759,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     revised_record,
                 )
                 return
+
+    if await send_retryable_artifact_write_notice(context, update.effective_chat.id):
+        return
 
     # Check if a text message was sent while a proposal is waiting for confirmation.
     pending_confirmations = get_tracked_confirmation_messages(context)

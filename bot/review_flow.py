@@ -2,6 +2,7 @@ from telegram.ext import ContextTypes
 
 from bot.keyboards import (
     build_artifact_write_retry_keyboard,
+    build_review_resume_keyboard,
     build_review_stage_keyboard,
 )
 from bot.proposal_flow import send_weekly_review_scheduling_proposals
@@ -30,6 +31,21 @@ from persistence.models import (
 ACTIVE_REVIEW_WORKFLOW_ID_KEY = "active_review_workflow_id"
 ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY = "active_review_stage_confirmation"
 ACTIVE_ARTIFACT_WRITE_RETRY_KEY = "active_artifact_write_retry"
+ACTIVE_REVIEW_RESUME_PROMPT_KEY = "active_review_resume_prompt"
+
+
+def select_latest_resumable_review(records):
+    """
+    Returns the newest resumable review workflow, if any.
+
+    Startup can recover more than one durable workflow after repeated failures.
+    Surfacing only the latest keeps Telegram recovery simple while preserving
+    older records for later inspection instead of silently mutating them.
+    """
+    if not records:
+        return None
+
+    return max(records, key=lambda record: record.updated_at)
 
 
 def _get_review_stage_checkpoint(record, stage: ReviewStage):
@@ -94,6 +110,28 @@ def _format_artifact_change_summary(changes) -> str:
     return "\n".join(lines) if lines else "No artifact changes were proposed."
 
 
+def _set_active_review_stage_confirmation(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    review_id: str,
+    stage: ReviewStage,
+    message_id: int | None = None,
+) -> None:
+    """
+    Stores the currently visible review gate for revision/confirmation routing.
+
+    When Telegram returns a real message id, we retain it so a later text
+    revision can close the old keyboard before showing the revised proposal.
+    """
+    confirmation = {
+        "review_id": review_id,
+        "stage": stage.value,
+    }
+    if isinstance(message_id, int):
+        confirmation["message_id"] = message_id
+    context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = confirmation
+
+
 async def send_review_stage_confirmation(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -101,16 +139,92 @@ async def send_review_stage_confirmation(
     stage: ReviewStage,
 ) -> None:
     """Presents one Sunday review stage checkpoint for confirm/revise feedback."""
-    context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = {
-        "review_id": record.id,
-        "stage": stage.value,
-    }
-    await context.bot.send_message(
+    message = await context.bot.send_message(
         chat_id=chat_id,
         text=_format_review_stage_summary(stage, record),
         reply_markup=build_review_stage_keyboard(stage.value),
         parse_mode="Markdown",
     )
+    _set_active_review_stage_confirmation(
+        context,
+        review_id=record.id,
+        stage=stage,
+        message_id=getattr(message, "message_id", None),
+    )
+
+
+async def send_review_resume_prompt(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    record,
+) -> None:
+    """Presents the startup prompt for one resumable Sunday review workflow."""
+    context.user_data[ACTIVE_REVIEW_RESUME_PROMPT_KEY] = {
+        "review_id": record.id,
+    }
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "⚠️ *A Sunday review was interrupted.*\n\n"
+            f"It stopped at *{record.current_stage.value.replace('_', ' ').title()}*. "
+            "Would you like to continue from that review stage?"
+        ),
+        reply_markup=build_review_resume_keyboard(record.id),
+        parse_mode="Markdown",
+    )
+
+
+async def resume_review_workflow(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    review_id: str,
+):
+    """
+    Restores volatile Telegram review state and shows the persisted stage gate.
+
+    The durable ReviewWorkflowRecord remains the source of truth; this helper
+    only reconnects the user-facing UI after a restart or process failure.
+    """
+    record = await load_review_workflow(review_id)
+    if record is None:
+        context.user_data.pop(ACTIVE_REVIEW_RESUME_PROMPT_KEY, None)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="That interrupted review is no longer available.",
+        )
+        return None
+
+    context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = record.id
+    context.user_data.pop(ACTIVE_REVIEW_RESUME_PROMPT_KEY, None)
+    await send_review_stage_gate(context, chat_id, record)
+    return record
+
+
+async def discard_review_workflow(
+    context: ContextTypes.DEFAULT_TYPE,
+    review_id: str,
+):
+    """
+    Marks a stale review workflow failed so startup stops resurfacing it.
+
+    We use FAILED rather than deleting the record because the interrupted review
+    may still be useful for debugging why recovery was needed.
+    """
+    record = await load_review_workflow(review_id)
+    if record is None:
+        context.user_data.pop(ACTIVE_REVIEW_RESUME_PROMPT_KEY, None)
+        return None
+
+    record = await transition_review_stage(
+        record,
+        workflow_status=ReviewWorkflowStatus.FAILED,
+        stage=record.current_stage,
+        stage_status=record.stage_status,
+    )
+    context.user_data.pop(ACTIVE_REVIEW_RESUME_PROMPT_KEY, None)
+    if context.user_data.get(ACTIVE_REVIEW_WORKFLOW_ID_KEY) == record.id:
+        context.user_data.pop(ACTIVE_REVIEW_WORKFLOW_ID_KEY, None)
+    return record
 
 
 async def send_memory_audit_confirmation(
@@ -119,20 +233,22 @@ async def send_memory_audit_confirmation(
     record,
 ) -> None:
     """Presents memory-audit findings plus proposed decision-log changes."""
-    context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = {
-        "review_id": record.id,
-        "stage": ReviewStage.MEMORY_AUDIT.value,
-    }
     text = (
         f"{_format_review_stage_summary(ReviewStage.MEMORY_AUDIT, record)}\n\n"
         "*Proposed Decision Log Changes:*\n"
         f"{_format_artifact_change_summary(record.decision_log_changes)}"
     )
-    await context.bot.send_message(
+    message = await context.bot.send_message(
         chat_id=chat_id,
         text=text,
         reply_markup=build_review_stage_keyboard(ReviewStage.MEMORY_AUDIT.value),
         parse_mode="Markdown",
+    )
+    _set_active_review_stage_confirmation(
+        context,
+        review_id=record.id,
+        stage=ReviewStage.MEMORY_AUDIT,
+        message_id=getattr(message, "message_id", None),
     )
 
 
@@ -142,20 +258,22 @@ async def send_goals_audit_confirmation(
     record,
 ) -> None:
     """Presents goals-audit findings plus optional proposed goals changes."""
-    context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = {
-        "review_id": record.id,
-        "stage": ReviewStage.GOALS_AUDIT.value,
-    }
     text = (
         f"{_format_review_stage_summary(ReviewStage.GOALS_AUDIT, record)}\n\n"
         "*Proposed Goals Changes:*\n"
         f"{_format_artifact_change_summary(record.goals_changes)}"
     )
-    await context.bot.send_message(
+    message = await context.bot.send_message(
         chat_id=chat_id,
         text=text,
         reply_markup=build_review_stage_keyboard(ReviewStage.GOALS_AUDIT.value),
         parse_mode="Markdown",
+    )
+    _set_active_review_stage_confirmation(
+        context,
+        review_id=record.id,
+        stage=ReviewStage.GOALS_AUDIT,
+        message_id=getattr(message, "message_id", None),
     )
 
 
@@ -168,20 +286,22 @@ async def send_weekly_plan_confirmation(
     if record.weekly_state_changes is None or not record.weekly_state_changes.proposed_markdown:
         raise ValueError("Sunday review has no proposed weekly-state markdown to confirm.")
 
-    context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = {
-        "review_id": record.id,
-        "stage": ReviewStage.WEEKLY_PLAN.value,
-    }
     text = (
         f"{_format_review_stage_summary(ReviewStage.WEEKLY_PLAN, record)}\n\n"
         "*Proposed Weekly State Changes:*\n"
         f"{_format_artifact_change_summary(record.weekly_state_changes)}"
     )
-    await context.bot.send_message(
+    message = await context.bot.send_message(
         chat_id=chat_id,
         text=text,
         reply_markup=build_review_stage_keyboard(ReviewStage.WEEKLY_PLAN.value),
         parse_mode="Markdown",
+    )
+    _set_active_review_stage_confirmation(
+        context,
+        review_id=record.id,
+        stage=ReviewStage.WEEKLY_PLAN,
+        message_id=getattr(message, "message_id", None),
     )
 
 

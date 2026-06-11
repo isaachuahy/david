@@ -5,6 +5,7 @@ from bot.handlers import (
     handle_message,
     handle_confirm,
     handle_reject,
+    handle_review_resume,
     handle_start_trigger,
     handle_delay_trigger,
     weekly_review_command,
@@ -965,6 +966,61 @@ async def test_weekly_review_command_starts_review_without_consuming_trigger(
 
 
 @pytest.mark.asyncio
+@patch('bot.handlers.resume_review_workflow', new_callable=AsyncMock)
+async def test_handle_review_resume_continues_interrupted_review(
+    mock_resume_review_workflow,
+):
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.callback_query = MagicMock()
+    update.callback_query.data = "resume_review_review_test"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.chat_id = 456
+
+    context = MagicMock()
+    context.user_data = {
+        "active_review_resume_prompt": {"review_id": "review_test"},
+    }
+    context.bot_data = {"allowed_user_id": 123}
+
+    await handle_review_resume(update, context)
+
+    update.callback_query.answer.assert_awaited_once()
+    update.callback_query.edit_message_text.assert_awaited_once_with(
+        "Continuing the interrupted Sunday review...",
+    )
+    mock_resume_review_workflow.assert_awaited_once_with(context, 456, "review_test")
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers.discard_review_workflow', new_callable=AsyncMock)
+async def test_handle_review_resume_discards_interrupted_review(
+    mock_discard_review_workflow,
+):
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.callback_query = MagicMock()
+    update.callback_query.data = "discard_review_review_test"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {
+        "active_review_resume_prompt": {"review_id": "review_test"},
+    }
+    context.bot_data = {"allowed_user_id": 123}
+
+    await handle_review_resume(update, context)
+
+    update.callback_query.answer.assert_awaited_once()
+    mock_discard_review_workflow.assert_awaited_once_with(context, "review_test")
+    update.callback_query.edit_message_text.assert_awaited_once_with(
+        "Discarded the interrupted Sunday review. It will not be resumed on the next restart.",
+    )
+
+
+@pytest.mark.asyncio
 @patch('bot.review_flow.send_review_stage_gate', new_callable=AsyncMock)
 @patch('bot.review_flow.advance_review_from_current_stage', new_callable=AsyncMock)
 @patch('bot.review_flow.transition_review_stage', new_callable=AsyncMock)
@@ -1654,10 +1710,12 @@ async def test_handle_message_revises_active_review_stage(
         "active_review_stage_confirmation": {
             "review_id": "review_test",
             "stage": "week_review",
+            "message_id": 789,
         },
         "session_state": "ACTIVE",
     }
     context.bot_data = {"allowed_user_id": 123}
+    context.bot.edit_message_reply_markup = AsyncMock()
 
     record = ReviewWorkflowRecord(
         id="review_test",
@@ -1687,10 +1745,11 @@ async def test_handle_message_revises_active_review_stage(
         stage=ReviewStage.WEEK_REVIEW,
         feedback="The week review missed the dentist appointment.",
     )
-    assert context.user_data["active_review_stage_confirmation"] == {
-        "review_id": "review_test",
-        "stage": "week_review",
-    }
+    context.bot.edit_message_reply_markup.assert_awaited_once_with(
+        chat_id=456,
+        message_id=789,
+        reply_markup=None,
+    )
     update.message.reply_text.assert_awaited_once_with(
         "📝 *Revision applied.*",
         parse_mode="Markdown",
@@ -1700,6 +1759,43 @@ async def test_handle_message_revises_active_review_stage(
         456,
         revised_record,
     )
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers.discard_review_workflow', new_callable=AsyncMock)
+@patch('bot.handlers.start_session')
+@patch('bot.handlers.process_message', new_callable=AsyncMock)
+async def test_handle_message_discards_resume_prompt_then_routes_normally(
+    mock_process_message,
+    mock_start_session,
+    mock_discard_review_workflow,
+):
+    mock_process_message.return_value = FlashResponse(
+        message="Let's start fresh."
+    )
+
+    update = MagicMock()
+    update.effective_chat.id = 456
+    update.effective_user.id = 123
+    update.message.text = "Let's talk about today instead."
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {
+        "active_review_resume_prompt": {"review_id": "review_test"},
+    }
+    context.bot_data = {"allowed_user_id": 123}
+    context.job_queue.get_jobs_by_name.return_value = ()
+
+    await handle_message(update, context)
+
+    mock_discard_review_workflow.assert_awaited_once_with(context, "review_test")
+    mock_start_session.assert_called_once_with(context)
+    mock_process_message.assert_awaited_once_with("Let's talk about today instead.", context)
+    update.message.reply_text.assert_any_await(
+        "I discarded the interrupted Sunday review and will treat this as a new message."
+    )
+    update.message.reply_text.assert_any_await("Let's start fresh.")
 
 
 @pytest.mark.asyncio

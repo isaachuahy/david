@@ -3,6 +3,13 @@ from pathlib import Path
 from unittest.mock import ANY, MagicMock, patch
 
 import main
+from persistence.models import (
+    ReviewStage,
+    ReviewWorkflowRecord,
+    ReviewWorkflowStatus,
+    SourceSnapshot,
+    StageStatus,
+)
 
 
 @patch("observability.sentry.logger")
@@ -59,6 +66,8 @@ def test_init_sentry_initializes_sdk_when_dsn_is_present(
 @patch("main.PersistenceInput")
 @patch("main.setup_scheduler")
 @patch("main.ApplicationBuilder")
+@patch("main.reconcile_artifact_writes")
+@patch("main.reconcile_review_workflows", return_value=[])
 @patch("main.reconcile_orphaned_sessions")
 @patch("main.init_db")
 @patch("main.bootstrap_sentry")
@@ -68,6 +77,8 @@ def test_main_initializes_db_and_reconciles_sessions_before_polling(
     mock_init_sentry,
     mock_init_db,
     mock_reconcile,
+    mock_reconcile_review_workflows,
+    mock_reconcile_artifact_writes,
     mock_application_builder,
     mock_setup_scheduler,
     mock_persistence_input,
@@ -97,6 +108,8 @@ def test_main_initializes_db_and_reconciles_sessions_before_polling(
     mock_init_sentry.assert_called_once_with()
     mock_init_db.assert_called_once_with()
     mock_reconcile.assert_called_once_with()
+    mock_reconcile_review_workflows.assert_called_once_with()
+    mock_reconcile_artifact_writes.assert_called_once_with()
     mock_persistence_input.assert_called_once_with(
         bot_data=False,
         chat_data=False,
@@ -112,7 +125,85 @@ def test_main_initializes_db_and_reconciles_sessions_before_polling(
     builder.post_init.assert_called_once_with(main.invalidate_restart_volatile_user_data)
     assert app.bot_data["allowed_user_id"] == 123
     mock_setup_scheduler.assert_called_once_with(app, 123)
+    app.job_queue.run_once.assert_not_called()
     app.run_polling.assert_called_once_with()
+
+
+@patch("main.get_telegram_persistence_path", return_value=Path("/tmp/telegram_state.pkl"))
+@patch("main.PicklePersistence")
+@patch("main.PersistenceInput")
+@patch("main.setup_scheduler")
+@patch("main.ApplicationBuilder")
+@patch("main.reconcile_artifact_writes")
+@patch("main.reconcile_orphaned_sessions")
+@patch("main.init_db")
+@patch("main.bootstrap_sentry")
+@patch("main.load_config")
+@patch("main.reconcile_review_workflows")
+def test_main_schedules_resume_prompt_for_latest_resumable_review(
+    mock_reconcile_review_workflows,
+    mock_load_config,
+    mock_init_sentry,
+    mock_init_db,
+    mock_reconcile,
+    mock_reconcile_artifact_writes,
+    mock_application_builder,
+    mock_setup_scheduler,
+    mock_persistence_input,
+    mock_pickle_persistence,
+    mock_get_telegram_persistence_path,
+):
+    mock_load_config.return_value = MagicMock(
+        telegram_bot_token="token",
+        allowed_user_id=123,
+        gemini_api_key="gemini-key",
+        db_path=Path("/tmp/assistant.db"),
+        google_token_path=Path("/tmp/token.json"),
+        google_credentials_path=Path("/tmp/credentials.json"),
+    )
+    older_review = ReviewWorkflowRecord(
+        id="review_old",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.WEEK_REVIEW,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+    )
+    latest_review = older_review.model_copy(
+        update={
+            "id": "review_latest",
+            "updated_at": "2026-04-30T00:00:00+00:00",
+        }
+    )
+    mock_reconcile_review_workflows.return_value = [older_review, latest_review]
+
+    app = MagicMock()
+    app.bot_data = {}
+    builder = MagicMock()
+    mock_application_builder.return_value = builder
+    builder.token.return_value = builder
+    builder.persistence.return_value = builder
+    builder.post_init.return_value = builder
+    builder.build.return_value = app
+
+    assert main.main() == 0
+
+    app.job_queue.run_once.assert_called_once_with(
+        main._send_review_resume_prompt_job,
+        when=1,
+        data={
+            "chat_id": 123,
+            "record": latest_review,
+        },
+        name="review_resume_prompt_review_latest",
+        chat_id=123,
+        user_id=123,
+    )
 
 
 @patch("main.capture_sentry_exception")

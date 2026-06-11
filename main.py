@@ -30,10 +30,27 @@ from config import ConfigError, load_config
 from bot.handlers import (
     start, done_command, test_trigger, test_schedule,
     weekly_review_command,
-    handle_confirm, handle_reject, handle_start_trigger,
+    handle_confirm, handle_reject, handle_review_resume, handle_start_trigger,
     handle_delay_trigger,
     handle_message
 )
+from bot.review_flow import (
+    select_latest_resumable_review,
+    send_review_resume_prompt,
+)
+
+
+async def _send_review_resume_prompt_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Sends a one-time startup prompt for the latest interrupted Sunday review.
+
+    Reconciliation happens before Telegram starts polling; this job bridges the
+    durable review record back into user-visible UI once the bot can send
+    messages safely.
+    """
+    record = context.job.data["record"]
+    chat_id = context.job.data["chat_id"]
+    await send_review_resume_prompt(context, chat_id, record)
 
 async def _handle_application_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -101,7 +118,7 @@ def main() -> int:
         init_db()
         reconcile_orphaned_sessions()
         try:
-            asyncio.run(reconcile_review_workflows())
+            resumable_reviews = asyncio.run(reconcile_review_workflows())
         except Exception as exc:
             capture_sentry_exception(
                 exc,
@@ -150,6 +167,7 @@ def main() -> int:
         app.add_handler(CallbackQueryHandler(handle_confirm, pattern=r"^confirm_"))
         app.add_handler(CallbackQueryHandler(handle_confirm, pattern=r"^retry_artifact_write_"))
         app.add_handler(CallbackQueryHandler(handle_reject, pattern=r"^reject_"))
+        app.add_handler(CallbackQueryHandler(handle_review_resume, pattern=r"^(resume|discard)_review_"))
         app.add_handler(CallbackQueryHandler(handle_start_trigger, pattern=r"^start_trigger_"))
         app.add_handler(CallbackQueryHandler(handle_delay_trigger, pattern=r"^delay_trigger$"))
         # MessageHandler is a catch-all for any text messsages that aren't commands
@@ -158,6 +176,24 @@ def main() -> int:
 
         # Initialize the APScheduler cron jobs
         setup_scheduler(app, config.allowed_user_id)
+        resumable_review = select_latest_resumable_review(resumable_reviews)
+        if resumable_review is not None:
+            if len(resumable_reviews) > 1:
+                logger.warning(
+                    "Multiple resumable Sunday reviews found at startup; prompting only the latest. review_ids={}",
+                    [record.id for record in resumable_reviews],
+                )
+            app.job_queue.run_once(
+                _send_review_resume_prompt_job,
+                when=1,
+                data={
+                    "chat_id": config.allowed_user_id,
+                    "record": resumable_review,
+                },
+                name=f"review_resume_prompt_{resumable_review.id}",
+                chat_id=config.allowed_user_id,
+                user_id=config.allowed_user_id,
+            )
 
         logger.info("Bot is now polling for messages...")
         app.run_polling()
