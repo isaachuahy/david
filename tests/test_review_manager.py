@@ -427,6 +427,93 @@ async def test_run_memory_audit_stage_persists_memory_audit_checkpoint(
     assert "Dentist appointment was missed" not in updated_record.decision_log_changes.proposed_markdown
     assert updated_record.last_completed_stage == ReviewStage.MEMORY_AUDIT
     assert mock_generate_review_structured.call_count == 2
+    assert mock_save_review_workflow_sync.call_count == 2
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
+async def test_run_memory_audit_stage_ignores_missing_optional_placeholder_deletion(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """Tests that scaffold placeholder deletion requests do not fail after the placeholder is gone."""
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown=VALID_DECISION_LOG_MARKDOWN,
+        ),
+        week_review=StageCheckpoint(summary="The week had useful progress."),
+        goals_audit=StageCheckpoint(summary="Goals still hold."),
+    )
+    mock_generate_review_structured.side_effect = [
+        MemoryAuditResponse(
+            summary="Memory is ready for first compaction.",
+            key_findings=[],
+            constraints=[],
+            carry_forward=[],
+        ),
+        DecisionLogChangeProposalResponse(
+            proposed_rolling_context_deletions=[
+                "- *(No synthesis yet. This section will be populated during the first Sunday review.)*",
+            ],
+            proposed_recent_decisions_reset=True,
+        ),
+    ]
+
+    updated_record = await run_memory_audit_stage(record)
+
+    assert updated_record.memory_audit is not None
+    assert updated_record.decision_log_changes is not None
+    assert updated_record.decision_log_changes.deletions == [
+        "- *(No synthesis yet. This section will be populated during the first Sunday review.)*",
+    ]
+    assert mock_save_review_workflow_sync.call_count == 2
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
+async def test_run_memory_audit_stage_persists_checkpoint_before_change_failure(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """Tests that memory-audit checkpoint state is durable even if change materialization fails."""
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown=VALID_DECISION_LOG_MARKDOWN,
+        ),
+        week_review=StageCheckpoint(summary="The week had useful progress."),
+        goals_audit=StageCheckpoint(summary="Goals still hold."),
+    )
+    mock_generate_review_structured.side_effect = [
+        MemoryAuditResponse(
+            summary="Memory checkpoint should survive.",
+            key_findings=["This should be persisted before proposal failure."],
+            constraints=[],
+            carry_forward=[],
+        ),
+        DecisionLogChangeProposalResponse(
+            proposed_rolling_context_deletions=[
+                "- This exact bullet does not exist.",
+            ],
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="Decision-log deletion anchor was not found"):
+        await run_memory_audit_stage(record)
+
+    assert record.memory_audit is not None
+    assert record.memory_audit.summary == "Memory checkpoint should survive."
     mock_save_review_workflow_sync.assert_called_once()
 
 

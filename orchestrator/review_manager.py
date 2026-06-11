@@ -92,6 +92,9 @@ _GOALS_FORBIDDEN_MARKERS = (
     "## Current Rolling Context",
     "## Recent Decisions",
 )
+_DECISION_LOG_OPTIONAL_PLACEHOLDER_BULLETS = {
+    "- *(No synthesis yet. This section will be populated during the first Sunday review.)*",
+}
 
 
 def _utc_now_iso() -> str:
@@ -595,6 +598,8 @@ def _materialize_decision_log_change_proposal(
 
     for bullet in deletions:
         if bullet not in updated_bullets:
+            if bullet in _DECISION_LOG_OPTIONAL_PLACEHOLDER_BULLETS:
+                continue
             raise ValueError(f"Decision-log deletion anchor was not found: {bullet}")
         updated_bullets.remove(bullet)
 
@@ -1119,6 +1124,8 @@ async def run_memory_audit_stage(
         )
 
     record.memory_audit = _response_to_stage_checkpoint(response)
+    record.last_completed_stage = ReviewStage.MEMORY_AUDIT
+    record = await save_review_workflow(record)
     proposal_prompt = _with_revision_context(
         _render_decision_log_change_prompt(record),
         record=record,
