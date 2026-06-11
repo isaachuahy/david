@@ -53,7 +53,9 @@ from bot.review_flow import (
     ACTIVE_REVIEW_WORKFLOW_ID_KEY,
     advance_review_after_confirmed_stage,
     apply_confirmed_review_stage_artifacts,
+    append_review_gate_status,
     discard_review_workflow,
+    mark_review_stage_revision_in_progress,
     revise_active_review_stage,
     resume_review_workflow,
     send_retryable_artifact_write_notice,
@@ -385,21 +387,44 @@ async def _handle_review_stage_confirm(
             if isinstance(retry_state, dict)
             else None
         )
-        await query.edit_message_text(
-            "❌ *I could not apply the confirmed review changes. The review is still paused here.*",
-            reply_markup=(
-                build_artifact_write_retry_keyboard(retry_write_id)
-                if retry_write_id
-                else None
-            ),
-            parse_mode="Markdown",
-        )
+        status_appended = False
+        if isinstance(active_confirmation, dict):
+            status_appended = await append_review_gate_status(
+                context,
+                query.message.chat_id,
+                active_confirmation,
+                "❌ *I could not apply the confirmed review changes. The review is still paused here.*",
+                reply_markup=(
+                    build_artifact_write_retry_keyboard(retry_write_id)
+                    if retry_write_id
+                    else None
+                ),
+            )
+        if not status_appended:
+            await query.edit_message_text(
+                "❌ *I could not apply the confirmed review changes. The review is still paused here.*",
+                reply_markup=(
+                    build_artifact_write_retry_keyboard(retry_write_id)
+                    if retry_write_id
+                    else None
+                ),
+                parse_mode="Markdown",
+            )
         return
 
-    await query.edit_message_text(
-        f"✅ *{stage.value.replace('_', ' ').title()} confirmed.*",
-        parse_mode="Markdown",
-    )
+    status_appended = False
+    if isinstance(active_confirmation, dict):
+        status_appended = await append_review_gate_status(
+            context,
+            query.message.chat_id,
+            active_confirmation,
+            f"✅ *{stage.value.replace('_', ' ').title()} confirmed.*",
+        )
+    if not status_appended:
+        await query.edit_message_text(
+            f"✅ *{stage.value.replace('_', ' ').title()} confirmed.*",
+            parse_mode="Markdown",
+        )
     await advance_review_after_confirmed_stage(context, query.message.chat_id, record, stage)
 
 
@@ -563,10 +588,19 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "review_id": record.id,
             "stage": stage.value,
         }
-        await query.edit_message_text(
-            "📝 *Revision requested.* Send the correction you want me to apply to this review stage.",
-            parse_mode="Markdown",
-        )
+        status_appended = False
+        if isinstance(active_confirmation, dict):
+            status_appended = await append_review_gate_status(
+                context,
+                query.message.chat_id,
+                active_confirmation,
+                "📝 *Revision requested.* Send the correction you want me to apply to this review stage.",
+            )
+        if not status_appended:
+            await query.edit_message_text(
+                "📝 *Revision requested.* Send the correction you want me to apply to this review stage.",
+                parse_mode="Markdown",
+            )
         return
 
     if query.data.startswith("reject_item_"):
@@ -668,42 +702,6 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("There is no active session to close.")
 
 
-async def _close_active_review_stage_keyboard(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    active_stage_confirmation: dict,
-) -> None:
-    """
-    Removes the stale review-gate keyboard before applying text feedback.
-
-    A message during a review gate is treated as revision feedback for the
-    latest visible proposal. Closing the old inline keyboard prevents a delayed
-    button press from confirming or rejecting the pre-revision proposal.
-    """
-    message_id = active_stage_confirmation.get("message_id")
-    if not isinstance(message_id, int):
-        return
-
-    try:
-        await context.bot.edit_message_reply_markup(
-            chat_id=update.effective_chat.id,
-            message_id=message_id,
-            reply_markup=None,
-        )
-    except Exception as error:
-        logger.error(f"Failed to close stale review-stage keyboard: {error}")
-        capture_sentry_exception(
-            error,
-            component="handlers",
-            operation="close_review_stage_keyboard",
-            message="Failed to close stale review-stage keyboard before revision.",
-            tags={
-                "review_id": str(active_stage_confirmation.get("review_id", "unknown")),
-                "stage": str(active_stage_confirmation.get("stage", "unknown")),
-            },
-        )
-
-
 @authorized_only
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles ad-hoc messages by checking UI state and passing text to the Router."""
@@ -740,9 +738,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         review_id = active_stage_confirmation.get("review_id")
         stage_value = active_stage_confirmation.get("stage")
         if review_id and stage_value:
-            await _close_active_review_stage_keyboard(
-                update,
+            await mark_review_stage_revision_in_progress(
                 context,
+                update.effective_chat.id,
                 active_stage_confirmation,
             )
             revised_record = await revise_active_review_stage(

@@ -1,5 +1,7 @@
+from loguru import logger
 from telegram.ext import ContextTypes
 
+from observability.sentry import capture_exception as capture_sentry_exception
 from bot.keyboards import (
     build_artifact_write_retry_keyboard,
     build_review_resume_keyboard,
@@ -115,21 +117,118 @@ def _set_active_review_stage_confirmation(
     *,
     review_id: str,
     stage: ReviewStage,
+    text: str,
     message_id: int | None = None,
 ) -> None:
     """
     Stores the currently visible review gate for revision/confirmation routing.
 
     When Telegram returns a real message id, we retain it so a later text
-    revision can close the old keyboard before showing the revised proposal.
+    revision can annotate the old gate before showing the revised proposal.
     """
     confirmation = {
         "review_id": review_id,
         "stage": stage.value,
+        "text": text,
     }
     if isinstance(message_id, int):
         confirmation["message_id"] = message_id
     context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = confirmation
+
+
+async def mark_review_stage_revision_in_progress(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    active_stage_confirmation: dict,
+) -> None:
+    """
+    Retires the latest visible review gate while preserving its text.
+
+    A free-form message at a review gate means "revise this proposal." We keep
+    the old audit/proposal visible in Telegram, append a status line, and remove
+    the keyboard so a delayed button press cannot act on the pre-revision gate.
+    """
+    message_id = active_stage_confirmation.get("message_id")
+    if not isinstance(message_id, int):
+        return
+
+    text = active_stage_confirmation.get("text")
+    try:
+        if isinstance(text, str) and text.strip():
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=f"{text.strip()}\n\n📝 *Revision in progress...*",
+                reply_markup=None,
+                parse_mode="Markdown",
+            )
+        else:
+            await context.bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=None,
+            )
+    except Exception as error:
+        logger.error(f"Failed to mark review-stage revision in progress: {error}")
+        capture_sentry_exception(
+            error,
+            component="review_flow",
+            operation="mark_review_stage_revision_in_progress",
+            message="Failed to annotate stale review-stage gate before revision.",
+            tags={
+                "review_id": str(active_stage_confirmation.get("review_id", "unknown")),
+                "stage": str(active_stage_confirmation.get("stage", "unknown")),
+            },
+        )
+
+
+async def append_review_gate_status(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    active_stage_confirmation: dict,
+    status_text: str,
+    *,
+    reply_markup=None,
+) -> bool:
+    """
+    Appends a terminal/status line to the visible review gate.
+
+    Review gates are not part of chat history, so preserving the original
+    Telegram text matters for human continuity. Button actions should retire
+    the keyboard without collapsing the audit/proposal into a one-line status.
+    """
+    message_id = active_stage_confirmation.get("message_id")
+    if not isinstance(message_id, int):
+        return False
+
+    original_text = active_stage_confirmation.get("text")
+    next_text = (
+        f"{original_text.strip()}\n\n{status_text}"
+        if isinstance(original_text, str) and original_text.strip()
+        else status_text
+    )
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=next_text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+        return True
+    except Exception as error:
+        logger.error(f"Failed to append review-stage status: {error}")
+        capture_sentry_exception(
+            error,
+            component="review_flow",
+            operation="append_review_gate_status",
+            message="Failed to append status to review-stage gate.",
+            tags={
+                "review_id": str(active_stage_confirmation.get("review_id", "unknown")),
+                "stage": str(active_stage_confirmation.get("stage", "unknown")),
+            },
+        )
+        return False
 
 
 async def send_review_stage_confirmation(
@@ -139,9 +238,10 @@ async def send_review_stage_confirmation(
     stage: ReviewStage,
 ) -> None:
     """Presents one Sunday review stage checkpoint for confirm/revise feedback."""
+    text = _format_review_stage_summary(stage, record)
     message = await context.bot.send_message(
         chat_id=chat_id,
-        text=_format_review_stage_summary(stage, record),
+        text=text,
         reply_markup=build_review_stage_keyboard(stage.value),
         parse_mode="Markdown",
     )
@@ -149,6 +249,7 @@ async def send_review_stage_confirmation(
         context,
         review_id=record.id,
         stage=stage,
+        text=text,
         message_id=getattr(message, "message_id", None),
     )
 
@@ -248,6 +349,7 @@ async def send_memory_audit_confirmation(
         context,
         review_id=record.id,
         stage=ReviewStage.MEMORY_AUDIT,
+        text=text,
         message_id=getattr(message, "message_id", None),
     )
 
@@ -273,6 +375,7 @@ async def send_goals_audit_confirmation(
         context,
         review_id=record.id,
         stage=ReviewStage.GOALS_AUDIT,
+        text=text,
         message_id=getattr(message, "message_id", None),
     )
 
@@ -301,6 +404,7 @@ async def send_weekly_plan_confirmation(
         context,
         review_id=record.id,
         stage=ReviewStage.WEEKLY_PLAN,
+        text=text,
         message_id=getattr(message, "message_id", None),
     )
 

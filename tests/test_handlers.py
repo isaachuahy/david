@@ -263,11 +263,14 @@ async def test_revise_active_proposal_item_updates_proposal_in_place(
         "Move it to 10 instead",
     )
 
-    context.bot.edit_message_text.assert_awaited_once_with(
-        chat_id=456,
-        message_id=999,
-        text="Revision requested. Retiring this proposal while I update it.",
-    )
+    context.bot.edit_message_text.assert_awaited_once()
+    edit_kwargs = context.bot.edit_message_text.await_args.kwargs
+    assert edit_kwargs["chat_id"] == 456
+    assert edit_kwargs["message_id"] == 999
+    assert "*Deep Work*" in edit_kwargs["text"]
+    assert "Calendar ID: `primary`" in edit_kwargs["text"]
+    assert "📝 *Revision in progress...*" in edit_kwargs["text"]
+    assert edit_kwargs["parse_mode"] == "Markdown"
     mock_mark_in_revision.assert_called_once_with("pi_123", feedback="Move it to 10 instead")
     assert mock_process_message.await_args.args[0].startswith("Revise the active calendar proposal")
     mock_revise_proposal_item.assert_called_once()
@@ -906,10 +909,9 @@ async def test_handle_start_trigger_weekly_pauses_at_week_review_confirmation(
     mock_start_weekly_review_workflow.assert_awaited_once_with()
     assert context.user_data["active_review_workflow_id"] == "review_test"
     mock_send_proposal_thread.assert_not_awaited()
-    assert context.user_data["active_review_stage_confirmation"] == {
-        "review_id": "review_test",
-        "stage": "week_review",
-    }
+    assert context.user_data["active_review_stage_confirmation"]["review_id"] == "review_test"
+    assert context.user_data["active_review_stage_confirmation"]["stage"] == "week_review"
+    assert "The week had useful progress." in context.user_data["active_review_stage_confirmation"]["text"]
     sent_messages = context.bot.send_message.await_args_list
     assert "*Week Review Ready*" in sent_messages[0].kwargs["text"]
     assert "The week had useful progress." in sent_messages[0].kwargs["text"]
@@ -1643,10 +1645,9 @@ async def test_send_review_stage_gate_presents_memory_audit_decision_log_changes
     assert "David works better when late-evening commitments are avoided." in sent_text
     assert "Remove duplicated implementation note." in sent_text
     assert "Compact the rolling-context energy preference." in sent_text
-    assert context.user_data["active_review_stage_confirmation"] == {
-        "review_id": "review_test",
-        "stage": "memory_audit",
-    }
+    assert context.user_data["active_review_stage_confirmation"]["review_id"] == "review_test"
+    assert context.user_data["active_review_stage_confirmation"]["stage"] == "memory_audit"
+    assert "Memory is useful" in context.user_data["active_review_stage_confirmation"]["text"]
 
 
 @pytest.mark.asyncio
@@ -1684,10 +1685,9 @@ async def test_send_review_stage_gate_presents_goals_audit_goals_changes():
     assert "*Goals Audit Ready*" in sent_text
     assert "*Proposed Goals Changes:*" in sent_text
     assert "Clarify the durable MVP goal." in sent_text
-    assert context.user_data["active_review_stage_confirmation"] == {
-        "review_id": "review_test",
-        "stage": "goals_audit",
-    }
+    assert context.user_data["active_review_stage_confirmation"]["review_id"] == "review_test"
+    assert context.user_data["active_review_stage_confirmation"]["stage"] == "goals_audit"
+    assert "Goals remain accurate" in context.user_data["active_review_stage_confirmation"]["text"]
 
 
 @pytest.mark.asyncio
@@ -1711,11 +1711,12 @@ async def test_handle_message_revises_active_review_stage(
             "review_id": "review_test",
             "stage": "week_review",
             "message_id": 789,
+            "text": "*Week Review Ready*\n\nOriginal week review.",
         },
         "session_state": "ACTIVE",
     }
     context.bot_data = {"allowed_user_id": 123}
-    context.bot.edit_message_reply_markup = AsyncMock()
+    context.bot.edit_message_text = AsyncMock()
 
     record = ReviewWorkflowRecord(
         id="review_test",
@@ -1745,10 +1746,12 @@ async def test_handle_message_revises_active_review_stage(
         stage=ReviewStage.WEEK_REVIEW,
         feedback="The week review missed the dentist appointment.",
     )
-    context.bot.edit_message_reply_markup.assert_awaited_once_with(
+    context.bot.edit_message_text.assert_awaited_once_with(
         chat_id=456,
         message_id=789,
+        text="*Week Review Ready*\n\nOriginal week review.\n\n📝 *Revision in progress...*",
         reply_markup=None,
+        parse_mode="Markdown",
     )
     update.message.reply_text.assert_awaited_once_with(
         "📝 *Revision applied.*",

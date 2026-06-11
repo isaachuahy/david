@@ -39,10 +39,38 @@ async def _send_proposal_item_confirmation(
     The buttons point at the proposal item, not a calendar write. Calendar
     writes are created only after the user confirms the active item.
     """
+    reply_markup = build_proposal_item_keyboard(item.id)
+    full_text = _format_proposal_item_confirmation_text(
+        item,
+        prefix_text=prefix_text,
+        calendar_display_name=calendar_display_name,
+    )
+
+    message = await context.bot.send_message(
+        chat_id=chat_id,
+        text=full_text.strip(),
+        reply_markup=reply_markup,
+        parse_mode="Markdown",
+    )
+    track_confirmation_message(context, item.id, message.message_id)
+    return item.id
+
+
+def _format_proposal_item_confirmation_text(
+    item: ProposalItemRecord,
+    *,
+    prefix_text: str = "",
+    calendar_display_name: str | None = None,
+) -> str:
+    """
+    Formats the user-visible proposal text from durable item state.
+
+    Reusing this for both initial presentation and revision-in-progress updates
+    keeps the Telegram thread readable even though proposal messages are not
+    copied into David's chat history.
+    """
     start_dt = parse_user_datetime(item.start_time)
     end_dt = parse_user_datetime(item.end_time)
-    reply_markup = build_proposal_item_keyboard(item.id)
-
     display_name = calendar_display_name or item.calendar_id
     calendar_line = (
         f"Calendar: {display_name} (`{item.calendar_id}`)"
@@ -73,14 +101,7 @@ async def _send_proposal_item_confirmation(
             f"End: {format_user_datetime(end_dt)}"
         )
 
-    message = await context.bot.send_message(
-        chat_id=chat_id,
-        text=full_text.strip(),
-        reply_markup=reply_markup,
-        parse_mode="Markdown",
-    )
-    track_confirmation_message(context, item.id, message.message_id)
-    return item.id
+    return full_text.strip()
 
 
 async def _normalize_calendar_action(
@@ -332,10 +353,16 @@ async def revise_active_proposal_item(
         return False
 
     try:
+        existing_text = _format_proposal_item_confirmation_text(item)
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
-            text="Revision requested. Retiring this proposal while I update it.",
+            text=(
+                f"{existing_text}\n\n📝 *Revision in progress...*"
+                if existing_text
+                else "📝 *Revision in progress...*"
+            ),
+            parse_mode="Markdown",
         )
     except Exception as error:
         logger.error(f"Failed to retire proposal item UI for {item_id}: {error}")
