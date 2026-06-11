@@ -541,14 +541,46 @@ async def advance_review_after_confirmed_stage(
         # Scheduling-pass confirmation is the handoff from confirmed scheduling
         # intent into concrete proposal candidates. Proposal flow owns the item
         # queue after this point.
+        try:
+            record = await generate_scheduling_proposals(record)
+            context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = record.id
+            proposals_sent = await send_weekly_review_scheduling_proposals(
+                context,
+                chat_id,
+                record,
+            )
+        except Exception as error:
+            logger.error(f"Failed to generate Sunday review scheduling proposals: {error}")
+            capture_sentry_exception(
+                error,
+                component="review_flow",
+                operation="advance_review_after_confirmed_stage",
+                message="Failed to generate calendar proposals from the confirmed scheduling pass.",
+                tags={
+                    "review_id": record.id,
+                    "confirmed_stage": stage.value,
+                },
+            )
+            record = await transition_review_stage(
+                record,
+                workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+                stage=ReviewStage.SCHEDULING_PASS,
+                stage_status=StageStatus.AWAITING_FEEDBACK,
+                last_completed_stage=ReviewStage.SCHEDULING_PASS,
+            )
+            context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = record.id
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Calendar proposal generation failed, so I paused at the "
+                    "confirmed scheduling direction. Please confirm Scheduling "
+                    "Pass again to retry, or send feedback to revise it."
+                ),
+            )
+            await send_review_stage_gate(context, chat_id, record)
+            return
+
         context.user_data.pop(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY, None)
-        record = await generate_scheduling_proposals(record)
-        context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = record.id
-        proposals_sent = await send_weekly_review_scheduling_proposals(
-            context,
-            chat_id,
-            record,
-        )
         if not proposals_sent:
             record = await prepare_final_review_stage(record)
             await context.bot.send_message(

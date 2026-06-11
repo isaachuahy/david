@@ -191,6 +191,60 @@ def _get_review_stage_checkpoint(
     return getattr(record, _REVIEW_STAGE_FIELD_BY_STAGE[stage])
 
 
+def _review_stage_has_gate_output(
+    record: ReviewWorkflowRecord,
+    stage: ReviewStage,
+) -> bool:
+    """
+    Returns whether a review stage has enough persisted output to render safely.
+
+    Most gates only need their compact checkpoint. Weekly plan also needs the
+    proposed weekly-state markdown because its confirmation message approves
+    that artifact before downstream scheduling is allowed to run.
+    """
+    if _get_review_stage_checkpoint(record, stage) is None:
+        return False
+
+    if stage == ReviewStage.WEEKLY_PLAN:
+        return (
+            record.weekly_state_changes is not None
+            and bool(record.weekly_state_changes.proposed_markdown)
+        )
+
+    return True
+
+
+def _latest_renderable_review_stage_before_failure(
+    record: ReviewWorkflowRecord,
+    failed_stage: ReviewStage,
+) -> Optional[ReviewStage]:
+    """
+    Finds the safest review gate to show after a repair attempt fails.
+
+    Repair runs can fail while regenerating a downstream stage, especially when
+    validation rejects LLM-proposed markdown. Falling back to the latest
+    already-renderable gate lets the user retry deliberately instead of leaving
+    the workflow stranded on a half-built stage after a restart.
+    """
+    if (
+        record.last_completed_stage is not None
+        and record.last_completed_stage != failed_stage
+        and _review_stage_has_gate_output(record, record.last_completed_stage)
+    ):
+        return record.last_completed_stage
+
+    try:
+        failed_index = _REVIEW_STAGE_INVALIDATION_ORDER.index(failed_stage)
+    except ValueError:
+        return None
+
+    for stage in reversed(_REVIEW_STAGE_INVALIDATION_ORDER[:failed_index]):
+        if _review_stage_has_gate_output(record, stage):
+            return stage
+
+    return None
+
+
 def _format_revision_prompt_context(
     record: ReviewWorkflowRecord,
     stage: ReviewStage,
@@ -1685,18 +1739,7 @@ async def repair_review_stage_for_gate(
     instead of crashing on a missing checkpoint.
     """
     stage_to_repair = record.current_stage
-    checkpoint = _get_review_stage_checkpoint(record, stage_to_repair)
-    if (
-        checkpoint is not None
-        and stage_to_repair != ReviewStage.WEEKLY_PLAN
-    ):
-        return record
-    if (
-        stage_to_repair == ReviewStage.WEEKLY_PLAN
-        and record.weekly_plan is not None
-        and record.weekly_state_changes is not None
-        and record.weekly_state_changes.proposed_markdown
-    ):
+    if _review_stage_has_gate_output(record, stage_to_repair):
         return record
 
     logger.warning(
@@ -1705,46 +1748,78 @@ async def repair_review_stage_for_gate(
         stage_to_repair.value,
     )
 
-    if stage_to_repair == ReviewStage.WEEK_REVIEW:
-        record = await transition_review_stage(
-            record,
-            stage=ReviewStage.WEEK_REVIEW,
-            stage_status=StageStatus.RUNNING,
+    try:
+        if stage_to_repair == ReviewStage.WEEK_REVIEW:
+            record = await transition_review_stage(
+                record,
+                stage=ReviewStage.WEEK_REVIEW,
+                stage_status=StageStatus.RUNNING,
+            )
+            record = await run_week_review_stage(record)
+        elif stage_to_repair == ReviewStage.GOALS_AUDIT:
+            record = await transition_review_stage(
+                record,
+                stage=ReviewStage.GOALS_AUDIT,
+                stage_status=StageStatus.RUNNING,
+            )
+            record = await run_goals_audit_stage(record)
+        elif stage_to_repair == ReviewStage.MEMORY_AUDIT:
+            record = await transition_review_stage(
+                record,
+                stage=ReviewStage.MEMORY_AUDIT,
+                stage_status=StageStatus.RUNNING,
+            )
+            record = await run_memory_audit_stage(record)
+        elif stage_to_repair == ReviewStage.WEEKLY_PLAN:
+            record = await transition_review_stage(
+                record,
+                stage=ReviewStage.WEEKLY_PLAN,
+                stage_status=StageStatus.RUNNING,
+            )
+            record = await run_weekly_plan_stage(record)
+        elif stage_to_repair == ReviewStage.SCHEDULING_PASS:
+            record = await transition_review_stage(
+                record,
+                stage=ReviewStage.SCHEDULING_PASS,
+                stage_status=StageStatus.RUNNING,
+            )
+            record = await run_scheduling_pass_stage(record)
+        elif stage_to_repair == ReviewStage.FINAL_REVIEW:
+            return await prepare_final_review_stage(record)
+        else:
+            raise ValueError(
+                f"Review stage {stage_to_repair.value} has no checkpoint to confirm."
+            )
+    except Exception as error:
+        capture_sentry_exception(
+            error,
+            component="review_manager",
+            operation="repair_review_stage_for_gate",
+            message="Failed to repair a Sunday review stage before rendering its gate.",
+            tags={
+                "review_id": record.id,
+                "stage": stage_to_repair.value,
+            },
         )
-        record = await run_week_review_stage(record)
-    elif stage_to_repair == ReviewStage.GOALS_AUDIT:
-        record = await transition_review_stage(
+        fallback_stage = _latest_renderable_review_stage_before_failure(
             record,
-            stage=ReviewStage.GOALS_AUDIT,
-            stage_status=StageStatus.RUNNING,
+            stage_to_repair,
         )
-        record = await run_goals_audit_stage(record)
-    elif stage_to_repair == ReviewStage.MEMORY_AUDIT:
-        record = await transition_review_stage(
+        if fallback_stage is None:
+            raise
+
+        logger.warning(
+            "Restoring Sunday review {} to {} after {} repair failed.",
+            record.id,
+            fallback_stage.value,
+            stage_to_repair.value,
+        )
+        return await transition_review_stage(
             record,
-            stage=ReviewStage.MEMORY_AUDIT,
-            stage_status=StageStatus.RUNNING,
-        )
-        record = await run_memory_audit_stage(record)
-    elif stage_to_repair == ReviewStage.WEEKLY_PLAN:
-        record = await transition_review_stage(
-            record,
-            stage=ReviewStage.WEEKLY_PLAN,
-            stage_status=StageStatus.RUNNING,
-        )
-        record = await run_weekly_plan_stage(record)
-    elif stage_to_repair == ReviewStage.SCHEDULING_PASS:
-        record = await transition_review_stage(
-            record,
-            stage=ReviewStage.SCHEDULING_PASS,
-            stage_status=StageStatus.RUNNING,
-        )
-        record = await run_scheduling_pass_stage(record)
-    elif stage_to_repair == ReviewStage.FINAL_REVIEW:
-        return await prepare_final_review_stage(record)
-    else:
-        raise ValueError(
-            f"Review stage {stage_to_repair.value} has no checkpoint to confirm."
+            workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            stage=fallback_stage,
+            stage_status=StageStatus.AWAITING_FEEDBACK,
+            last_completed_stage=fallback_stage,
         )
 
     return await transition_review_stage(
