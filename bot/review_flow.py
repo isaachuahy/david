@@ -558,7 +558,38 @@ async def advance_review_after_confirmed_stage(
             await send_review_stage_gate(context, chat_id, record)
         return
 
-    record = await advance_review_from_current_stage(record)
+    try:
+        record = await advance_review_from_current_stage(record)
+    except Exception as error:
+        logger.error(f"Failed to advance Sunday review from {stage.value}: {error}")
+        capture_sentry_exception(
+            error,
+            component="review_flow",
+            operation="advance_review_after_confirmed_stage",
+            message="Failed to generate the next Sunday review stage after confirmation.",
+            tags={
+                "review_id": record.id,
+                "confirmed_stage": stage.value,
+            },
+        )
+        record = await transition_review_stage(
+            record,
+            workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            stage=stage,
+            stage_status=StageStatus.AWAITING_FEEDBACK,
+            last_completed_stage=stage,
+        )
+        context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = record.id
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "The next review-stage draft failed validation, so I paused "
+                "before advancing. Please confirm this stage again to retry."
+            ),
+        )
+        await send_review_stage_gate(context, chat_id, record)
+        return
+
     context.user_data[ACTIVE_REVIEW_WORKFLOW_ID_KEY] = record.id
     context.user_data.pop(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY, None)
 

@@ -1403,6 +1403,105 @@ async def test_handle_confirm_goals_audit_executes_goals_artifact_write(
 
 
 @pytest.mark.asyncio
+@patch('bot.review_flow.send_review_stage_gate', new_callable=AsyncMock)
+@patch('bot.review_flow.advance_review_from_current_stage', new_callable=AsyncMock)
+@patch('bot.review_flow.transition_review_stage', new_callable=AsyncMock)
+@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
+@patch('bot.review_flow.execute_artifact_write')
+@patch('bot.review_flow.create_artifact_write')
+async def test_handle_confirm_memory_audit_recovers_when_weekly_plan_generation_fails(
+    mock_create_artifact_write,
+    mock_execute_artifact_write,
+    mock_load_review_workflow,
+    mock_transition_review_stage,
+    mock_advance_review_from_current_stage,
+    mock_send_review_stage_gate,
+):
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.callback_query = MagicMock()
+    update.callback_query.data = "confirm_review_stage_memory_audit"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.chat_id = 456
+
+    context = MagicMock()
+    context.user_data = {
+        "active_review_workflow_id": "review_test",
+        "active_review_stage_confirmation": {
+            "review_id": "review_test",
+            "stage": "memory_audit",
+        },
+    }
+    context.bot_data = {"allowed_user_id": 123}
+    context.bot.send_message = AsyncMock()
+
+    loaded_record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.MEMORY_AUDIT,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        memory_audit=StageCheckpoint(summary="Memory audit is ready."),
+        decision_log_changes=ArtifactChangeSummary(
+            proposed_markdown="# Decision Log\n\n## Current Rolling Context\n- Keep evenings light.\n",
+        ),
+    )
+    completed_record = loaded_record.model_copy(
+        update={
+            "workflow_status": ReviewWorkflowStatus.ACTIVE,
+            "stage_status": StageStatus.COMPLETED,
+            "last_completed_stage": ReviewStage.MEMORY_AUDIT,
+        }
+    )
+    restored_record = loaded_record.model_copy(
+        update={
+            "workflow_status": ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            "stage_status": StageStatus.AWAITING_FEEDBACK,
+            "last_completed_stage": ReviewStage.MEMORY_AUDIT,
+        }
+    )
+    artifact_write = ArtifactWriteRecord(
+        id="awrite_memory",
+        artifact_type=ArtifactType.DECISION_LOG,
+        content=loaded_record.decision_log_changes.proposed_markdown,
+        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
+        source_id="review_test",
+        source_stage=ReviewStage.MEMORY_AUDIT.value,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+    )
+    mock_load_review_workflow.return_value = loaded_record
+    mock_create_artifact_write.return_value = artifact_write
+    mock_execute_artifact_write.return_value = artifact_write.model_copy(
+        update={"status": ArtifactWriteStatus.EXECUTED}
+    )
+    mock_transition_review_stage.side_effect = [completed_record, restored_record]
+    mock_advance_review_from_current_stage.side_effect = ValueError(
+        "Weekly state markdown is missing required section(s): ## This Week"
+    )
+
+    await handle_confirm(update, context)
+
+    mock_advance_review_from_current_stage.assert_awaited_once_with(completed_record)
+    assert mock_transition_review_stage.await_args_list[-1].kwargs == {
+        "workflow_status": ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        "stage": ReviewStage.MEMORY_AUDIT,
+        "stage_status": StageStatus.AWAITING_FEEDBACK,
+        "last_completed_stage": ReviewStage.MEMORY_AUDIT,
+    }
+    context.bot.send_message.assert_awaited_once()
+    assert "failed validation" in context.bot.send_message.await_args.kwargs["text"]
+    mock_send_review_stage_gate.assert_awaited_once_with(context, 456, restored_record)
+
+
+@pytest.mark.asyncio
 @patch('bot.review_flow.advance_review_from_current_stage', new_callable=AsyncMock)
 @patch('bot.review_flow.transition_review_stage', new_callable=AsyncMock)
 @patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
