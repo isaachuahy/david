@@ -1679,35 +1679,79 @@ async def repair_review_stage_for_gate(
     """
     Repairs persisted review records that cannot render their current gate.
 
-    Older failures may leave a workflow at AWAITING_FEEDBACK for a stage whose
-    checkpoint was never persisted. Before Telegram renders that gate, rerun
-    the missing stage from durable prerequisites so resume/retry paths recover
+    Older failures may leave a workflow at a stage whose checkpoint or required
+    artifact was never persisted. Before Telegram renders that gate, rerun the
+    missing stage from durable prerequisites so resume/retry paths recover
     instead of crashing on a missing checkpoint.
     """
-    checkpoint = _get_review_stage_checkpoint(record, record.current_stage)
-    if checkpoint is not None:
+    stage_to_repair = record.current_stage
+    checkpoint = _get_review_stage_checkpoint(record, stage_to_repair)
+    if (
+        checkpoint is not None
+        and stage_to_repair != ReviewStage.WEEKLY_PLAN
+    ):
+        return record
+    if (
+        stage_to_repair == ReviewStage.WEEKLY_PLAN
+        and record.weekly_plan is not None
+        and record.weekly_state_changes is not None
+        and record.weekly_state_changes.proposed_markdown
+    ):
         return record
 
-    if record.current_stage == ReviewStage.MEMORY_AUDIT:
-        logger.warning(
-            "Repairing Sunday review {} with missing memory_audit checkpoint before gate render.",
-            record.id,
+    logger.warning(
+        "Repairing Sunday review {} with missing {} gate output before render.",
+        record.id,
+        stage_to_repair.value,
+    )
+
+    if stage_to_repair == ReviewStage.WEEK_REVIEW:
+        record = await transition_review_stage(
+            record,
+            stage=ReviewStage.WEEK_REVIEW,
+            stage_status=StageStatus.RUNNING,
         )
+        record = await run_week_review_stage(record)
+    elif stage_to_repair == ReviewStage.GOALS_AUDIT:
+        record = await transition_review_stage(
+            record,
+            stage=ReviewStage.GOALS_AUDIT,
+            stage_status=StageStatus.RUNNING,
+        )
+        record = await run_goals_audit_stage(record)
+    elif stage_to_repair == ReviewStage.MEMORY_AUDIT:
         record = await transition_review_stage(
             record,
             stage=ReviewStage.MEMORY_AUDIT,
             stage_status=StageStatus.RUNNING,
         )
         record = await run_memory_audit_stage(record)
-        return await transition_review_stage(
+    elif stage_to_repair == ReviewStage.WEEKLY_PLAN:
+        record = await transition_review_stage(
             record,
-            workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
-            stage=ReviewStage.MEMORY_AUDIT,
-            stage_status=StageStatus.AWAITING_FEEDBACK,
+            stage=ReviewStage.WEEKLY_PLAN,
+            stage_status=StageStatus.RUNNING,
+        )
+        record = await run_weekly_plan_stage(record)
+    elif stage_to_repair == ReviewStage.SCHEDULING_PASS:
+        record = await transition_review_stage(
+            record,
+            stage=ReviewStage.SCHEDULING_PASS,
+            stage_status=StageStatus.RUNNING,
+        )
+        record = await run_scheduling_pass_stage(record)
+    elif stage_to_repair == ReviewStage.FINAL_REVIEW:
+        return await prepare_final_review_stage(record)
+    else:
+        raise ValueError(
+            f"Review stage {stage_to_repair.value} has no checkpoint to confirm."
         )
 
-    raise ValueError(
-        f"Review stage {record.current_stage.value} has no checkpoint to confirm."
+    return await transition_review_stage(
+        record,
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        stage=stage_to_repair,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
     )
 
 

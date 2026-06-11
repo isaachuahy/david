@@ -955,6 +955,94 @@ async def test_advance_review_from_completed_weekly_plan_runs_downstream_stages(
 @pytest.mark.asyncio
 @patch("orchestrator.review_manager.save_review_workflow_sync")
 @patch("orchestrator.review_manager._generate_review_structured")
+async def test_repair_review_stage_for_gate_recovers_missing_week_review_checkpoint(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """Tests that the first Sunday-review gate can be rebuilt after a stale resume."""
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.WEEK_REVIEW,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+            decision_log_markdown=VALID_DECISION_LOG_MARKDOWN,
+            past_week_events=["[2026-04-27T09:00:00-04:00] Deep Work"],
+        ),
+    )
+    mock_generate_review_structured.return_value = WeekReviewResponse(
+        summary="Recovered week review checkpoint.",
+        key_findings=["The stale first gate can now render."],
+        constraints=[],
+        carry_forward=[],
+    )
+
+    repaired_record = await repair_review_stage_for_gate(record)
+
+    assert repaired_record.week_review is not None
+    assert repaired_record.week_review.summary == "Recovered week review checkpoint."
+    assert repaired_record.workflow_status == ReviewWorkflowStatus.AWAITING_FEEDBACK
+    assert repaired_record.current_stage == ReviewStage.WEEK_REVIEW
+    assert repaired_record.stage_status == StageStatus.AWAITING_FEEDBACK
+    mock_generate_review_structured.assert_called_once()
+    assert mock_save_review_workflow_sync.call_count >= 3
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
+async def test_repair_review_stage_for_gate_recovers_missing_goals_audit_checkpoint(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """Tests that a stale goals-audit gate reruns both audit and change proposal passes."""
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.GOALS_AUDIT,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown=VALID_GOALS_MARKDOWN,
+            weekly_state_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+            decision_log_markdown=VALID_DECISION_LOG_MARKDOWN,
+        ),
+        week_review=StageCheckpoint(summary="The week had useful progress."),
+    )
+    mock_generate_review_structured.side_effect = [
+        GoalsAuditResponse(
+            summary="Recovered goals audit checkpoint.",
+            key_findings=["The stale goals gate can now render."],
+            constraints=[],
+            carry_forward=[],
+        ),
+        GoalsChangeProposalResponse(
+            proposed_change_summary="No durable goals change is needed.",
+            proposed_markdown=None,
+            requires_user_reconfirmation=False,
+        ),
+    ]
+
+    repaired_record = await repair_review_stage_for_gate(record)
+
+    assert repaired_record.goals_audit is not None
+    assert repaired_record.goals_audit.summary == "Recovered goals audit checkpoint."
+    assert repaired_record.goals_changes is None
+    assert repaired_record.workflow_status == ReviewWorkflowStatus.AWAITING_FEEDBACK
+    assert repaired_record.current_stage == ReviewStage.GOALS_AUDIT
+    assert repaired_record.stage_status == StageStatus.AWAITING_FEEDBACK
+    assert mock_generate_review_structured.call_count == 2
+    assert mock_save_review_workflow_sync.call_count >= 4
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
 async def test_repair_review_stage_for_gate_recovers_missing_memory_audit_checkpoint(
     mock_generate_review_structured,
     mock_save_review_workflow_sync,
@@ -996,6 +1084,130 @@ async def test_repair_review_stage_for_gate_recovers_missing_memory_audit_checkp
     assert repaired_record.stage_status == StageStatus.AWAITING_FEEDBACK
     assert mock_generate_review_structured.call_count == 2
     assert mock_save_review_workflow_sync.call_count >= 4
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
+async def test_repair_review_stage_for_gate_recovers_missing_weekly_plan_outputs(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """Tests that stale weekly-plan gates rerun the stage and restore proposed markdown."""
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.WEEKLY_PLAN,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+            decision_log_markdown=VALID_DECISION_LOG_MARKDOWN,
+        ),
+        week_review=StageCheckpoint(summary="The week had useful progress."),
+        goals_audit=StageCheckpoint(summary="Goals still hold."),
+        memory_audit=StageCheckpoint(summary="Memory is accurate."),
+    )
+    mock_generate_review_structured.return_value = WeeklyPlanResponse(
+        summary="Recovered weekly plan.",
+        key_findings=[],
+        constraints=[],
+        carry_forward=[],
+        state_change_summary="Recovered valid weekly state.",
+        weekly_state_content=VALID_WEEKLY_STATE_MARKDOWN,
+    )
+
+    repaired_record = await repair_review_stage_for_gate(record)
+
+    assert repaired_record.weekly_plan is not None
+    assert repaired_record.weekly_state_changes is not None
+    assert repaired_record.weekly_state_changes.proposed_markdown == VALID_WEEKLY_STATE_MARKDOWN
+    assert repaired_record.current_stage == ReviewStage.WEEKLY_PLAN
+    assert repaired_record.stage_status == StageStatus.AWAITING_FEEDBACK
+    mock_generate_review_structured.assert_called_once()
+    assert mock_save_review_workflow_sync.call_count >= 3
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
+async def test_repair_review_stage_for_gate_recovers_missing_scheduling_pass_checkpoint(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """Tests that stale scheduling-pass gates rerun scheduling intent generation."""
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.SCHEDULING_PASS,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+            decision_log_markdown=VALID_DECISION_LOG_MARKDOWN,
+        ),
+        week_review=StageCheckpoint(summary="The week had useful progress."),
+        goals_audit=StageCheckpoint(summary="Goals still hold."),
+        memory_audit=StageCheckpoint(summary="Memory is accurate."),
+        weekly_plan=StageCheckpoint(summary="Weekly plan is ready."),
+        weekly_state_changes=ArtifactChangeSummary(
+            proposed_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+        ),
+    )
+    mock_generate_review_structured.return_value = SchedulingPassResponse(
+        summary="Recovered scheduling pass.",
+        key_findings=[],
+        constraints=[],
+        carry_forward=[],
+        scheduling_rationale="Use one high-confidence focus block.",
+    )
+
+    repaired_record = await repair_review_stage_for_gate(record)
+
+    assert repaired_record.scheduling_pass is not None
+    assert repaired_record.scheduling_pass.summary == "Recovered scheduling pass."
+    assert repaired_record.current_stage == ReviewStage.SCHEDULING_PASS
+    assert repaired_record.stage_status == StageStatus.AWAITING_FEEDBACK
+    mock_generate_review_structured.assert_called_once()
+    assert mock_save_review_workflow_sync.call_count >= 3
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+async def test_repair_review_stage_for_gate_recovers_missing_final_review_checkpoint(
+    mock_save_review_workflow_sync,
+):
+    """Tests that stale final-review gates rebuild the deterministic final checkpoint."""
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.FINAL_REVIEW,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+            decision_log_markdown=VALID_DECISION_LOG_MARKDOWN,
+        ),
+        week_review=StageCheckpoint(summary="Week review done."),
+        goals_audit=StageCheckpoint(summary="Goals audit done."),
+        memory_audit=StageCheckpoint(summary="Memory audit done."),
+        weekly_plan=StageCheckpoint(summary="Weekly plan done."),
+        scheduling_pass=StageCheckpoint(summary="Scheduling pass done."),
+    )
+
+    repaired_record = await repair_review_stage_for_gate(record)
+
+    assert repaired_record.final_review is not None
+    assert "Week Review" in repaired_record.final_review.summary
+    assert repaired_record.current_stage == ReviewStage.FINAL_REVIEW
+    assert repaired_record.stage_status == StageStatus.AWAITING_FEEDBACK
+    assert mock_save_review_workflow_sync.call_count >= 3
 
 
 @patch("orchestrator.artifact_writes.capture_sentry_exception")
