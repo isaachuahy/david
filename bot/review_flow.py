@@ -17,6 +17,7 @@ from orchestrator.review_manager import (
     generate_scheduling_proposals,
     load_review_workflow,
     prepare_final_review_stage,
+    repair_review_stage_for_gate,
     revise_review_stage,
     transition_review_stage,
 )
@@ -421,6 +422,8 @@ async def send_review_stage_gate(
     Telegram surface for the persisted stage, keeping stage-specific UI details
     out of callback and message handlers.
     """
+    record = await repair_review_stage_for_gate(record)
+
     if record.current_stage == ReviewStage.WEEKLY_PLAN:
         await send_weekly_plan_confirmation(context, chat_id, record)
         return

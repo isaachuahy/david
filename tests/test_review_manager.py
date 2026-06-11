@@ -7,6 +7,7 @@ from orchestrator.review_manager import (
     build_final_review_message,
     execute_weekly_state_update,
     generate_scheduling_proposals,
+    repair_review_stage_for_gate,
     run_goals_audit_stage,
     run_memory_audit_stage,
     run_scheduling_pass_stage,
@@ -949,6 +950,52 @@ async def test_advance_review_from_completed_weekly_plan_runs_downstream_stages(
     assert updated_record.current_stage == ReviewStage.SCHEDULING_PASS
     assert updated_record.stage_status == StageStatus.AWAITING_FEEDBACK
     assert updated_record.last_completed_stage == ReviewStage.SCHEDULING_PASS
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
+async def test_repair_review_stage_for_gate_recovers_missing_memory_audit_checkpoint(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """Tests that a stale memory-audit gate is regenerated before Telegram renders it."""
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.MEMORY_AUDIT,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+            decision_log_markdown=VALID_DECISION_LOG_MARKDOWN,
+        ),
+        week_review=StageCheckpoint(summary="The week had useful progress."),
+        goals_audit=StageCheckpoint(summary="Goals still hold."),
+    )
+    mock_generate_review_structured.side_effect = [
+        MemoryAuditResponse(
+            summary="Recovered memory audit checkpoint.",
+            key_findings=["The stale gate can now render."],
+            constraints=[],
+            carry_forward=[],
+        ),
+        DecisionLogChangeProposalResponse(
+            proposed_recent_decisions_reset=True,
+        ),
+    ]
+
+    repaired_record = await repair_review_stage_for_gate(record)
+
+    assert repaired_record.memory_audit is not None
+    assert repaired_record.memory_audit.summary == "Recovered memory audit checkpoint."
+    assert repaired_record.workflow_status == ReviewWorkflowStatus.AWAITING_FEEDBACK
+    assert repaired_record.current_stage == ReviewStage.MEMORY_AUDIT
+    assert repaired_record.stage_status == StageStatus.AWAITING_FEEDBACK
+    assert mock_generate_review_structured.call_count == 2
+    assert mock_save_review_workflow_sync.call_count >= 4
 
 
 @patch("orchestrator.artifact_writes.capture_sentry_exception")

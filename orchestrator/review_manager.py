@@ -1673,6 +1673,44 @@ async def advance_review_from_current_stage(
     )
 
 
+async def repair_review_stage_for_gate(
+    record: ReviewWorkflowRecord,
+) -> ReviewWorkflowRecord:
+    """
+    Repairs persisted review records that cannot render their current gate.
+
+    Older failures may leave a workflow at AWAITING_FEEDBACK for a stage whose
+    checkpoint was never persisted. Before Telegram renders that gate, rerun
+    the missing stage from durable prerequisites so resume/retry paths recover
+    instead of crashing on a missing checkpoint.
+    """
+    checkpoint = _get_review_stage_checkpoint(record, record.current_stage)
+    if checkpoint is not None:
+        return record
+
+    if record.current_stage == ReviewStage.MEMORY_AUDIT:
+        logger.warning(
+            "Repairing Sunday review {} with missing memory_audit checkpoint before gate render.",
+            record.id,
+        )
+        record = await transition_review_stage(
+            record,
+            stage=ReviewStage.MEMORY_AUDIT,
+            stage_status=StageStatus.RUNNING,
+        )
+        record = await run_memory_audit_stage(record)
+        return await transition_review_stage(
+            record,
+            workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+            stage=ReviewStage.MEMORY_AUDIT,
+            stage_status=StageStatus.AWAITING_FEEDBACK,
+        )
+
+    raise ValueError(
+        f"Review stage {record.current_stage.value} has no checkpoint to confirm."
+    )
+
+
 def execute_weekly_state_update(content: str) -> bool:
     """
     Replaces weekly_state.md with confirmed markdown and snapshots the result.
