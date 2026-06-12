@@ -506,6 +506,7 @@ async def send_review_stage_gate(
     if record.current_stage in {
         ReviewStage.WEEK_REVIEW,
         ReviewStage.GOALS_AUDIT,
+        ReviewStage.SCHEDULING_PASS,
         ReviewStage.FINAL_REVIEW,
     }:
         await send_review_stage_confirmation(

@@ -1851,6 +1851,44 @@ async def test_send_review_stage_gate_chunks_full_weekly_state_markdown():
 
 
 @pytest.mark.asyncio
+async def test_send_review_stage_gate_presents_scheduling_pass_confirmation():
+    context = MagicMock()
+    context.user_data = {}
+    context.bot.send_message = AsyncMock()
+
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.SCHEDULING_PASS,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        scheduling_pass=StageCheckpoint(
+            summary="Use one high-confidence morning implementation block.",
+            key_findings=["Morning focus best fits the confirmed weekly plan."],
+            constraints=["Avoid late-evening event proposals."],
+        ),
+    )
+
+    await send_review_stage_gate(context, 456, record)
+
+    context.bot.send_message.assert_awaited_once()
+    sent_text = context.bot.send_message.await_args.kwargs["text"]
+    assert "*Scheduling Pass Ready*" in sent_text
+    assert "Use one high-confidence morning implementation block." in sent_text
+    assert "Morning focus best fits the confirmed weekly plan." in sent_text
+    active_confirmation = context.user_data["active_review_stage_confirmation"]
+    assert active_confirmation["review_id"] == "review_test"
+    assert active_confirmation["stage"] == "scheduling_pass"
+    assert "Scheduling Pass Ready" in active_confirmation["text"]
+
+
+@pytest.mark.asyncio
 @patch('bot.handlers.send_review_stage_gate', new_callable=AsyncMock)
 @patch('bot.review_flow.revise_review_stage', new_callable=AsyncMock)
 @patch('bot.review_flow.load_review_workflow', new_callable=AsyncMock)
