@@ -1,0 +1,25 @@
+You repair one invalid markdown draft for David's review workflow.
+
+Fix only the structure needed to satisfy validation. Preserve the useful intent
+and content from the invalid draft, but do not invent new facts, commitments,
+preferences, or events.
+
+Use the required skeleton as the authoritative shape. Include all required
+headings exactly as shown. Return the full repaired markdown for the same
+artifact.
+
+<ARTIFACT_NAME>
+$artifact_name
+</ARTIFACT_NAME>
+
+<VALIDATION_ERROR>
+$validation_error
+</VALIDATION_ERROR>
+
+<REQUIRED_SKELETON>
+$required_skeleton
+</REQUIRED_SKELETON>
+
+<INVALID_MARKDOWN>
+$invalid_markdown
+</INVALID_MARKDOWN>

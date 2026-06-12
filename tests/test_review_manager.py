@@ -30,6 +30,7 @@ from reasoning.schemas import (
     DecisionLogChangeProposalResponse,
     GoalsAuditResponse,
     GoalsChangeProposalResponse,
+    MarkdownRepairResponse,
     MemoryAuditResponse,
     ProposedEvent,
     RollingContextModification,
@@ -589,6 +590,62 @@ async def test_run_weekly_plan_stage_persists_checkpoint_and_weekly_state_artifa
     assert updated_record.weekly_state_changes.proposed_markdown == VALID_WEEKLY_STATE_MARKDOWN
     assert updated_record.last_completed_stage == ReviewStage.WEEKLY_PLAN
     mock_generate_review_structured.assert_called_once()
+    mock_save_review_workflow_sync.assert_called_once()
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
+async def test_run_weekly_plan_stage_repairs_invalid_weekly_state_markdown_once(
+    mock_generate_review_structured,
+    mock_save_review_workflow_sync,
+):
+    """Tests that malformed weekly-state drafts get one structural repair attempt."""
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown=VALID_WEEKLY_STATE_MARKDOWN,
+            decision_log_markdown="# Decision Log",
+        ),
+        week_review=StageCheckpoint(summary="The week moved implementation forward."),
+        goals_audit=StageCheckpoint(summary="Goals remain accurate."),
+        memory_audit=StageCheckpoint(summary="Memory needs only light cleanup."),
+    )
+    invalid_weekly_state = """# Weekly State
+
+### Top Priorities
+- [ ] Finish review workflow implementation.
+
+### Carryover
+- [ ] Keep context cleanup moving.
+
+### Execution Focus
+- Prefer fewer, higher-confidence commitments.
+"""
+    mock_generate_review_structured.side_effect = [
+        WeeklyPlanResponse(
+            summary="The next week should focus on completing the staged review flow.",
+            key_findings=["Weekly planning should stay implementation-focused."],
+            constraints=["Avoid late-evening event proposals."],
+            carry_forward=["Finish Sunday review orchestration."],
+            state_change_summary="Tighten weekly priorities around the review workflow.",
+            weekly_state_content=invalid_weekly_state,
+        ),
+        MarkdownRepairResponse(repaired_markdown=VALID_WEEKLY_STATE_MARKDOWN),
+    ]
+
+    updated_record = await run_weekly_plan_stage(record)
+
+    assert updated_record.weekly_plan is not None
+    assert updated_record.weekly_state_changes is not None
+    assert updated_record.weekly_state_changes.proposed_markdown == VALID_WEEKLY_STATE_MARKDOWN
+    assert mock_generate_review_structured.call_count == 2
+    assert mock_generate_review_structured.call_args_list[1].kwargs["operation"] == (
+        "weekly_state_markdown_repair"
+    )
     mock_save_review_workflow_sync.assert_called_once()
 
 

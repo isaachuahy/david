@@ -1732,18 +1732,23 @@ async def test_send_review_stage_gate_presents_memory_audit_decision_log_changes
             additions=["David works better when late-evening commitments are avoided."],
             deletions=["Remove duplicated implementation note."],
             modifications=["Compact the rolling-context energy preference."],
+            proposed_markdown="# Decision Log\n\n## Current Rolling Context\n- Keep evenings light.",
         ),
     )
 
     await send_review_stage_gate(context, 456, record)
 
-    context.bot.send_message.assert_awaited_once()
-    sent_text = context.bot.send_message.await_args.kwargs["text"]
+    assert context.bot.send_message.await_count == 2
+    sent_text = context.bot.send_message.await_args_list[0].kwargs["text"]
+    full_markdown_text = context.bot.send_message.await_args_list[1].kwargs["text"]
     assert "*Memory Audit Ready*" in sent_text
     assert "*Proposed Decision Log Changes:*" in sent_text
     assert "David works better when late-evening commitments are avoided." in sent_text
     assert "Remove duplicated implementation note." in sent_text
     assert "Compact the rolling-context energy preference." in sent_text
+    assert "Full proposed decision_log.md markdown:" in full_markdown_text
+    assert "## Current Rolling Context" in full_markdown_text
+    assert "parse_mode" not in context.bot.send_message.await_args_list[1].kwargs
     assert context.user_data["active_review_stage_confirmation"]["review_id"] == "review_test"
     assert context.user_data["active_review_stage_confirmation"]["stage"] == "memory_audit"
     assert "Memory is useful" in context.user_data["active_review_stage_confirmation"]["text"]
@@ -1779,14 +1784,70 @@ async def test_send_review_stage_gate_presents_goals_audit_goals_changes():
 
     await send_review_stage_gate(context, 456, record)
 
-    context.bot.send_message.assert_awaited_once()
-    sent_text = context.bot.send_message.await_args.kwargs["text"]
+    assert context.bot.send_message.await_count == 2
+    sent_text = context.bot.send_message.await_args_list[0].kwargs["text"]
+    full_markdown_text = context.bot.send_message.await_args_list[1].kwargs["text"]
     assert "*Goals Audit Ready*" in sent_text
     assert "*Proposed Goals Changes:*" in sent_text
     assert "Clarify the durable MVP goal." in sent_text
+    assert "Full proposed goals.md markdown:" in full_markdown_text
+    assert "## Operating Principles" in full_markdown_text
+    assert "parse_mode" not in context.bot.send_message.await_args_list[1].kwargs
     assert context.user_data["active_review_stage_confirmation"]["review_id"] == "review_test"
     assert context.user_data["active_review_stage_confirmation"]["stage"] == "goals_audit"
     assert "Goals remain accurate" in context.user_data["active_review_stage_confirmation"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_send_review_stage_gate_chunks_full_weekly_state_markdown():
+    context = MagicMock()
+    context.user_data = {}
+    context.bot.send_message = AsyncMock()
+
+    long_weekly_state = (
+        "# Weekly State\n\n"
+        "## This Week\n\n"
+        "### Top Priorities\n"
+        + "\n".join(f"- [ ] Priority {index}" for index in range(240))
+        + "\n\n### Carryover\n- [ ] Carry context cleanup forward.\n"
+        + "\n### Constraints\n- Avoid overfilling evenings.\n"
+        + "\n### Execution Focus\n- Prefer fewer, higher-confidence commitments.\n"
+    )
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.WEEKLY_PLAN,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        weekly_plan=StageCheckpoint(
+            summary="The week should stay focused on robust review workflow implementation.",
+        ),
+        weekly_state_changes=ArtifactChangeSummary(
+            modifications=["Replace weekly state with a focused implementation plan."],
+            proposed_markdown=long_weekly_state,
+        ),
+    )
+
+    await send_review_stage_gate(context, 456, record)
+
+    assert context.bot.send_message.await_count > 2
+    gate_text = context.bot.send_message.await_args_list[0].kwargs["text"]
+    first_chunk_text = context.bot.send_message.await_args_list[1].kwargs["text"]
+    second_chunk_text = context.bot.send_message.await_args_list[2].kwargs["text"]
+    assert "*Weekly Plan Ready*" in gate_text
+    assert "Full proposed weekly_state.md markdown (1/" in first_chunk_text
+    assert "Full proposed weekly_state.md markdown (2/" in second_chunk_text
+    assert "parse_mode" not in context.bot.send_message.await_args_list[1].kwargs
+    assert context.user_data["active_review_stage_confirmation"]["stage"] == "weekly_plan"
+    assert "Full proposed weekly_state.md markdown" not in (
+        context.user_data["active_review_stage_confirmation"]["text"]
+    )
 
 
 @pytest.mark.asyncio

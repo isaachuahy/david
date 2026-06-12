@@ -35,6 +35,7 @@ ACTIVE_REVIEW_WORKFLOW_ID_KEY = "active_review_workflow_id"
 ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY = "active_review_stage_confirmation"
 ACTIVE_ARTIFACT_WRITE_RETRY_KEY = "active_artifact_write_retry"
 ACTIVE_REVIEW_RESUME_PROMPT_KEY = "active_review_resume_prompt"
+ARTIFACT_MARKDOWN_CHUNK_SIZE = 3400
 
 
 def select_latest_resumable_review(records):
@@ -95,7 +96,8 @@ def _format_artifact_change_summary(changes) -> str:
     Formats compact artifact-change proposals for confirmation messages.
 
     Sunday review stages store semantic diffs rather than raw line diffs. This
-    keeps Telegram output readable while still showing what would change.
+    keeps the button-bearing Telegram gate readable. Full proposed markdown is
+    sent separately in plain-text chunks to avoid Telegram message limits.
     """
     if changes is None:
         return "No artifact changes were proposed."
@@ -110,7 +112,46 @@ def _format_artifact_change_summary(changes) -> str:
             lines.append(f"*{label}:*")
             lines.extend(f"- {value}" for value in values)
 
-    return "\n".join(lines) if lines else "No artifact changes were proposed."
+    if not lines:
+        lines.append("No semantic change summary was provided.")
+
+    return "\n".join(lines)
+
+
+async def _send_full_artifact_markdown(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    artifact_name: str,
+    proposed_markdown: str | None,
+) -> None:
+    """
+    Sends full proposed artifact markdown after the compact confirmation gate.
+
+    These messages intentionally use plain text instead of Markdown parse mode:
+    the artifact content itself may contain characters that would break Telegram
+    formatting. Chunking keeps long retries or repaired drafts under Telegram's
+    message-length limit without moving buttons away from the compact gate.
+    """
+    if not proposed_markdown:
+        return
+
+    markdown = proposed_markdown.strip()
+    chunks = [
+        markdown[index:index + ARTIFACT_MARKDOWN_CHUNK_SIZE]
+        for index in range(0, len(markdown), ARTIFACT_MARKDOWN_CHUNK_SIZE)
+    ] or [""]
+
+    for index, chunk in enumerate(chunks, start=1):
+        label = (
+            f"Full proposed {artifact_name} markdown"
+            if len(chunks) == 1
+            else f"Full proposed {artifact_name} markdown ({index}/{len(chunks)})"
+        )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"{label}:\n\n{chunk}",
+        )
 
 
 def _set_active_review_stage_confirmation(
@@ -353,6 +394,16 @@ async def send_memory_audit_confirmation(
         text=text,
         message_id=getattr(message, "message_id", None),
     )
+    await _send_full_artifact_markdown(
+        context,
+        chat_id,
+        artifact_name="decision_log.md",
+        proposed_markdown=(
+            record.decision_log_changes.proposed_markdown
+            if record.decision_log_changes
+            else None
+        ),
+    )
 
 
 async def send_goals_audit_confirmation(
@@ -378,6 +429,16 @@ async def send_goals_audit_confirmation(
         stage=ReviewStage.GOALS_AUDIT,
         text=text,
         message_id=getattr(message, "message_id", None),
+    )
+    await _send_full_artifact_markdown(
+        context,
+        chat_id,
+        artifact_name="goals.md",
+        proposed_markdown=(
+            record.goals_changes.proposed_markdown
+            if record.goals_changes
+            else None
+        ),
     )
 
 
@@ -407,6 +468,12 @@ async def send_weekly_plan_confirmation(
         stage=ReviewStage.WEEKLY_PLAN,
         text=text,
         message_id=getattr(message, "message_id", None),
+    )
+    await _send_full_artifact_markdown(
+        context,
+        chat_id,
+        artifact_name="weekly_state.md",
+        proposed_markdown=record.weekly_state_changes.proposed_markdown,
     )
 
 

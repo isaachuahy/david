@@ -32,6 +32,7 @@ from reasoning.schemas import (
     DecisionLogChangeProposalResponse,
     GoalsAuditResponse,
     GoalsChangeProposalResponse,
+    MarkdownRepairResponse,
     MemoryAuditResponse,
     SchedulingPassResponse,
     SchedulingProposalResponse,
@@ -74,6 +75,18 @@ _WEEKLY_STATE_REQUIRED_MARKERS = (
     "### Constraints",
     "### Execution Focus",
 )
+_WEEKLY_STATE_REQUIRED_SKELETON = """# Weekly State
+
+## This Week
+
+### Top Priorities
+
+### Carryover
+
+### Constraints
+
+### Execution Focus
+"""
 _WEEKLY_STATE_FORBIDDEN_MARKERS = (
     "# Goals",
     "# Decision Log",
@@ -448,6 +461,23 @@ def _render_weekly_plan_prompt(record: ReviewWorkflowRecord) -> str:
     )
 
 
+def _render_artifact_markdown_repair_prompt(
+    *,
+    artifact_name: str,
+    invalid_markdown: str,
+    validation_error: Exception,
+    required_skeleton: str,
+) -> str:
+    """Renders the one-shot markdown repair prompt for invalid draft artifacts."""
+    return _render_review_prompt(
+        "artifact_markdown_repair.txt",
+        artifact_name=artifact_name,
+        validation_error=str(validation_error),
+        required_skeleton=required_skeleton,
+        invalid_markdown=invalid_markdown,
+    )
+
+
 def _render_scheduling_pass_prompt(record: ReviewWorkflowRecord) -> str:
     """
     Renders the scheduling-pass prompt from completed review checkpoints.
@@ -537,6 +567,11 @@ def validate_weekly_state_markdown(content: str) -> None:
         )
 
 
+def _normalize_artifact_markdown(content: str) -> str:
+    """Normalizes generated artifact markdown to the file shape we persist."""
+    return content.strip() + "\n"
+
+
 def validate_goals_markdown(content: str) -> None:
     """
     Performs deterministic sanity checks before confirming proposed goals.
@@ -567,6 +602,35 @@ def validate_goals_markdown(content: str) -> None:
             "Goals markdown appears to include another artifact: "
             + ", ".join(forbidden_markers)
         )
+
+
+async def _repair_markdown_once(
+    *,
+    artifact_name: str,
+    invalid_markdown: str,
+    validation_error: Exception,
+    required_skeleton: str,
+) -> str:
+    """
+    Attempts one structural repair of invalid draft markdown.
+
+    This is intentionally bounded to a single Flash call. The caller must run
+    deterministic validation again before storing or showing the repaired draft.
+    """
+    prompt = _render_artifact_markdown_repair_prompt(
+        artifact_name=artifact_name,
+        invalid_markdown=invalid_markdown,
+        validation_error=validation_error,
+        required_skeleton=required_skeleton,
+    )
+    response = await asyncio.to_thread(
+        _generate_review_structured,
+        prompt=prompt,
+        response_schema=MarkdownRepairResponse,
+        model=GEMINI_FLASH_MODEL,
+        operation=f"{artifact_name}_markdown_repair",
+    )
+    return response.repaired_markdown.strip()
 
 
 def _normalize_decision_log_bullet(value: str) -> str:
@@ -1274,12 +1338,29 @@ async def run_weekly_plan_stage(
             operation=retry_operation,
         )
 
-    validate_weekly_state_markdown(response.weekly_state_content)
+    weekly_state_content = _normalize_artifact_markdown(response.weekly_state_content)
+    try:
+        validate_weekly_state_markdown(weekly_state_content)
+    except ValueError as validation_error:
+        logger.warning(
+            "Repairing invalid weekly_state markdown from {}: {}",
+            operation,
+            validation_error,
+        )
+        weekly_state_content = _normalize_artifact_markdown(
+            await _repair_markdown_once(
+                artifact_name="weekly_state",
+                invalid_markdown=weekly_state_content,
+                validation_error=validation_error,
+                required_skeleton=_WEEKLY_STATE_REQUIRED_SKELETON,
+            )
+        )
+        validate_weekly_state_markdown(weekly_state_content)
 
     record.weekly_plan = _response_to_stage_checkpoint(response)
     record.weekly_state_changes = ArtifactChangeSummary(
         modifications=[response.state_change_summary] if response.state_change_summary else [],
-        proposed_markdown=response.weekly_state_content,
+        proposed_markdown=weekly_state_content,
     )
     record.last_completed_stage = ReviewStage.WEEKLY_PLAN
     return await save_review_workflow(record)

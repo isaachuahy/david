@@ -326,6 +326,19 @@ class WeeklyPlanResponse(BaseModel):
     )
 
 
+class MarkdownRepairResponse(BaseModel):
+    """
+    LLM-facing schema for repairing one invalid markdown draft.
+
+    The application still validates the repaired markdown before it can be
+    shown or written. This schema only carries the repaired draft content.
+    """
+
+    repaired_markdown: str = Field(
+        description="Full repaired markdown content for the same artifact draft.",
+    )
+
+
 class SchedulingPassResponse(BaseModel):
     """
     LLM-facing schema for the scheduling pass stage of the Sunday review workflow.
