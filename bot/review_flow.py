@@ -36,6 +36,7 @@ ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY = "active_review_stage_confirmation"
 ACTIVE_ARTIFACT_WRITE_RETRY_KEY = "active_artifact_write_retry"
 ACTIVE_REVIEW_RESUME_PROMPT_KEY = "active_review_resume_prompt"
 ARTIFACT_MARKDOWN_CHUNK_SIZE = 3400
+REVIEW_GATE_MESSAGE_LIMIT = 3400
 
 
 def select_latest_resumable_review(records):
@@ -151,6 +152,84 @@ async def _send_full_artifact_markdown(
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"{label}:\n\n{chunk}",
+        )
+
+
+async def _send_plain_text_chunks(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    label: str,
+    content: str,
+) -> None:
+    """
+    Sends long non-interactive review text in Telegram-safe chunks.
+
+    Button-bearing gate messages must stay short enough to edit later. When a
+    gate has too much detail, this helper preserves the full content separately
+    without Markdown parsing or inline keyboards.
+    """
+    stripped = content.strip()
+    if not stripped:
+        return
+
+    chunks = [
+        stripped[index:index + ARTIFACT_MARKDOWN_CHUNK_SIZE]
+        for index in range(0, len(stripped), ARTIFACT_MARKDOWN_CHUNK_SIZE)
+    ]
+    for index, chunk in enumerate(chunks, start=1):
+        heading = label if len(chunks) == 1 else f"{label} ({index}/{len(chunks)})"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"{heading}:\n\n{chunk}",
+        )
+
+
+async def _send_review_gate_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    record,
+    stage: ReviewStage,
+    text: str,
+):
+    """
+    Sends a review confirmation gate while respecting Telegram message limits.
+
+    If the rich gate text is too long, the button message is reduced to a short
+    summary and the full gate detail is sent separately. The active confirmation
+    stores the editable button text, so later status updates do not try to edit
+    an oversized message.
+    """
+    gate_text = text
+    if len(text) > REVIEW_GATE_MESSAGE_LIMIT:
+        checkpoint = _get_review_stage_checkpoint(record, stage)
+        gate_text = (
+            f"*{stage.value.replace('_', ' ').title()} Ready*\n\n"
+            f"{checkpoint.summary if checkpoint else 'Review stage is ready for confirmation.'}\n\n"
+            "The full review details were sent separately because they are too long for one Telegram message."
+        )
+
+    message = await context.bot.send_message(
+        chat_id=chat_id,
+        text=gate_text,
+        reply_markup=build_review_stage_keyboard(stage.value),
+        parse_mode="Markdown",
+    )
+    _set_active_review_stage_confirmation(
+        context,
+        review_id=record.id,
+        stage=stage,
+        text=gate_text,
+        message_id=getattr(message, "message_id", None),
+    )
+
+    if gate_text != text:
+        await _send_plain_text_chunks(
+            context,
+            chat_id,
+            label=f"Full {stage.value.replace('_', ' ')} gate details",
+            content=text,
         )
 
 
@@ -281,18 +360,12 @@ async def send_review_stage_confirmation(
 ) -> None:
     """Presents one Sunday review stage checkpoint for confirm/revise feedback."""
     text = _format_review_stage_summary(stage, record)
-    message = await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=build_review_stage_keyboard(stage.value),
-        parse_mode="Markdown",
-    )
-    _set_active_review_stage_confirmation(
+    await _send_review_gate_message(
         context,
-        review_id=record.id,
+        chat_id,
+        record=record,
         stage=stage,
         text=text,
-        message_id=getattr(message, "message_id", None),
     )
 
 
@@ -381,18 +454,12 @@ async def send_memory_audit_confirmation(
         "*Proposed Decision Log Changes:*\n"
         f"{_format_artifact_change_summary(record.decision_log_changes)}"
     )
-    message = await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=build_review_stage_keyboard(ReviewStage.MEMORY_AUDIT.value),
-        parse_mode="Markdown",
-    )
-    _set_active_review_stage_confirmation(
+    await _send_review_gate_message(
         context,
-        review_id=record.id,
+        chat_id,
+        record=record,
         stage=ReviewStage.MEMORY_AUDIT,
         text=text,
-        message_id=getattr(message, "message_id", None),
     )
     await _send_full_artifact_markdown(
         context,
@@ -417,18 +484,12 @@ async def send_goals_audit_confirmation(
         "*Proposed Goals Changes:*\n"
         f"{_format_artifact_change_summary(record.goals_changes)}"
     )
-    message = await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=build_review_stage_keyboard(ReviewStage.GOALS_AUDIT.value),
-        parse_mode="Markdown",
-    )
-    _set_active_review_stage_confirmation(
+    await _send_review_gate_message(
         context,
-        review_id=record.id,
+        chat_id,
+        record=record,
         stage=ReviewStage.GOALS_AUDIT,
         text=text,
-        message_id=getattr(message, "message_id", None),
     )
     await _send_full_artifact_markdown(
         context,
@@ -456,18 +517,12 @@ async def send_weekly_plan_confirmation(
         "*Proposed Weekly State Changes:*\n"
         f"{_format_artifact_change_summary(record.weekly_state_changes)}"
     )
-    message = await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=build_review_stage_keyboard(ReviewStage.WEEKLY_PLAN.value),
-        parse_mode="Markdown",
-    )
-    _set_active_review_stage_confirmation(
+    await _send_review_gate_message(
         context,
-        review_id=record.id,
+        chat_id,
+        record=record,
         stage=ReviewStage.WEEKLY_PLAN,
         text=text,
-        message_id=getattr(message, "message_id", None),
     )
     await _send_full_artifact_markdown(
         context,

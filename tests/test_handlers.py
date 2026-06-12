@@ -1889,6 +1889,58 @@ async def test_send_review_stage_gate_presents_scheduling_pass_confirmation():
 
 
 @pytest.mark.asyncio
+async def test_send_review_stage_gate_splits_oversized_gate_details():
+    context = MagicMock()
+    context.user_data = {}
+    context.bot.send_message = AsyncMock()
+
+    record = ReviewWorkflowRecord(
+        id="review_test",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=ReviewStage.SCHEDULING_PASS,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-04-29T00:00:00+00:00",
+        updated_at="2026-04-29T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals",
+            weekly_state_markdown="# Weekly State",
+            decision_log_markdown="# Decision Log",
+        ),
+        scheduling_pass=StageCheckpoint(
+            summary="Use focused implementation blocks.",
+            key_findings=[
+                f"Detailed scheduling rationale item {index} with enough text to grow the gate."
+                for index in range(100)
+            ],
+            constraints=["Avoid late-evening event proposals."],
+        ),
+    )
+
+    await send_review_stage_gate(context, 456, record)
+
+    assert context.bot.send_message.await_count > 1
+    gate_call = context.bot.send_message.await_args_list[0]
+    detail_call = context.bot.send_message.await_args_list[1]
+    gate_text = gate_call.kwargs["text"]
+    detail_text = "\n".join(
+        call.kwargs["text"]
+        for call in context.bot.send_message.await_args_list[1:]
+    )
+    assert len(gate_text) < 1000
+    assert "*Scheduling Pass Ready*" in gate_text
+    assert "full review details were sent separately" in gate_text
+    assert gate_call.kwargs["reply_markup"] is not None
+    assert "Full scheduling pass gate details" in detail_text
+    assert "Detailed scheduling rationale item 99" in detail_text
+    assert "parse_mode" not in detail_call.kwargs
+    assert all(
+        "parse_mode" not in call.kwargs
+        for call in context.bot.send_message.await_args_list[1:]
+    )
+    assert context.user_data["active_review_stage_confirmation"]["text"] == gate_text
+
+
+@pytest.mark.asyncio
 @patch('bot.handlers.send_review_stage_gate', new_callable=AsyncMock)
 @patch('bot.review_flow.revise_review_stage', new_callable=AsyncMock)
 @patch('bot.review_flow.load_review_workflow', new_callable=AsyncMock)
