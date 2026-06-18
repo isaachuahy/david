@@ -49,9 +49,15 @@ def build_artifact_write_retry_keyboard(write_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def build_trigger_keyboard(trigger_type: str) -> InlineKeyboardMarkup:
-    """Builds the Start/Delay inline keyboard for scheduled triggers."""
+    """
+    Builds the controls shared by every scheduled trigger prompt.
+
+    Clearing is intentionally available alongside both daily and weekly review
+    prompts because either prompt may be the visible front of a larger queue.
+    """
     keyboard = [
         [InlineKeyboardButton("Start", callback_data=f"start_trigger_{trigger_type}")],
-        [InlineKeyboardButton("Not Now / Chat First", callback_data="delay_trigger")]
+        [InlineKeyboardButton("Not Now / Chat First", callback_data="delay_trigger")],
+        [InlineKeyboardButton("Clear Queue", callback_data="clear_trigger_queue")],
     ]
     return InlineKeyboardMarkup(keyboard)

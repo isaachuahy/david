@@ -8,9 +8,11 @@ from bot.handlers import (
     handle_review_resume,
     handle_start_trigger,
     handle_delay_trigger,
+    handle_clear_trigger_queue,
     weekly_review_command,
     test_schedule as handler_test_schedule,
 )
+from bot.keyboards import build_trigger_keyboard
 from bot.proposal_flow import (
     _normalize_calendar_action,
     revise_active_proposal_item,
@@ -2694,6 +2696,47 @@ async def test_handle_delay_trigger():
     update.callback_query.edit_message_text.assert_awaited_once_with(
         "Got it - let's chat first. I'll hold onto this trigger until you're ready.",
         parse_mode="Markdown"
+    )
+
+def test_build_trigger_keyboard_offers_clear_queue_for_review_prompts():
+    """
+    Ensures either review prompt can discard the complete scheduled-trigger queue.
+    """
+    for trigger_type in ("daily_checkin", "weekly_review"):
+        keyboard = build_trigger_keyboard(trigger_type)
+        callback_data = [
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+
+        assert "clear_trigger_queue" in callback_data
+
+@pytest.mark.asyncio
+async def test_handle_clear_trigger_queue_removes_entire_stack_in_place():
+    """
+    Ensures one clear action removes both morning and weekly pending triggers.
+    """
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.callback_query = MagicMock()
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+
+    pending_triggers = ["daily_checkin", "weekly_review"]
+    context = MagicMock()
+    context.bot_data = {
+        "allowed_user_id": 123,
+        "pending_triggers": pending_triggers,
+    }
+
+    await handle_clear_trigger_queue(update, context)
+
+    assert pending_triggers == []
+    assert context.bot_data["pending_triggers"] is pending_triggers
+    update.callback_query.edit_message_text.assert_awaited_once_with(
+        "🧹 *Trigger queue cleared.* Removed 2 pending trigger(s).",
+        parse_mode="Markdown",
     )
 
 @pytest.mark.asyncio

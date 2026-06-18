@@ -689,6 +689,28 @@ async def handle_delay_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text("Got it - let's chat first. I'll hold onto this trigger until you're ready.", parse_mode="Markdown")
 
 @authorized_only
+async def handle_clear_trigger_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Clears every pending scheduled trigger from the shared queue.
+
+    The list is cleared in place so any runtime code already holding a reference
+    to the queue immediately sees that both morning and weekly prompts are gone.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    queue = context.bot_data.setdefault("pending_triggers", [])
+    cleared_count = len(queue)
+    queue.clear()
+
+    if cleared_count:
+        text = f"🧹 *Trigger queue cleared.* Removed {cleared_count} pending trigger(s)."
+    else:
+        text = "🧹 *Trigger queue is already clear.*"
+
+    await query.edit_message_text(text, parse_mode="Markdown")
+
+@authorized_only
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Closes the active session and checks for pending triggers."""
     if is_session_active(context):

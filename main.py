@@ -31,7 +31,7 @@ from bot.handlers import (
     start, done_command, test_trigger, test_schedule,
     weekly_review_command,
     handle_confirm, handle_reject, handle_review_resume, handle_start_trigger,
-    handle_delay_trigger,
+    handle_delay_trigger, handle_clear_trigger_queue,
     handle_message
 )
 from bot.review_flow import (
@@ -170,6 +170,7 @@ def main() -> int:
         app.add_handler(CallbackQueryHandler(handle_review_resume, pattern=r"^(resume|discard)_review_"))
         app.add_handler(CallbackQueryHandler(handle_start_trigger, pattern=r"^start_trigger_"))
         app.add_handler(CallbackQueryHandler(handle_delay_trigger, pattern=r"^delay_trigger$"))
+        app.add_handler(CallbackQueryHandler(handle_clear_trigger_queue, pattern=r"^clear_trigger_queue$"))
         # MessageHandler is a catch-all for any text messsages that aren't commands
         app.add_handler(MessageHandler(user_filter & filters.TEXT & ~filters.COMMAND, handle_message))
         app.add_error_handler(_handle_application_error)
