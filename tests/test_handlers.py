@@ -1,3 +1,4 @@
+from datetime import date, datetime
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, ANY
 from bot.handlers import (
@@ -873,24 +874,122 @@ async def test_handle_reject_legacy_write_success(mock_remove_ui, mock_get_pendi
     )
 
 @pytest.mark.asyncio
+@patch('bot.handlers.datetime')
+@patch('bot.handlers.get_events_for_local_day')
 @patch('bot.handlers.consume_trigger')
-async def test_handle_start_trigger_daily(mock_consume_trigger):
+async def test_handle_start_trigger_daily_caches_and_summarizes_local_day(
+    mock_consume_trigger,
+    mock_get_events_for_local_day,
+    mock_datetime,
+):
     update = MagicMock()
     update.effective_user.id = 123
     update.callback_query = MagicMock()
     update.callback_query.data = "start_trigger_daily_checkin"
     update.callback_query.answer = AsyncMock()
     update.callback_query.edit_message_text = AsyncMock()
-    
+
     context = MagicMock()
+    context.user_data = {
+        "cached_events": [{"summary": "Stale Event"}],
+    }
     context.bot_data = {"allowed_user_id": 123}
-    
-    await handle_start_trigger(update, context)
-    
-    mock_consume_trigger.assert_called_once_with(context, "daily_checkin")
-    update.callback_query.edit_message_text.assert_awaited_once_with(
-        "🌅 *Daily Check-in Started.* What are your top priorities for today?", parse_mode="Markdown"
+
+    mock_datetime.now.return_value = datetime.fromisoformat(
+        "2026-06-18T08:00:00-04:00"
     )
+    mock_datetime.min = datetime.min
+    mock_datetime.combine.side_effect = datetime.combine
+    mock_get_events_for_local_day.return_value = [
+        {
+            "summary": "Lunch",
+            "start": {"dateTime": "2026-06-18T15:00:00Z"},
+            "end": {"dateTime": "2026-06-18T16:00:00Z"},
+        },
+        {
+            "summary": "Team Offsite",
+            "start": {"date": "2026-06-18"},
+            "end": {"date": "2026-06-19"},
+        },
+        {
+            "summary": "Breakfast",
+            "start": {"dateTime": "2026-06-18T13:00:00Z"},
+            "end": {"dateTime": "2026-06-18T14:00:00Z"},
+        },
+    ]
+
+    await handle_start_trigger(update, context)
+
+    mock_get_events_for_local_day.assert_called_once_with(date(2026, 6, 18))
+    mock_consume_trigger.assert_called_once_with(context, "daily_checkin")
+    assert [event["summary"] for event in context.user_data["cached_events"]] == [
+        "Team Offsite",
+        "Breakfast",
+        "Lunch",
+    ]
+    assert context.user_data["calendar_cache_metadata"] == {
+        "scope": "local_day",
+        "start": "2026-06-18T00:00:00-04:00",
+        "end": "2026-06-19T00:00:00-04:00",
+        "timezone": "America/Toronto",
+    }
+    update.callback_query.edit_message_text.assert_awaited_once_with(
+        "🌅 Daily Check-in Started.\n\n"
+        "Thursday, June 18, 2026\n\n"
+        "Today's events:\n"
+        "• All day — Team Offsite\n"
+        "• 9:00 AM–10:00 AM — Breakfast\n"
+        "• 11:00 AM–12:00 PM — Lunch\n\n"
+        "What are your top priorities for today?"
+    )
+
+
+@pytest.mark.asyncio
+@patch('bot.handlers.datetime')
+@patch('bot.handlers.get_events_for_local_day', return_value=[])
+@patch('bot.handlers.consume_trigger')
+async def test_handle_start_trigger_daily_caches_empty_day(
+    mock_consume_trigger,
+    mock_get_events_for_local_day,
+    mock_datetime,
+):
+    """An empty local day should still replace stale cache data and start review."""
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.callback_query = MagicMock()
+    update.callback_query.data = "start_trigger_daily_checkin"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {
+        "cached_events": [{"summary": "Stale Event"}],
+    }
+    context.bot_data = {"allowed_user_id": 123}
+    mock_datetime.now.return_value = datetime.fromisoformat(
+        "2026-06-18T08:00:00-04:00"
+    )
+    mock_datetime.min = datetime.min
+    mock_datetime.combine.side_effect = datetime.combine
+
+    await handle_start_trigger(update, context)
+
+    mock_get_events_for_local_day.assert_called_once_with(date(2026, 6, 18))
+    mock_consume_trigger.assert_called_once_with(context, "daily_checkin")
+    assert context.user_data["cached_events"] == []
+    assert context.user_data["calendar_cache_metadata"] == {
+        "scope": "local_day",
+        "start": "2026-06-18T00:00:00-04:00",
+        "end": "2026-06-19T00:00:00-04:00",
+        "timezone": "America/Toronto",
+    }
+    update.callback_query.edit_message_text.assert_awaited_once_with(
+        "🌅 Daily Check-in Started.\n\n"
+        "Thursday, June 18, 2026\n\n"
+        "No events scheduled for today.\n\n"
+        "What are your top priorities for today?"
+    )
+
 
 @pytest.mark.asyncio
 @patch('bot.handlers.send_proposal_thread', new_callable=AsyncMock)

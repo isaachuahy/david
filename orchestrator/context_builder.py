@@ -61,6 +61,41 @@ def _current_datetime_block() -> str:
         f"Today is {human_date}."
     )
 
+def _format_calendar_cache_coverage(tg_context: ContextTypes.DEFAULT_TYPE = None) -> str:
+    """
+    Describes a deliberately truncated calendar cache for model context.
+
+    Morning standup stores only one local calendar day. Surfacing that boundary
+    prevents the model from treating an intentionally narrow snapshot as proof
+    that later dates are free.
+    """
+    if tg_context is None:
+        return ""
+
+    metadata = tg_context.user_data.get("calendar_cache_metadata")
+    if not isinstance(metadata, dict) or metadata.get("scope") != "local_day":
+        return ""
+
+    start_value = metadata.get("start")
+    timezone_name = metadata.get("timezone", USER_TIMEZONE.key)
+    if not isinstance(start_value, str):
+        return ""
+
+    try:
+        local_date = datetime.fromisoformat(start_value).astimezone(USER_TIMEZONE).date()
+    except ValueError:
+        logger.warning("Ignoring invalid calendar cache start metadata.")
+        return ""
+
+    human_date = (
+        f"{local_date.strftime('%A')}, "
+        f"{local_date.strftime('%B')} {local_date.day}, {local_date.year}"
+    )
+    return (
+        f"Calendar coverage: events below are limited to {human_date} "
+        f"in {timezone_name}. Events outside this local day have not been queried."
+    )
+
 def _format_calendar_events(tg_context: ContextTypes.DEFAULT_TYPE = None, days: int = 7) -> str:
     """Fetches and formats upcoming calendar events, utilizing a session cache if available."""
     events = None
@@ -81,8 +116,10 @@ def _format_calendar_events(tg_context: ContextTypes.DEFAULT_TYPE = None, days: 
     if tg_context is not None:
         tg_context.user_data['cached_events'] = events
 
+    coverage_note = _format_calendar_cache_coverage(tg_context)
     if not events:
-        return "No upcoming events scheduled."
+        empty_message = "No upcoming events scheduled."
+        return f"{coverage_note}\n{empty_message}" if coverage_note else empty_message
         
     lines = []
     for event in events:
@@ -101,7 +138,8 @@ def _format_calendar_events(tg_context: ContextTypes.DEFAULT_TYPE = None, days: 
             f"(Calendar: {calendar_display_name}; calendar_id: {calendar_id})"
         )
         
-    return "\n".join(lines)
+    event_block = "\n".join(lines)
+    return f"{coverage_note}\n{event_block}" if coverage_note else event_block
 
 def _resolve_requested_sections(
     sections: Optional[Iterable[ContextSection]] = None,

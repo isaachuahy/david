@@ -82,6 +82,12 @@ async def test_invalidate_restart_volatile_user_data_clears_cached_events_only()
     application.user_data = {
         123: {
             "cached_events": [{"summary": "Stale cached event"}],
+            "calendar_cache_metadata": {
+                "scope": "local_day",
+                "start": "2026-06-18T00:00:00-04:00",
+                "end": "2026-06-19T00:00:00-04:00",
+                "timezone": "America/Toronto",
+            },
             "pending_confirmations": [("cw_123", 999)],
             "chat_history": [{"role": "user", "content": "Keep me"}],
         },
@@ -95,6 +101,7 @@ async def test_invalidate_restart_volatile_user_data_clears_cached_events_only()
     await invalidate_restart_volatile_user_data(application)
 
     assert "cached_events" not in application.user_data[123]
+    assert "calendar_cache_metadata" not in application.user_data[123]
     assert application.user_data[123]["pending_confirmations"] == [("cw_123", 999)]
     assert application.user_data[123]["chat_history"] == [{"role": "user", "content": "Keep me"}]
     assert application.user_data[456]["pending_confirmations"] == [("cw_456", 111)]
@@ -144,6 +151,12 @@ async def test_execute_synthesis_task_appends_and_finalizes_state(
     context.user_data = {
         "chat_history": [{"role": "user", "content": "We decided to focus on sales."}],
         "cached_events": [{"summary": "Stale cached event"}],
+        "calendar_cache_metadata": {
+            "scope": "local_day",
+            "start": "2026-06-18T00:00:00-04:00",
+            "end": "2026-06-19T00:00:00-04:00",
+            "timezone": "America/Toronto",
+        },
         "session_state": SessionStatus.CLOSING,
         "current_session_id": "sess_123",
     }
@@ -171,6 +184,7 @@ async def test_execute_synthesis_task_appends_and_finalizes_state(
     )
     assert context.user_data["chat_history"] == []
     assert "cached_events" not in context.user_data
+    assert "calendar_cache_metadata" not in context.user_data
     assert context.user_data["session_state"] == SessionStatus.IDLE
     assert context.user_data["current_session_id"] is None
     mock_prompt_next_trigger.assert_awaited_once_with(context, 456)
@@ -196,6 +210,12 @@ async def test_execute_synthesis_task_notifies_on_failure_and_finalizes_state(
     context.user_data = {
         "chat_history": [{"role": "user", "content": "Important decision"}],
         "cached_events": [{"summary": "Stale cached event"}],
+        "calendar_cache_metadata": {
+            "scope": "local_day",
+            "start": "2026-06-18T00:00:00-04:00",
+            "end": "2026-06-19T00:00:00-04:00",
+            "timezone": "America/Toronto",
+        },
         "session_state": SessionStatus.CLOSING,
         "current_session_id": "sess_456",
     }
@@ -228,6 +248,7 @@ async def test_execute_synthesis_task_notifies_on_failure_and_finalizes_state(
     }
     assert context.user_data["chat_history"] == []
     assert "cached_events" not in context.user_data
+    assert "calendar_cache_metadata" not in context.user_data
     assert context.user_data["session_state"] == SessionStatus.IDLE
     assert context.user_data["current_session_id"] is None
     mock_prompt_next_trigger.assert_awaited_once_with(context, 789)

@@ -69,6 +69,7 @@ def test_format_calendar_events_cache_hit(mock_get_events, mock_resolve_calendar
     mock_get_events.assert_not_called()
     assert result.index("Earlier Event") < result.index("Later Event")
     assert "Calendar: Team Calendar; calendar_id: team_calendar@example.com" in result
+    assert "Calendar coverage:" not in result
     assert tg_context.user_data["cached_events"][0]["summary"] == "Earlier Event"
 
 def test_format_calendar_events_no_events():
@@ -82,6 +83,58 @@ def test_format_calendar_events_no_events():
 
     # Assert
     assert result == "No upcoming events scheduled."
+
+@patch("orchestrator.context_builder.resolve_calendar_display_name")
+def test_format_calendar_events_labels_local_day_cache_coverage(
+    mock_resolve_calendar_display_name,
+):
+    """
+    A morning cache should tell the model that later dates remain unqueried.
+    """
+    mock_resolve_calendar_display_name.return_value = "Primary"
+    tg_context = MagicMock()
+    tg_context.user_data = {
+        "cached_events": [
+            {
+                "summary": "Morning Focus",
+                "start": {"dateTime": "2026-06-18T09:00:00-04:00"},
+                "calendar_id": "primary",
+            }
+        ],
+        "calendar_cache_metadata": {
+            "scope": "local_day",
+            "start": "2026-06-18T00:00:00-04:00",
+            "end": "2026-06-19T00:00:00-04:00",
+            "timezone": "America/Toronto",
+        },
+    }
+
+    result = _format_calendar_events(tg_context)
+
+    assert (
+        "Calendar coverage: events below are limited to Thursday, June 18, 2026 "
+        "in America/Toronto. Events outside this local day have not been queried."
+    ) in result
+    assert "Morning Focus" in result
+
+
+def test_format_calendar_events_labels_empty_local_day_cache_coverage():
+    """An empty truncated cache must not imply that future dates are also free."""
+    tg_context = MagicMock()
+    tg_context.user_data = {
+        "cached_events": [],
+        "calendar_cache_metadata": {
+            "scope": "local_day",
+            "start": "2026-06-18T00:00:00-04:00",
+            "end": "2026-06-19T00:00:00-04:00",
+            "timezone": "America/Toronto",
+        },
+    }
+
+    result = _format_calendar_events(tg_context)
+
+    assert "Events outside this local day have not been queried." in result
+    assert result.endswith("No upcoming events scheduled.")
 
 @patch("orchestrator.context_builder._current_datetime_block", return_value="Today is Thursday, April 9, 2026.")
 @patch("orchestrator.context_builder._format_calendar_events", return_value="<CALENDAR_EVENTS>")

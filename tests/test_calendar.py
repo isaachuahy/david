@@ -1,7 +1,8 @@
-from datetime import datetime
+from datetime import date, datetime
 from unittest.mock import MagicMock, patch
 
 from integrations.calendar import (
+    get_events_for_local_day,
     get_past_events,
     get_upcoming_events,
     insert_event,
@@ -66,6 +67,64 @@ def test_get_upcoming_events_returns_earliest_first_across_calendars(mock_get_ca
         "Later Event",
     ]
     assert [event["calendar_id"] for event in events] == ["cal_2", "cal_2", "cal_1"]
+
+
+@patch("integrations.calendar.get_calendar_service")
+def test_get_events_for_local_day_uses_toronto_boundaries_and_sorts_results(
+    mock_get_calendar_service,
+):
+    """
+    A morning review should cache the complete Toronto day across every calendar.
+    """
+    mock_service = MagicMock()
+    mock_get_calendar_service.return_value = mock_service
+    mock_service.calendarList.return_value.list.return_value.execute.return_value = {
+        "items": [{"id": "cal_1"}, {"id": "cal_2"}]
+    }
+    mock_service.events.return_value.list.return_value.execute.side_effect = [
+        {
+            "items": [
+                {"summary": "Lunch", "start": {"dateTime": "2026-06-18T16:00:00Z"}},
+            ]
+        },
+        {
+            "items": [
+                {"summary": "All Day", "start": {"date": "2026-06-18"}},
+                {"summary": "Breakfast", "start": {"dateTime": "2026-06-18T12:00:00Z"}},
+            ]
+        },
+    ]
+
+    events = get_events_for_local_day(date(2026, 6, 18))
+
+    assert [event["summary"] for event in events] == [
+        "All Day",
+        "Breakfast",
+        "Lunch",
+    ]
+    assert [event["calendar_id"] for event in events] == ["cal_2", "cal_2", "cal_1"]
+    for call in mock_service.events.return_value.list.call_args_list:
+        assert call.kwargs["timeMin"] == "2026-06-18T04:00:00+00:00"
+        assert call.kwargs["timeMax"] == "2026-06-19T04:00:00+00:00"
+
+
+@patch("integrations.calendar.get_calendar_service")
+def test_get_events_for_local_day_preserves_fall_back_day_length(
+    mock_get_calendar_service,
+):
+    """The Toronto fall-back day must span 25 real hours rather than 24."""
+    mock_service = MagicMock()
+    mock_get_calendar_service.return_value = mock_service
+    mock_service.calendarList.return_value.list.return_value.execute.return_value = {
+        "items": [{"id": "primary"}]
+    }
+    mock_service.events.return_value.list.return_value.execute.return_value = {"items": []}
+
+    get_events_for_local_day(date(2026, 11, 1))
+
+    call = mock_service.events.return_value.list.call_args
+    assert call.kwargs["timeMin"] == "2026-11-01T04:00:00+00:00"
+    assert call.kwargs["timeMax"] == "2026-11-02T05:00:00+00:00"
 
 
 @patch("integrations.calendar.get_calendar_service")

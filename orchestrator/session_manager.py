@@ -19,9 +19,13 @@ SESSION_READY_MESSAGE = "Session synthesis is done. I'm ready for your next mess
 PENDING_CONFIRMATIONS_KEY = "pending_confirmations"
 LEGACY_PENDING_WRITES_KEY = "pending_writes"
 
-# Keys in user_data that should be cleared on restart to avoid stale state issues. 
-# Cached calendar events are the main culprit since they can easily become out of sync with the real calendar state after a restart.
-RESTART_INVALID_USER_DATA_KEYS = ("cached_events",)
+# Keys in user_data that should be cleared on restart to avoid stale state issues.
+# Calendar coverage metadata must be invalidated with its event list so future
+# context never describes a cache window whose underlying events were removed.
+RESTART_INVALID_USER_DATA_KEYS = (
+    "cached_events",
+    "calendar_cache_metadata",
+)
 
 def _user_data(context: ContextTypes.DEFAULT_TYPE) -> dict:
     """Returns user_data when available, otherwise a safe empty dict."""
@@ -311,6 +315,7 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
         user_data = _user_data(context)
         user_data['chat_history'] = []
         user_data.pop('cached_events', None)
+        user_data.pop('calendar_cache_metadata', None)
         user_data['session_state'] = SessionStatus.IDLE
         user_data['current_session_id'] = None
 

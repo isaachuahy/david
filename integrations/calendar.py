@@ -1,4 +1,4 @@
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, time, timezone, timedelta
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from loguru import logger
@@ -180,6 +180,64 @@ def get_upcoming_events(days: int = 7) -> list:
         
     except HttpError as error:
         logger.error(f"An error occurred fetching events: {error}")
+        return []
+
+def get_events_for_local_day(target_date: date | None = None) -> list:
+    """
+    Fetches all events inside one complete day in the user's local timezone.
+
+    Google Calendar expects absolute instants, so the local midnight boundaries
+    are converted to UTC. Building each midnight separately also preserves the
+    correct day length across daylight-saving transitions.
+    """
+    local_date = target_date or datetime.now(USER_TIMEZONE).date()
+    local_start = datetime.combine(local_date, time.min, tzinfo=USER_TIMEZONE)
+    local_end = datetime.combine(
+        local_date + timedelta(days=1),
+        time.min,
+        tzinfo=USER_TIMEZONE,
+    )
+    time_min_iso = local_start.astimezone(timezone.utc).isoformat()
+    time_max_iso = local_end.astimezone(timezone.utc).isoformat()
+
+    service = get_calendar_service()
+    try:
+        logger.info(
+            f"Fetching events for local day {local_date.isoformat()} "
+            "across all calendars..."
+        )
+        calendar_list = service.calendarList().list().execute()
+        calendars = calendar_list.get("items", [])
+        all_events = []
+
+        for calendar in calendars:
+            calendar_id = calendar["id"]
+            try:
+                # Query every calendar with the same timezone-day boundaries so
+                # the merged cache represents one coherent local calendar day.
+                events_result = service.events().list(
+                    calendarId=calendar_id,
+                    timeMin=time_min_iso,
+                    timeMax=time_max_iso,
+                    singleEvents=True,
+                    orderBy="startTime",
+                ).execute()
+                calendar_events = events_result.get("items", [])
+                for event in calendar_events:
+                    event.setdefault("calendar_id", calendar_id)
+                all_events.extend(calendar_events)
+            except HttpError as error:
+                logger.warning(
+                    "Could not fetch events for calendar "
+                    f"{calendar.get('summary', calendar_id)}: {error}"
+                )
+
+        all_events.sort(key=calendar_event_sort_key)
+        return all_events
+    except HttpError as error:
+        logger.error(
+            f"An error occurred fetching events for {local_date.isoformat()}: {error}"
+        )
         return []
 
 def get_past_events(days: int = 7) -> list:

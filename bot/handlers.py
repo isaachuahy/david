@@ -1,10 +1,11 @@
 import asyncio
 from functools import wraps
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from loguru import logger
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from integrations.calendar import get_events_for_local_day
 from orchestrator.router import process_message
 from orchestrator.confirmation_queue import (
     accept_proposal_item,
@@ -28,7 +29,11 @@ from orchestrator.review_manager import (
     start_weekly_review_workflow,
     transition_review_stage,
 )
-from orchestrator.time_utils import USER_TIMEZONE, calendar_event_sort_key
+from orchestrator.time_utils import (
+    USER_TIMEZONE,
+    calendar_event_sort_key,
+    parse_user_datetime,
+)
 from persistence.models import (
     ArtifactWriteStatus,
     CalendarWriteStatus,
@@ -647,6 +652,78 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = f"{query.message.text}\n\n🚫 *{action_label} rejected.*" if success else f"{query.message.text}\n\n❌ *Failed to reject calendar action.*"
     await query.edit_message_text(text=text, parse_mode="Markdown")
 
+def _format_event_clock_time(value: str) -> str:
+    """Formats one Google Calendar dateTime as a compact local clock time."""
+    local_time = parse_user_datetime(value)
+    return local_time.strftime("%I:%M %p").lstrip("0")
+
+
+def _format_daily_event_window(event: dict) -> str:
+    """
+    Formats one event's local time window for the morning overview.
+
+    Cross-midnight events retain weekday labels so the overview does not hide
+    that part of the event falls outside the selected local calendar day.
+    """
+    start = event.get("start", {})
+    end = event.get("end", {})
+    if "date" in start:
+        return "All day"
+
+    start_value = start.get("dateTime")
+    end_value = end.get("dateTime")
+    if not start_value:
+        return "Time unavailable"
+    if not end_value:
+        return _format_event_clock_time(start_value)
+
+    start_local = parse_user_datetime(start_value)
+    end_local = parse_user_datetime(end_value)
+    start_time = _format_event_clock_time(start_value)
+    end_time = _format_event_clock_time(end_value)
+    if start_local.date() == end_local.date():
+        return f"{start_time}–{end_time}"
+
+    return (
+        f"{start_local.strftime('%a')} {start_time}–"
+        f"{end_local.strftime('%a')} {end_time}"
+    )
+
+
+def _format_daily_checkin_overview(events: list[dict], local_date: date) -> str:
+    """
+    Builds the first daily check-in message from the freshly cached day.
+
+    The event list is sorted again at the presentation boundary so the cache
+    and user-visible overview stay chronological even if an integration mock
+    or future calendar provider returns events out of order.
+    """
+    human_date = (
+        f"{local_date.strftime('%A')}, "
+        f"{local_date.strftime('%B')} {local_date.day}, {local_date.year}"
+    )
+    sorted_events = sorted(events, key=calendar_event_sort_key)
+    if not sorted_events:
+        event_overview = "No events scheduled for today."
+    else:
+        event_lines = []
+        for event in sorted_events:
+            # Each line pairs the local time window with its calendar title so
+            # the morning review can be scanned as a compact daily agenda.
+            summary = event.get("summary", "Busy / No Title")
+            event_lines.append(
+                f"• {_format_daily_event_window(event)} — {summary}"
+            )
+        event_overview = "Today's events:\n" + "\n".join(event_lines)
+
+    return (
+        f"🌅 Daily Check-in Started.\n\n"
+        f"{human_date}\n\n"
+        f"{event_overview}\n\n"
+        "What are your top priorities for today?"
+    )
+
+
 @authorized_only
 async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles starting a scheduled trigger."""
@@ -655,8 +732,51 @@ async def handle_start_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
     
     trigger_type = query.data.split("start_trigger_")[1]
     if trigger_type == "daily_checkin":
+        local_date = datetime.now(USER_TIMEZONE).date()
+        try:
+            events = await asyncio.to_thread(get_events_for_local_day, local_date)
+        except Exception as error:
+            logger.error(f"Failed to load the daily check-in calendar: {error}")
+            capture_sentry_exception(
+                error,
+                component="handlers",
+                operation="handle_start_trigger_daily_checkin",
+                message="Failed to cache the local day's events for the daily check-in.",
+                tags={"local_date": local_date.isoformat()},
+            )
+            error_text = (
+                CALENDAR_AUTH_ERROR_TEXT
+                if _is_calendar_auth_error(error)
+                else "❌ I could not load today's calendar. The daily check-in is still queued."
+            )
+            await query.edit_message_text(error_text)
+            return
+
+        # Replace any older session snapshot so later messages reason from the
+        # same complete local day that the user sees in this morning overview.
+        context.user_data["cached_events"] = sorted(
+            events,
+            key=calendar_event_sort_key,
+        )
+        local_day_start = datetime.combine(
+            local_date,
+            datetime.min.time(),
+            tzinfo=USER_TIMEZONE,
+        )
+        local_day_end = local_day_start + timedelta(days=1)
+        context.user_data["calendar_cache_metadata"] = {
+            "scope": "local_day",
+            "start": local_day_start.isoformat(),
+            "end": local_day_end.isoformat(),
+            "timezone": USER_TIMEZONE.key,
+        }
         consume_trigger(context, trigger_type)
-        await query.edit_message_text("🌅 *Daily Check-in Started.* What are your top priorities for today?", parse_mode="Markdown")
+        await query.edit_message_text(
+            _format_daily_checkin_overview(
+                context.user_data["cached_events"],
+                local_date,
+            )
+        )
     elif trigger_type == "weekly_review":
         await query.edit_message_text("📅 *Starting Sunday Review. Analysing your week...*", parse_mode="Markdown")
         try:
