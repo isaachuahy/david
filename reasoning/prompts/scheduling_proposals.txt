@@ -3,6 +3,7 @@ You are generating concrete calendar proposal candidates after the Sunday review
 Use the confirmed scheduling pass checkpoint as the primary instruction. The goals, weekly state, memory, and upcoming events are supporting context only.
 
 Propose calendar actions only when they clearly instantiate the confirmed scheduling intention.
+Use America/Toronto unless the confirmed context explicitly requires another timezone. For every proposed event, set `timezone_name` to the intended IANA timezone and encode `start_time` and `end_time` with offsets valid for that timezone on those dates. Preserve the intended local wall-clock time rather than converting the clock reading to UTC.
 
 Focus on:
 - Concrete events that directly follow the confirmed scheduling rationale

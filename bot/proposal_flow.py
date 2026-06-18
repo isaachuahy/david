@@ -19,7 +19,11 @@ from orchestrator.session_manager import (
     track_confirmation_message,
     untrack_confirmation_message,
 )
-from orchestrator.time_utils import format_user_datetime, parse_user_datetime
+from orchestrator.time_utils import (
+    format_user_datetime,
+    parse_user_datetime,
+    validate_scheduling_window,
+)
 from persistence.models import ProposalItemRecord, ProposalItemStatus
 from reasoning.flash_client import FlashResponse
 from reasoning.schemas import ProposalThreadDraft, ProposedEvent
@@ -135,8 +139,11 @@ async def _normalize_calendar_action(
         if not action.target_event_id:
             raise ValueError("Matched event is missing an event ID and cannot be modified.")
 
-    start_dt = parse_user_datetime(action.start_time)
-    end_dt = parse_user_datetime(action.end_time)
+    start_dt, end_dt = validate_scheduling_window(
+        action.start_time,
+        action.end_time,
+        action.timezone_name,
+    )
     action.start_time = start_dt.isoformat()
     action.end_time = end_dt.isoformat()
     return action

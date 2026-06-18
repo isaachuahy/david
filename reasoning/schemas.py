@@ -22,6 +22,14 @@ class ProposedEvent(BaseModel):
     summary: str = Field(description="The title of the calendar event.")
     start_time: str = Field(description="The event start time in timezone-aware ISO 8601 format, including a UTC offset, e.g., 2026-03-22T09:00:00-04:00")
     end_time: str = Field(description="The event end time in timezone-aware ISO 8601 format, including a UTC offset, e.g., 2026-03-22T11:00:00-04:00")
+    timezone_name: str = Field(
+        default="America/Toronto",
+        description=(
+            "IANA timezone used to interpret the event's intended local wall-clock "
+            "times, such as America/Toronto or UTC. The UTC offsets in start_time "
+            "and end_time must be valid for this timezone on those dates."
+        ),
+    )
     description: str = Field(description="A brief description of the event's purpose.")
     requested_calendar_text: str = Field(
         default="primary",

@@ -12,6 +12,7 @@ from bot.handlers import (
     test_schedule as handler_test_schedule,
 )
 from bot.proposal_flow import (
+    _normalize_calendar_action,
     revise_active_proposal_item,
     send_calendar_proposal,
     send_proposal_thread,
@@ -153,6 +154,32 @@ async def test_handle_message_uses_proposal_thread_when_present(
     )
     mock_send_calendar_proposal.assert_not_awaited()
     update.message.reply_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@patch('bot.proposal_flow.resolve_calendar_reference')
+async def test_normalize_calendar_action_rejects_utc_clock_time_for_toronto(
+    mock_resolve_calendar_reference,
+):
+    """
+    Ensures proposal normalization rejects timezone-aware values that encode the
+    wrong instant for the model's declared Toronto wall-clock intention.
+    """
+    mock_resolve_calendar_reference.return_value = {
+        "calendar_id": "primary",
+        "calendar_display_name": "Primary",
+    }
+    context = MagicMock()
+    context.user_data = {}
+    action = ProposedEvent(
+        summary="Deep Work",
+        start_time="2026-06-18T09:00:00Z",
+        end_time="2026-06-18T10:00:00Z",
+        description="Focused implementation time.",
+    )
+
+    with pytest.raises(ValueError, match="offset that is invalid"):
+        await _normalize_calendar_action(context, action)
 
 
 @pytest.mark.asyncio
