@@ -82,6 +82,8 @@ and model capacity, while session completion logs and saves aggregate usage to
 SQLite's `session_usage` table before clearing history. `/context` displays the
 current or last completed session without calling a model. Published model limits
 live in `config.py`; unknown limits and missing provider counts stay unknown.
+The latest request is retained even outside a chat session, so `/context` can show
+a standalone weekly review's measurements separately from older session totals.
 
 The system also runs two scheduled routines:
 - daily check-in, which reuses the normal interaction flow with scheduled initiation

@@ -93,7 +93,9 @@ include the past seven days and the upcoming seven days, so scheduling sees
 existing commitments. All-day event end dates are explicitly marked exclusive.
 
 Use `/context` in Telegram to see current or last-session history size, measured
-model capacity, and cumulative reported token usage. Chat keeps the full
+model capacity, and cumulative reported token usage. A standalone weekly review
+also shows its latest request's model, input/output tokens, and capacity above any
+previous chat-session totals. Chat keeps the full
 current-session history. Each chat, review, and synthesis request emits a
 `model_context_usage` log; session finalization emits `session_context_usage` and
 saves its summary in SQLite's `session_usage` table before clearing history.

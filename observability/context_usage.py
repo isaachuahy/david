@@ -79,10 +79,15 @@ def record_model_usage(
         "context_characters": context_characters,
     }
     logger.info("model_context_usage {}", json.dumps(entry))
-    if data is None or not session_id:
+    if data is None:
         return
 
     with _lock:
+        # Reviews can run outside a chat session. Keep one latest measurement
+        # for /context without inventing a session or changing session totals.
+        data["last_model_usage"] = entry
+        if not session_id:
+            return
         # Keep only per-model aggregates and the last request in Telegram state;
         # individual request records already live in logs, without prompt content.
         summary = data.setdefault("session_usage", {"session_id": session_id, "models": {}})
@@ -129,32 +134,56 @@ def finish_session_usage(user_data: dict, session_id: str | None, history: list[
     return summary
 
 
+def _format_request_usage(entry: dict) -> list[str]:
+    """Use the same capacity labels for standalone reviews and session requests."""
+    percent = entry["capacity_percent"]
+    capacity = "unknown" if percent is None else f"{percent:.2f}%"
+    kind = "input capacity" if entry["capacity_kind"] == "input" else "context window"
+    limit = entry["capacity_tokens"]
+    limit_text = f" / {limit:,} tokens" if limit else "; limit unknown"
+    prompt_tokens = entry["input_tokens"]
+    prompt_text = f"{prompt_tokens:,}" if prompt_tokens is not None else "unknown"
+    output_tokens = entry["output_tokens"]
+    output_text = f"{output_tokens:,}" if output_tokens is not None else "unknown"
+    return [
+        f"{entry['operation']} · {entry['model']}",
+        f"Last request: {prompt_text} input tokens{limit_text}; {capacity} {kind}.",
+        f"Output: {output_text} tokens (including thinking).",
+    ]
+
+
 def format_context_usage(user_data: dict) -> str:
     """Show measured request capacity and cumulative usage without making a model call."""
     summary = user_data.get("session_usage") or user_data.get("last_session_usage")
+    latest = user_data.get("last_model_usage")
+    lines = []
+    if latest and latest["session_id"] is None:
+        # This measurement is newer than any completed chat session. Show it
+        # separately so review usage cannot be mistaken for old session totals.
+        lines.extend([
+            "Latest model request outside a chat session",
+            *_format_request_usage(latest),
+        ])
     if not summary:
+        if lines:
+            return "\n".join(lines)
         return "No model context measurements yet. Chat uses the full current-session history."
     active = bool(user_data.get("current_session_id")) and summary.get("session_id") == user_data["current_session_id"]
     history = history_size(user_data.get("chat_history", [])) if active else summary["history"]
-    lines = [
+    if lines:
+        lines.append("")
+    lines.extend([
         "Current session" if active else "Last completed session",
         f"History: {history['messages']:,} messages, {history['characters']:,} characters.",
         "Full current-session history is sent to chat; no automatic truncation.",
-    ]
+    ])
     for bucket in summary["models"].values():
         # Report each role/model separately: summing context percentages would be misleading.
         last = bucket["last_request"]
-        percent = last["capacity_percent"]
-        capacity = "unknown" if percent is None else f"{percent:.2f}%"
-        kind = "input capacity" if last["capacity_kind"] == "input" else "context window"
-        limit = last["capacity_tokens"]
-        limit_text = f" / {limit:,} tokens" if limit else "; limit unknown"
-        prompt_tokens = last["input_tokens"]
-        prompt_text = f"{prompt_tokens:,}" if prompt_tokens is not None else "unknown"
         totals = bucket["reported_tokens"]
         lines.extend([
-            f"\n{last['operation']} · {last['model']}",
-            f"Last request: {prompt_text} input tokens{limit_text}; {capacity} {kind}.",
+            "",
+            *_format_request_usage(last),
             f"Session: {bucket['requests']} requests; {totals['input_tokens']:,} reported input / "
             f"{totals['output_tokens']:,} reported output tokens (including thinking).",
         ])
