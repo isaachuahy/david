@@ -84,6 +84,42 @@ def test_format_calendar_events_no_events():
     # Assert
     assert result == "No upcoming events scheduled."
 
+
+@pytest.mark.parametrize(
+    "start, end, expected_window",
+    [
+        (
+            {"dateTime": "2026-09-17T10:00:00-04:00"},
+            {"dateTime": "2026-09-17T11:30:00-04:00"},
+            "2026-09-17T10:00:00-04:00 → 2026-09-17T11:30:00-04:00",
+        ),
+        (
+            {"date": "2026-09-17"},
+            {"date": "2026-09-19"},
+            "2026-09-17 → 2026-09-19; all-day, end date exclusive",
+        ),
+        (
+            {"dateTime": "2026-09-17T10:00:00-04:00"},
+            {},
+            "2026-09-17T10:00:00-04:00 → unknown end",
+        ),
+    ],
+)
+@patch("orchestrator.context_builder.resolve_calendar_display_name", return_value="Primary")
+def test_calendar_context_preserves_event_boundaries(
+    mock_calendar_name, start, end, expected_window,
+):
+    """Scheduling context must expose duration without inventing missing data."""
+    context = MagicMock()
+    context.user_data = {"cached_events": [{
+        "summary": "Busy block", "start": start, "end": end,
+    }]}
+
+    result = build_context(context, sections=("UPCOMING_CALENDAR",))
+
+    assert f"[{expected_window}] Busy block" in result
+
+
 @patch("orchestrator.context_builder.resolve_calendar_display_name")
 def test_format_calendar_events_labels_local_day_cache_coverage(
     mock_resolve_calendar_display_name,

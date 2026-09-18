@@ -72,6 +72,17 @@ David uses four context profiles:
 
 The router chooses the smallest profile that can answer the turn correctly.
 
+Calendar context includes event start and end times. New weekly-review snapshots
+freeze both past and upcoming seven-day event windows for later scheduling stages.
+
+`observability/context_usage.py` measures provider-reported usage for chat, review,
+and synthesis. A ContextVar carries the active session through worker-thread calls;
+the synthesis job restores that scope explicitly. Per-request logs contain counts
+and model capacity, while session completion logs and saves aggregate usage to
+SQLite's `session_usage` table before clearing history. `/context` displays the
+current or last completed session without calling a model. Published model limits
+live in `config.py`; unknown limits and missing provider counts stay unknown.
+
 The system also runs two scheduled routines:
 - daily check-in, which reuses the normal interaction flow with scheduled initiation
 - Sunday review, which uses the staged workflow below

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Tuple
@@ -6,6 +7,7 @@ from loguru import logger
 from telegram.ext import Application, ContextTypes
 
 from observability.sentry import capture_exception as capture_sentry_exception
+from observability.context_usage import finish_session_usage, usage_scope
 from persistence.database import get_db
 from orchestrator.confirmation_queue import get_pending_write, reject_write
 from orchestrator.trigger_scheduler import prompt_next_trigger
@@ -154,6 +156,7 @@ def start_session(context: ContextTypes.DEFAULT_TYPE) -> str:
     user_data['current_session_id'] = session_id
     user_data['session_state'] = SessionStatus.ACTIVE
     user_data['chat_history'] = []
+    user_data['session_usage'] = {"session_id": session_id, "models": {}}
     
     record = SessionRecord(
         id=session_id,
@@ -261,11 +264,14 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Running background synthesis for session {session_id}...")
     try:
         if chat_history:
-            synthesis = await asyncio.to_thread(
-                generate_session_synthesis,
-                chat_history,
-                session_date=session_date,
-            )
+            # Jobs do not inherit the original Telegram handler's ContextVar.
+            # Restore attribution so synthesis contributes to this session too.
+            with usage_scope(_user_data(context)):
+                synthesis = await asyncio.to_thread(
+                    generate_session_synthesis,
+                    chat_history,
+                    session_date=session_date,
+                )
             if session_id:
                 persist_decision(session_id, synthesis.content)
             append_to_decision_log(synthesis.content)
@@ -294,6 +300,19 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
                 tags={"session_id": session_id} if session_id is not None else None,
             )
     finally:
+        # Persist counts, not conversation content. A logging/storage failure
+        # must not prevent closing the session or clear an already-written log.
+        try:
+            summary = finish_session_usage(_user_data(context), session_id, chat_history)
+            if session_id:
+                get_db()["session_usage"].upsert({
+                    "session_id": session_id,
+                    "summary_json": json.dumps(summary),
+                }, pk="session_id")
+        except Exception as error:
+            logger.error("Failed to persist usage for session {}: {}", session_id, error)
+            capture_sentry_exception(error, component="session_manager", operation="persist_session_usage")
+
         # Finalise transition to IDLE even if synthesis fails.
         # Clear both short-term chat state and the per-session calendar cache
         # so the next session always starts from a fresh local view.

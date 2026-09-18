@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from google import genai
 from loguru import logger
 from observability.sentry import capture_exception as capture_sentry_exception
+from observability.context_usage import gemini_token_usage, record_model_usage
 
 from reasoning.parser import parse_model_response
 from reasoning.schemas import CalendarPlanningMode, ProposalThreadDraft
@@ -94,9 +95,11 @@ def generate_flash_response(user_message: str, context_block: str, chat_history:
     if thinking_level:
         generation_config['thinking_config'] = {'thinking_level': thinking_level}
 
+    model = 'gemini-3-flash-preview'
+    response = None
     try:
         response = client.models.generate_content(
-            model='gemini-3-flash-preview',
+            model=model,
             contents=prompt,
             config=generation_config
         )
@@ -104,6 +107,14 @@ def generate_flash_response(user_message: str, context_block: str, chat_history:
         logger.error(f"Gemini Flash request failed: {e}")
         capture_sentry_exception(e, component="gemini_flash", operation="generate_flash_response")
         raise
+    finally:
+        # Measure the whole provider prompt, including instructions and context;
+        # history characters are a separate exact size, not a token estimate.
+        record_model_usage(
+            provider="gemini", model=model, operation="chat",
+            usage=gemini_token_usage(response), history=chat_history or [],
+            context_characters=len(context_block),
+        )
 
     try:
         return parse_model_response(response, FlashResponse)
@@ -126,9 +137,11 @@ def generate_session_synthesis(chat_history: list[dict], session_date: str) -> S
         session_date=session_date
     )
 
+    model = 'gemini-3-flash-preview'
+    response = None
     try:
         response = client.models.generate_content(
-            model='gemini-3-flash-preview',
+            model=model,
             contents=prompt,
             config={
                 'temperature': 1.0,
@@ -139,6 +152,12 @@ def generate_session_synthesis(chat_history: list[dict], session_date: str) -> S
         logger.error(f"Gemini Flash session synthesis request failed: {e}")
         capture_sentry_exception(e, component="gemini_flash", operation="generate_session_synthesis")
         raise
+    finally:
+        # Synthesis belongs to the closing session's total, even if it fails.
+        record_model_usage(
+            provider="gemini", model=model, operation="synthesis",
+            usage=gemini_token_usage(response), history=chat_history,
+        )
 
     content = response.text.strip()
     if not content:

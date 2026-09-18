@@ -86,6 +86,24 @@ Notes:
 - `GOOGLE_CREDENTIALS_PATH` should point to your Google OAuth client JSON.
 - `GOOGLE_TOKEN_PATH` is where the authorized user token is stored.
 
+### Context usage and calendar context
+
+Calendar context includes event start and end times. New weekly-review snapshots
+include the past seven days and the upcoming seven days, so scheduling sees
+existing commitments. All-day event end dates are explicitly marked exclusive.
+
+Use `/context` in Telegram to see current or last-session history size, measured
+model capacity, and cumulative reported token usage. Chat keeps the full
+current-session history. Each chat, review, and synthesis request emits a
+`model_context_usage` log; session finalization emits `session_context_usage` and
+saves its summary in SQLite's `session_usage` table before clearing history.
+
+Totals include repeatedly submitted history and thinking output. Cached input and
+thinking are subsets, not extra tokens. Missing usage or unknown model limits are
+labeled unknown. Capacity uses provider-reported counts after a request; this does
+not add automatic compaction or a preflight limit check. Telemetry stores counts,
+not conversation text.
+
 ### 4. Add Google auth files
 
 Place your Google OAuth client credentials at the configured path, commonly:

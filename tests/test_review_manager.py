@@ -3,7 +3,9 @@ from unittest.mock import patch
 import pytest
 
 from orchestrator.review_manager import (
+    _render_scheduling_proposals_prompt,
     advance_review_from_current_stage,
+    build_review_source_snapshot,
     build_final_review_message,
     execute_weekly_state_update,
     generate_scheduling_proposals,
@@ -39,6 +41,51 @@ from reasoning.schemas import (
     WeekReviewResponse,
     WeeklyPlanResponse,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("upcoming", [True, False])
+@patch("orchestrator.review_manager.get_effective_artifact_content", return_value="# Context")
+@patch("orchestrator.review_manager._read_context_markdown", return_value="# Context")
+@patch("orchestrator.review_manager.get_upcoming_events")
+@patch("orchestrator.review_manager.get_past_events")
+async def test_review_snapshot_carries_calendar_windows_into_scheduling(
+    mock_past, mock_upcoming, mock_read, mock_effective, upcoming,
+):
+    """Exercise snapshot creation so future events cannot disappear before planning."""
+    mock_past.return_value = [{
+        "summary": "Last week's work",
+        "start": {"dateTime": "2026-09-14T09:00:00-04:00"},
+        "end": {"dateTime": "2026-09-14T10:00:00-04:00"},
+    }]
+    mock_upcoming.return_value = [{
+        "summary": "Existing meeting",
+        "start": {"dateTime": "2026-09-18T10:00:00-04:00"},
+        "end": {"dateTime": "2026-09-18T11:30:00-04:00"},
+        "calendar_id": "work",
+    }] if upcoming else []
+
+    snapshot = await build_review_source_snapshot()
+    record = ReviewWorkflowRecord(
+        id="snapshot_test",
+        created_at="2026-09-17T00:00:00+00:00",
+        updated_at="2026-09-17T00:00:00+00:00",
+        source_snapshot=snapshot,
+        scheduling_pass=StageCheckpoint(summary="Plan next week."),
+    )
+    prompt = _render_scheduling_proposals_prompt(record)
+
+    mock_past.assert_called_once_with(days=7)
+    mock_upcoming.assert_called_once_with(days=7)
+    assert "2026-09-14T10:00:00-04:00" in snapshot.past_week_events[0]
+    if upcoming:
+        # Check the consumer, not just the snapshot field, to protect this seam.
+        assert "2026-09-18T10:00:00-04:00 → 2026-09-18T11:30:00-04:00" in prompt
+        assert "Existing meeting (calendar_id: work)" in prompt
+    else:
+        assert snapshot.upcoming_events == []
+        assert "No events returned for this period." in prompt
+        assert "No events found in the past week." not in prompt
 
 
 VALID_WEEKLY_STATE_MARKDOWN = """# Weekly State
