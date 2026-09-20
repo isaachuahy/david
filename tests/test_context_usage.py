@@ -2,6 +2,8 @@
 
 import asyncio
 from copy import deepcopy
+import json
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,6 +16,111 @@ from observability.context_usage import (
     record_model_usage, usage_scope,
 )
 from reasoning.schemas import WeekReviewResponse
+
+
+def test_finishing_old_session_preserves_new_session_usage():
+    """A delayed finalizer may only consume the bucket for its own session."""
+    data = {"current_session_id": "new"}
+    with usage_scope(data):
+        record_model_usage(
+            provider="gemini", model="gemini-3-flash-preview", operation="chat",
+            usage={"input_tokens": 75, "output_tokens": 10},
+        )
+    newer_usage = deepcopy(data["session_usage"])
+
+    summary = finish_session_usage(data, "old", [{"content": "Old history"}])
+
+    assert data["session_usage"] == newer_usage
+    assert summary["session_id"] == "old"
+    assert summary["reported_tokens"]["input_tokens"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_session_timing", ["before_job", "during_job"])
+@pytest.mark.parametrize("synthesis_fails", [False, True])
+async def test_delayed_synthesis_preserves_new_session(
+    tmp_path, monkeypatch, new_session_timing, synthesis_fails,
+):
+    """Closing work keeps old usage even when another session replaces user_data."""
+    from orchestrator.session_manager import end_session, execute_synthesis_task, start_session
+    from persistence.database import get_db, init_db
+    from persistence.models import SessionStatus
+
+    monkeypatch.setenv("DAVID_DB_PATH", str(tmp_path / "assistant.db"))
+    monkeypatch.setenv("DAVID_CONTEXT_DIR", str(tmp_path / "context"))
+    init_db()
+    assert "session_usage" not in get_db().table_names()
+    context = MagicMock()
+    context.user_data = {}
+    context.bot.send_message = AsyncMock()
+    old_id = start_session(context)
+    context.user_data["chat_history"] = [{"role": "user", "content": "Old history"}]
+    with usage_scope(context.user_data):
+        record_model_usage(
+            provider="gemini", model="gemini-3-flash-preview", operation="chat",
+            usage={"input_tokens": 100, "output_tokens": 20},
+        )
+    await end_session(context, chat_id=456, user_id=123)
+    context.job.data = context.job_queue.run_once.call_args.kwargs["data"]
+    entered = asyncio.Event()
+    release = Event()
+    loop = asyncio.get_running_loop()
+
+    def synthesize(*args, **kwargs):
+        """Pause at the model boundary to reproduce the race without sleeps."""
+        loop.call_soon_threadsafe(entered.set)
+        if not release.wait(timeout=5):
+            raise TimeoutError("Test did not release synthesis")
+        record_model_usage(
+            provider="gemini", model="gemini-3-flash-preview", operation="synthesis",
+            usage={"input_tokens": 300, "output_tokens": 50},
+        )
+        if synthesis_fails:
+            raise ValueError("Simulated response parsing failure")
+        return SimpleNamespace(content="Old session notes")
+
+    def start_new_session():
+        """Create real replacement state whose usage and history must survive."""
+        new_id = start_session(context)
+        context.user_data["chat_history"] = [{"role": "user", "content": "New history"}]
+        context.user_data["cached_events"] = [{"summary": "New event"}]
+        context.user_data["calendar_cache_metadata"] = {"scope": "new"}
+        with usage_scope(context.user_data):
+            record_model_usage(
+                provider="gemini", model="gemini-3-flash-preview", operation="chat",
+                usage={"input_tokens": 75, "output_tokens": 10},
+            )
+        return new_id, deepcopy(context.user_data)
+
+    with (
+        patch("orchestrator.session_manager.generate_session_synthesis", side_effect=synthesize),
+        patch("orchestrator.session_manager.prompt_next_trigger", new_callable=AsyncMock) as prompt,
+    ):
+        if new_session_timing == "before_job":
+            new_id, newer_state = start_new_session()
+        task = asyncio.create_task(execute_synthesis_task(context))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            if new_session_timing == "during_job":
+                new_id, newer_state = start_new_session()
+        finally:
+            release.set()
+            await task
+
+    # Use real SQLite to verify first-write table creation and the stored owner,
+    # not just a mocked upsert call that could hide cross-session corruption.
+    summary = json.loads(get_db()["session_usage"].get(old_id)["summary_json"])
+    assert summary["session_id"] == old_id
+    assert summary["reported_tokens"]["input_tokens"] == 400
+    assert summary["reported_tokens"]["output_tokens"] == 70
+    assert summary["history"] == {"messages": 1, "characters": 11}
+    assert context.user_data["current_session_id"] == new_id
+    assert context.user_data["session_state"] == SessionStatus.ACTIVE
+    for field in ("session_usage", "chat_history", "cached_events", "calendar_cache_metadata", "last_model_usage"):
+        # Finishing the old job must preserve all state owned by the newer one.
+        assert context.user_data[field] == newer_state[field]
+    assert get_db()["sessions"].get(new_id)["status"] == SessionStatus.ACTIVE.value
+    prompt.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -192,7 +299,6 @@ async def test_context_command_reads_metrics_without_routing_or_history_changes(
 @patch("orchestrator.session_manager.get_db")
 async def test_final_summary_includes_synthesis_and_survives_history_clear(mock_db, mock_persist, mock_append, mock_trigger):
     """Session finalization must persist the final model call before resetting state."""
-    import json
     from orchestrator.session_manager import execute_synthesis_task
     context = MagicMock()
     context.user_data = {"current_session_id": "session", "chat_history": [{"content": "Hello"}]}

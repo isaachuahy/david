@@ -1,3 +1,4 @@
+import json
 from unittest.mock import patch
 
 import pytest
@@ -41,6 +42,38 @@ from reasoning.schemas import (
     WeekReviewResponse,
     WeeklyPlanResponse,
 )
+
+
+def test_legacy_snapshot_without_upcoming_events_loads_from_sqlite(tmp_path, monkeypatch):
+    """Reviews saved before upcoming calendar context remain resumable."""
+    from persistence.database import get_db, init_db
+    from persistence.review_workflows import load_resumable_review_workflows_sync
+
+    monkeypatch.setenv("DAVID_DB_PATH", str(tmp_path / "assistant.db"))
+    init_db()
+    record = ReviewWorkflowRecord(
+        id="legacy_review",
+        created_at="2026-09-17T00:00:00+00:00",
+        updated_at="2026-09-17T00:00:00+00:00",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals", weekly_state_markdown="# Week", decision_log_markdown="# Memory",
+        ),
+    )
+    legacy_state = record.model_dump(mode="json")
+    legacy_state["source_snapshot"].pop("upcoming_events")
+    get_db()["review_workflows"].insert({
+        "id": record.id,
+        "workflow_status": record.workflow_status.value,
+        "updated_at": record.updated_at,
+        "state_json": json.dumps(legacy_state),
+    })
+
+    restored, = load_resumable_review_workflows_sync()
+
+    assert restored.id == record.id
+    assert restored.source_snapshot.upcoming_events == []
+    assert restored.source_snapshot.goals_markdown == "# Goals"
 
 
 @pytest.mark.asyncio

@@ -77,7 +77,9 @@ freeze both past and upcoming seven-day event windows for later scheduling stage
 
 `observability/context_usage.py` measures provider-reported usage for chat, review,
 and synthesis. A ContextVar carries the active session through worker-thread calls;
-the synthesis job restores that scope explicitly. Per-request logs contain counts
+the synthesis job pins that scope to its queued session ID and usage bucket. An old
+job cannot consume a newer session's measurements or clear its history and cache.
+Per-request logs contain counts
 and model capacity, while session completion logs and saves aggregate usage to
 SQLite's `session_usage` table before clearing history. `/context` displays the
 current or last completed session without calling a model. Published model limits

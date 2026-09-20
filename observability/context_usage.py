@@ -114,10 +114,22 @@ def record_model_usage(
         bucket["last_request"] = entry
 
 
-def finish_session_usage(user_data: dict, session_id: str | None, history: list[dict]) -> dict:
-    """Capture the completed session, including synthesis, before history is cleared."""
+def finish_session_usage(
+    user_data: dict, session_id: str | None, history: list[dict], *, summary: dict | None = None,
+) -> dict:
+    """Finalize the captured session without consuming a newer session's usage."""
     with _lock:
-        summary = user_data.pop("session_usage", {"session_id": session_id, "models": {}})
+        if summary is not None and summary.get("session_id") != session_id:
+            raise ValueError("Usage summary belongs to a different session")
+        stored = user_data.get("session_usage")
+        if stored is not None and stored.get("session_id") == session_id:
+            # A delayed synthesis job can outlive the shared user_data slot.
+            # Only remove that slot when it still belongs to the closing job.
+            user_data.pop("session_usage")
+            if summary is None:
+                summary = stored
+        if summary is None:
+            summary = {"session_id": session_id, "models": {}}
         summary["history"] = history_size(history)
         # Repeated history contributes to each request's input total. These are
         # cumulative provider counts, not the size of the final transcript.

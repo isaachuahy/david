@@ -283,6 +283,7 @@ async def test_end_session_schedules_synthesis_with_chat_history_snapshot(
             "chat_id": 456,
             "session_id": "sess_abc123",
             "chat_history": [{"role": "user", "content": "Need to prioritize hiring."}],
+            "session_usage": {"session_id": "sess_abc123", "models": {}},
         },
         chat_id=456,
         user_id=123,
