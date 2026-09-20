@@ -1,4 +1,5 @@
 import asyncio
+import json
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Tuple
@@ -6,6 +7,7 @@ from loguru import logger
 from telegram.ext import Application, ContextTypes
 
 from observability.sentry import capture_exception as capture_sentry_exception
+from observability.context_usage import finish_session_usage, usage_scope
 from persistence.database import get_db
 from orchestrator.confirmation_queue import get_pending_write, reject_write
 from orchestrator.trigger_scheduler import prompt_next_trigger
@@ -154,6 +156,7 @@ def start_session(context: ContextTypes.DEFAULT_TYPE) -> str:
     user_data['current_session_id'] = session_id
     user_data['session_state'] = SessionStatus.ACTIVE
     user_data['chat_history'] = []
+    user_data['session_usage'] = {"session_id": session_id, "models": {}}
     
     record = SessionRecord(
         id=session_id,
@@ -257,15 +260,25 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
     session_id = job_data.get("session_id")
     chat_history = list(job_data.get("chat_history", []))
     session_date = datetime.now(timezone.utc).date().isoformat()
+    user_data = _user_data(context)
+    summary = job_data.get("session_usage", user_data.get("session_usage"))
+    if summary is None or summary.get("session_id") != session_id:
+        summary = {"session_id": session_id, "models": {}}
+    # Pin attribution to the queued job, even if a new session replaces shared
+    # user_data before or during the worker-thread model call.
+    synthesis_usage = {"current_session_id": session_id, "session_usage": summary}
     
     logger.info(f"Running background synthesis for session {session_id}...")
     try:
         if chat_history:
-            synthesis = await asyncio.to_thread(
-                generate_session_synthesis,
-                chat_history,
-                session_date=session_date,
-            )
+            # Jobs do not inherit the original Telegram handler's ContextVar.
+            # Restore attribution so synthesis contributes to this session too.
+            with usage_scope(synthesis_usage):
+                synthesis = await asyncio.to_thread(
+                    generate_session_synthesis,
+                    chat_history,
+                    session_date=session_date,
+                )
             if session_id:
                 persist_decision(session_id, synthesis.content)
             append_to_decision_log(synthesis.content)
@@ -294,9 +307,24 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
                 tags={"session_id": session_id} if session_id is not None else None,
             )
     finally:
-        # Finalise transition to IDLE even if synthesis fails.
-        # Clear both short-term chat state and the per-session calendar cache
-        # so the next session always starts from a fresh local view.
+        # Persist counts, not conversation content. A logging/storage failure
+        # must not prevent closing the session or clear an already-written log.
+        try:
+            summary = finish_session_usage(
+                user_data, session_id, chat_history, summary=synthesis_usage["session_usage"],
+            )
+            if session_id:
+                # get_db returns sqlite_utils.Database: upsert creates this table
+                # on the first completed session, including existing deployments.
+                get_db()["session_usage"].upsert({
+                    "session_id": session_id,
+                    "summary_json": json.dumps(summary),
+                }, pk="session_id")
+        except Exception as error:
+            logger.error("Failed to persist usage for session {}: {}", session_id, error)
+            capture_sentry_exception(error, component="session_manager", operation="persist_session_usage")
+
+        # Complete the durable record even if another session now owns the UI.
         if session_id:
             try:
                 get_db()["sessions"].update(session_id, {  # type: ignore
@@ -312,44 +340,53 @@ async def execute_synthesis_task(context: ContextTypes.DEFAULT_TYPE):
                     tags={"session_id": session_id},
                 )
 
-        user_data = _user_data(context)
-        user_data['chat_history'] = []
-        user_data.pop('cached_events', None)
-        user_data.pop('calendar_cache_metadata', None)
-        user_data['session_state'] = SessionStatus.IDLE
-        user_data['current_session_id'] = None
+        if user_data.get('current_session_id') == session_id:
+            # The closing job may clear only its own history and calendar cache.
+            # A newer session keeps its state and must not receive an idle prompt.
+            user_data['chat_history'] = []
+            user_data.pop('cached_events', None)
+            user_data.pop('calendar_cache_metadata', None)
+            user_data['session_state'] = SessionStatus.IDLE
+            user_data['current_session_id'] = None
+            if "last_model_usage" in synthesis_usage:
+                user_data["last_model_usage"] = synthesis_usage["last_model_usage"]
 
-        try:
-            await prompt_next_trigger(context, chat_id)
-        except Exception as e:
-            logger.error(f"Failed to evaluate the trigger queue after session {session_id}: {e}")
-            capture_sentry_exception(
-                e,
-                component="session_manager",
-                operation="prompt_next_trigger_after_session",
-                tags={"session_id": session_id} if session_id is not None else None,
-            )
+            try:
+                await prompt_next_trigger(context, chat_id)
+            except Exception as e:
+                logger.error(f"Failed to evaluate the trigger queue after session {session_id}: {e}")
+                capture_sentry_exception(
+                    e,
+                    component="session_manager",
+                    operation="prompt_next_trigger_after_session",
+                    tags={"session_id": session_id} if session_id is not None else None,
+                )
 
-        logger.info(f"Session {session_id} synthesis finalization complete. Ready for new messages.")
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=SESSION_READY_MESSAGE,
-            )
-        except Exception as e:
-            logger.error(f"Failed to send ready-for-next-message prompt for session {session_id}: {e}")
-            capture_sentry_exception(
-                e,
-                component="session_manager",
-                operation="send_session_ready_message",
-                tags={"session_id": session_id} if session_id is not None else None,
-            )
+            logger.info(f"Session {session_id} synthesis finalization complete. Ready for new messages.")
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=SESSION_READY_MESSAGE,
+                )
+            except Exception as e:
+                logger.error(f"Failed to send ready-for-next-message prompt for session {session_id}: {e}")
+                capture_sentry_exception(
+                    e,
+                    component="session_manager",
+                    operation="send_session_ready_message",
+                    tags={"session_id": session_id} if session_id is not None else None,
+                )
 
 async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: str = "done", user_id: Optional[int] = None):
     """Ends the active session, clears short-term memory, and checks for pending triggers."""
     user_data = _user_data(context)
     session_id = user_data.get('current_session_id')
     chat_history_snapshot = list(user_data.get('chat_history', []))
+    # Retain this bucket with the job before any await allows the active session
+    # to change. A subsequent start_session may replace the shared slot safely.
+    usage_summary = user_data.get("session_usage")
+    if usage_summary is None or usage_summary.get("session_id") != session_id:
+        usage_summary = {"session_id": session_id, "models": {}}
     if session_id:
         db = get_db()
         db["sessions"].update(session_id, {
@@ -386,6 +423,7 @@ async def end_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reason: 
             "chat_id": chat_id,
             "session_id": session_id,
             "chat_history": chat_history_snapshot,
+            "session_usage": usage_summary,
         },
         "chat_id": chat_id,
     }

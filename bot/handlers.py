@@ -67,6 +67,7 @@ from bot.review_flow import (
     send_review_stage_gate,
 )
 from observability.sentry import capture_exception as capture_sentry_exception
+from observability.context_usage import format_context_usage, usage_scope
 
 UNAUTHORIZED_CALLBACK_TEXT = "This action is not available."
 CALENDAR_AUTH_ERROR_TEXT = (
@@ -146,7 +147,10 @@ def authorized_only(handler):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         if not await _is_authorized(update, context):
             return
-        return await handler(update, context, *args, **kwargs)
+        # ContextVars propagate into asyncio.to_thread, attributing nested model
+        # requests without passing Telegram objects through the reasoning layer.
+        with usage_scope(context.user_data):
+            return await handler(update, context, *args, **kwargs)
 
     return wrapper
 
@@ -187,6 +191,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"User {user_id} started the bot.")
     await update.message.reply_text("Hello! I am David.")
     await send_retryable_artifact_write_notice(context, update.effective_chat.id)
+
+@authorized_only
+async def context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows measured context capacity without generating a conversational turn."""
+    report = format_context_usage(context.user_data)
+    for offset in range(0, len(report), 3500):
+        # Long sessions can include several review models; keep each reply below
+        # Telegram's message limit without dropping any usage rows.
+        await update.message.reply_text(report[offset:offset + 3500])
+
 
 @authorized_only
 async def test_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):

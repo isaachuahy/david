@@ -83,6 +83,19 @@ def format_user_datetime(dt: datetime) -> str:
     return dt.astimezone(USER_TIMEZONE).strftime("%Y-%m-%d %H:%M %Z")
 
 
+def format_calendar_event_window(event: dict) -> str:
+    """Preserves event boundaries for chat and review scheduling context."""
+    start = event.get("start") or {}
+    end = event.get("end") or {}
+    start_value = start.get("dateTime") or start.get("date") or "unknown start"
+    end_value = end.get("dateTime") or end.get("date") or "unknown end"
+
+    # Google Calendar uses an exclusive end date for all-day events; naming
+    # that convention keeps the planner from blocking an extra day.
+    suffix = "; all-day, end date exclusive" if start.get("date") else ""
+    return f"{start_value} → {end_value}{suffix}"
+
+
 def parse_calendar_sortable_datetime(value: str) -> datetime:
     """
     Normalizes Google Calendar date/dateTime values into sortable datetimes.

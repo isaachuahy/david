@@ -3,7 +3,7 @@ from typing import Iterable, Literal, Optional
 
 from loguru import logger
 from integrations.calendar import get_upcoming_events, resolve_calendar_display_name
-from orchestrator.time_utils import calendar_event_sort_key
+from orchestrator.time_utils import calendar_event_sort_key, format_calendar_event_window
 from telegram.ext import ContextTypes
 from runtime_paths import get_context_dir
 from orchestrator.time_utils import USER_TIMEZONE
@@ -123,7 +123,8 @@ def _format_calendar_events(tg_context: ContextTypes.DEFAULT_TYPE = None, days: 
         
     lines = []
     for event in events:
-        start = event['start'].get('dateTime', event['start'].get('date'))
+        # Show occupied intervals so the model can reason about free time.
+        window = format_calendar_event_window(event)
         summary = event.get('summary', 'Busy / No Title')
         calendar_id = event.get("calendar_id", "primary")
 
@@ -134,7 +135,7 @@ def _format_calendar_events(tg_context: ContextTypes.DEFAULT_TYPE = None, days: 
 
         calendar_display_name = calendar_name_cache[calendar_id]
         lines.append(
-            f"- [{start}] {summary} "
+            f"- [{window}] {summary} "
             f"(Calendar: {calendar_display_name}; calendar_id: {calendar_id})"
         )
         

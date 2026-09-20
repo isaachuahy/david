@@ -28,7 +28,7 @@ from orchestrator.session_manager import (
 from persistence.database import get_telegram_persistence_path, init_db
 from config import ConfigError, load_config
 from bot.handlers import (
-    start, done_command, test_trigger, test_schedule,
+    start, done_command, context_command, test_trigger, test_schedule,
     weekly_review_command,
     handle_confirm, handle_reject, handle_review_resume, handle_start_trigger,
     handle_delay_trigger, handle_clear_trigger_queue,
@@ -161,6 +161,7 @@ def main() -> int:
         user_filter = filters.User(user_id=config.allowed_user_id)
         app.add_handler(CommandHandler("start", start, filters=user_filter))
         app.add_handler(CommandHandler("done", done_command, filters=user_filter))
+        app.add_handler(CommandHandler("context", context_command, filters=user_filter))
         app.add_handler(CommandHandler("test_trigger", test_trigger, filters=user_filter))
         app.add_handler(CommandHandler("test_schedule", test_schedule, filters=user_filter))
         app.add_handler(CommandHandler("weekly_review", weekly_review_command, filters=user_filter))

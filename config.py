@@ -36,6 +36,14 @@ def _get_env(name: str) -> str | None:
     return cleaned or None
 
 
+# Published Gemini input capacity, checked 2026-09-18. Unknown models remain
+# unmeasured rather than borrowing another model's limit.
+# https://ai.google.dev/gemini-api/docs/models/gemini-3-flash-preview
+MODEL_CONTEXT_LIMITS = {
+    ("gemini", "gemini-3-flash-preview"): ("input", 1_048_576),
+}
+
+
 def _require_env(name: str, *, placeholder_values: set[str] | None = None) -> str:
     value = _get_env(name)
     if value is None:

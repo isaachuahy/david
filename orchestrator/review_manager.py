@@ -8,9 +8,11 @@ from loguru import logger
 from pydantic import BaseModel
 
 from observability.sentry import capture_exception as capture_sentry_exception
-from integrations.calendar import get_past_events
+from observability.context_usage import gemini_token_usage, record_model_usage
+from integrations.calendar import get_past_events, get_upcoming_events
 from orchestrator.artifact_writes import execute_artifact_replacement
 from orchestrator.review_artifacts import get_effective_artifact_content
+from orchestrator.time_utils import format_calendar_event_window
 from persistence.models import (
     ArtifactChangeSummary,
     ArtifactType,
@@ -129,21 +131,22 @@ def _read_context_markdown(filename: str) -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
-def _format_past_event_lines(past_events_raw: list[dict]) -> list[str]:
+def _format_snapshot_event_lines(events: list[dict]) -> list[str]:
     """
-    Normalizes past-week calendar events into compact durable strings.
+    Normalizes past and upcoming calendar events into compact durable strings.
 
     The review snapshot stores these lines rather than raw event payloads so
     later stages can reason from a stable, compact baseline across restarts.
     """
     lines: list[str] = []
 
-    for event in past_events_raw:
+    for event in events:
         # Keep each event compact and human-readable because the snapshot is
         # meant to anchor review reasoning, not preserve the full API payload.
-        start_time = event["start"].get("dateTime", event["start"].get("date"))
+        window = format_calendar_event_window(event)
         summary = event.get("summary", "Busy / No Title")
-        lines.append(f"[{start_time}] {summary}")
+        calendar_id = event.get("calendar_id", "primary")
+        lines.append(f"[{window}] {summary} (calendar_id: {calendar_id})")
 
     return lines
 
@@ -151,7 +154,7 @@ def _format_past_event_lines(past_events_raw: list[dict]) -> list[str]:
 def _format_snapshot_events_for_prompt(event_lines: list[str]) -> str:
     """Formats frozen snapshot events for prompt injection."""
     if not event_lines:
-        return "No events found in the past week."
+        return "No events returned for this period."
     return "\n".join(f"- {line}" for line in event_lines)
 
 
@@ -802,6 +805,7 @@ def _generate_review_structured(
     if system_instruction:
         config["system_instruction"] = system_instruction
 
+    response = None
     try:
         response = client.models.generate_content(
             model=model,
@@ -819,6 +823,13 @@ def _generate_review_structured(
             tags={"model": model},
         )
         raise
+    finally:
+        # Include review calls and fallbacks when invoked inside a conversation;
+        # standalone scheduled work still gets its own per-request log entry.
+        record_model_usage(
+            provider="gemini", model=model, operation=f"review:{operation}",
+            usage=gemini_token_usage(response), context_characters=len(prompt),
+        )
 
 
 def _is_non_retryable_review_generation_error(error: Exception) -> bool:
@@ -911,18 +922,26 @@ async def build_review_source_snapshot() -> SourceSnapshot:
     working set from disk on every resume.
     """
     try:
-        goals_markdown, weekly_state_markdown, decision_log_markdown, past_events_raw = await asyncio.gather(
+        (
+            goals_markdown,
+            weekly_state_markdown,
+            decision_log_markdown,
+            past_events_raw,
+            upcoming_events_raw,
+        ) = await asyncio.gather(
             asyncio.to_thread(_read_context_markdown, "goals.md"),
             asyncio.to_thread(_read_context_markdown, "weekly_state.md"),
             asyncio.to_thread(_read_context_markdown, "decision_log.md"),
             asyncio.to_thread(get_past_events, days=7),
+            asyncio.to_thread(get_upcoming_events, days=7),
         )
 
         return SourceSnapshot(
             goals_markdown=goals_markdown,
             weekly_state_markdown=weekly_state_markdown,
             decision_log_markdown=decision_log_markdown,
-            past_week_events=_format_past_event_lines(past_events_raw or []),
+            past_week_events=_format_snapshot_event_lines(past_events_raw or []),
+            upcoming_events=_format_snapshot_event_lines(upcoming_events_raw or []),
         )
     except Exception as error:
         capture_sentry_exception(
