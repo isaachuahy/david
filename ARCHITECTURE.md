@@ -30,20 +30,28 @@ C4Context
 
 ## 2. Normal Interaction Flow
 
-Normal conversation stays lightweight and selective.
+Normal conversation selects an operation before touching pending work.
 
-- The router classifies each turn as `operational` or `strategic`.
-- The router also detects whether the turn needs calendar context, strategy context, or both.
-- The context builder selects the smallest valid context profile.
+- The router selects `discuss`, `create_draft`, `revise_draft`, or `clarify`, plus a draft ID when applicable.
+- Application state limits available operations and targets; revisions recheck the target before dispatch.
+- If the model selects `revise_draft` with no editable pending work, code maps it to `clarify` with a null target. Other invalid selections still fail validation.
+- Discussion uses a response schema without calendar proposal fields and preserves pending drafts.
+- The answering model receives the full compact context, including calendar end times and pending work.
 - Calendar proposals enter a revision-aware proposal thread.
 - Only a confirmed proposal is executed against Google Calendar.
+
+`handle_message()` is the sole classification entry point for incoming text,
+including when pending state is empty. It validates and dispatches the decision.
+`process_message()` requires that decision and state; it only assembles context,
+generates a response, and records the conversational turn. Revision handlers pass
+their already-selected operation through the same response-generation path.
 
 ```mermaid
 flowchart TD
     A["Inbound Telegram message"] --> B["RoutingDecision
-    intent + context flags"]
-    B --> C["ContextBuilder
-    select smallest profile"]
+    operation + target ID"]
+    B --> C["Validate operation and target;
+    assemble context"]
     C --> D["LLM call"]
     D --> E{"Response contains
     calendar proposal?"}
@@ -54,9 +62,9 @@ flowchart TD
     G --> H["Show draft for feedback"]
     H --> I{"User response"}
 
-    I -- "Revise" --> G
-    I -- "Confirm" --> J["Execute confirmed calendar change"]
-    I -- "Reject" --> K["Mark thread rejected"]
+    I -- "Message" --> B
+    I -- "Confirm button" --> J["Execute confirmed calendar change"]
+    I -- "Reject button" --> K["Mark item rejected"]
 
     J --> F
     K --> F
@@ -70,7 +78,24 @@ David uses four context profiles:
 - `priority_strategy`
 - `full`
 
-The router chooses the smallest profile that can answer the turn correctly.
+Ordinary turns use `full`: operation labels alone do not indicate which context
+an answer needs. Calendar reads use the existing session cache. Weekly-review
+snapshots include both past and upcoming events with their start and end times.
+
+Routing uses a short production prompt and the full current-session transcript.
+`reasoning/model_client.py` sends Gemini directly to Google's API and Luna through
+OpenRouter. Model selection lives in `config.py`; benchmark
+endpoint pins, price caps, and datasets are separate from runtime policy.
+Discussion requires no separate pause/resume state. Interrupted review recovery
+and artifact retries retain their existing explicit buttons.
+
+`observability/context_usage.py` records provider token usage and model capacity
+without entering conversational history. A ContextVar attributes nested calls,
+including worker-thread calls, to the active session. Synthesis restores that scope
+in its background job. Finalization logs and persists the summary to `session_usage`
+before clearing history; `/context` displays current or last-session measurements.
+Missing counts remain unknown, and cumulative token totals are separate from peak
+per-request occupancy. Published model limits are centralized in `config.py`.
 
 Calendar context includes event start and end times. New weekly-review snapshots
 freeze both past and upcoming seven-day event windows for later scheduling stages.

@@ -15,6 +15,7 @@ from orchestrator.confirmation_queue import (
     revise_proposal_item,
 )
 from orchestrator.router import process_message
+from reasoning.routing import RoutingDecision
 from orchestrator.session_manager import (
     track_confirmation_message,
     untrack_confirmation_message,
@@ -377,11 +378,25 @@ async def revise_active_proposal_item(
     mark_proposal_item_in_revision(item_id, feedback=feedback)
     untrack_confirmation_message(context, item_id)
 
-    if "cached_events" not in context.user_data:
-        context.user_data["cached_events"] = await asyncio.to_thread(get_upcoming_events)
-
-    revision_request = _format_revision_request(context, item, feedback)
-    response = await process_message(revision_request, context)
+    try:
+        if "cached_events" not in context.user_data:
+            context.user_data["cached_events"] = await asyncio.to_thread(get_upcoming_events)
+        revision_request = _format_revision_request(context, item, feedback)
+        # Interpretation has already authorized this revision. Keep the user's
+        # actual feedback in history and supply orchestration as separate context.
+        response = await process_message(
+            feedback,
+            context,
+            routing_decision=RoutingDecision(
+                operation="revise_draft", target_id=item.id,
+            ),
+            routing_state={"drafts": [{"id": item.id, "status": "pending"}]},
+            workflow_context=revision_request,
+        )
+    except Exception:
+        # Calendar and model failures must leave the draft reachable next turn.
+        track_confirmation_message(context, item_id, message_id)
+        raise
     revised_action = _extract_revised_calendar_action(response)
 
     if revised_action is None:
@@ -392,7 +407,7 @@ async def revise_active_proposal_item(
     try:
         normalized_action = await _normalize_calendar_action(context, revised_action)
     except ValueError as error:
-        _rollback_latest_chat_turn(context, revision_request)
+        _rollback_latest_chat_turn(context, feedback)
         updated_item = revise_proposal_item(
             item_id,
             revised_action,

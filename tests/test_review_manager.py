@@ -236,6 +236,31 @@ async def test_run_week_review_stage_persists_week_review_checkpoint(
 @pytest.mark.asyncio
 @patch("orchestrator.review_manager.save_review_workflow_sync")
 @patch("orchestrator.review_manager._generate_review_structured")
+async def test_review_retry_uses_configured_model_roles(mock_generate, mock_save, monkeypatch):
+    """Review retries must honor central settings instead of a retired hardcoded ID."""
+    monkeypatch.setenv("GEMINI_REVIEW_MODEL", "configured-review")
+    monkeypatch.setenv("GEMINI_REVIEW_FALLBACK_MODEL", "configured-fallback")
+    record = ReviewWorkflowRecord(
+        id="review_retry",
+        created_at="2026-09-17T00:00:00+00:00",
+        updated_at="2026-09-17T00:00:00+00:00",
+        source_snapshot=SourceSnapshot(
+            goals_markdown="# Goals", weekly_state_markdown="# Week", decision_log_markdown="# Memory",
+        ),
+    )
+    mock_generate.side_effect = [ValueError("Invalid model output"), WeekReviewResponse(summary="Recovered.")]
+
+    result = await run_week_review_stage(record)
+
+    assert [call.kwargs["model"] for call in mock_generate.call_args_list] == [
+        "configured-review", "configured-fallback",
+    ]
+    assert result.week_review.summary == "Recovered."
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.save_review_workflow_sync")
+@patch("orchestrator.review_manager._generate_review_structured")
 async def test_schema_request_errors_do_not_retry_with_pro(
     mock_generate_review_structured,
     mock_save_review_workflow_sync,

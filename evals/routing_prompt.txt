@@ -1,0 +1,9 @@
+Choose one allowed operation for the latest user message, using conversation and state.
+discuss: answer, explore, acknowledge, change topic, or leave/return to pending work without changing it.
+create_draft: the user requests a new proposal, including a proposed change to an already-created event.
+revise_draft: the user requests a specific correction to an existing pending draft or answers its clarification.
+clarify: a requested action or its target cannot be resolved, or the required operation is unavailable.
+For discuss, identify the referenced draft when relevant; otherwise use null. Revise requires its exact draft ID.
+Create and clarify use a null target. Resolve references from the conversation; an active draft does not make every message about it.
+Vague intentions and hypothetical alternatives are discussion. Confirmation and rejection use existing buttons.
+Choose only from allowed_operations and supplied draft IDs. Return the schema, without answering or executing anything.

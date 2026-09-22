@@ -7,12 +7,15 @@ from reasoning.flash_client import (
     generate_session_synthesis,
     PROMPTS_DIR,
     FlashResponse,
+    ConversationResponse,
 )
 
 
 @patch("reasoning.flash_client.genai.Client")
 @patch("builtins.open", new_callable=mock_open, read_data="Mocked system prompt.")
-def test_generate_flash_response_reads_system_prompt(mock_file, mock_client_class):
+def test_generate_flash_response_reads_system_prompt(mock_file, mock_client_class, monkeypatch):
+    """Chat uses the configured role while preserving its system prompt."""
+    monkeypatch.setenv("GEMINI_CHAT_MODEL", "configured-chat")
     # Setup mock client and response
     mock_client_instance = MagicMock()
     mock_client_class.return_value = mock_client_instance
@@ -31,6 +34,23 @@ def test_generate_flash_response_reads_system_prompt(mock_file, mock_client_clas
     # Assert generate_content was called with the loaded system prompt
     generate_content_kwargs = mock_client_instance.models.generate_content.call_args.kwargs
     assert generate_content_kwargs['config']['system_instruction'] == "Mocked system prompt."
+    assert generate_content_kwargs["model"] == "configured-chat"
+
+
+@patch("reasoning.flash_client.genai.Client")
+@patch("builtins.open", new_callable=mock_open, read_data="System prompt.")
+def test_discussion_uses_a_schema_without_calendar_proposals(mock_file, mock_client_class):
+    """Exploration cannot produce executable proposal fields in the response contract."""
+    client = mock_client_class.return_value
+    client.models.generate_content.return_value.parsed = ConversationResponse(message="Let's compare options.")
+
+    result = generate_flash_response("Is there a better way?", "<CONTEXT>", allow_calendar_proposals=False)
+
+    config = client.models.generate_content.call_args.kwargs["config"]
+    assert config["response_schema"] is ConversationResponse
+    assert set(ConversationResponse.model_fields) == {"message"}
+    assert result.proposal_thread is None
+    assert result.calendar_planning_mode == "discuss"
 
 @patch("reasoning.flash_client.capture_sentry_exception")
 @patch("builtins.open", side_effect=FileNotFoundError("File not found"))
@@ -100,7 +120,9 @@ def test_generate_flash_response_reports_parse_failures(
 
 @patch("reasoning.flash_client.genai.Client")
 @patch("builtins.open", new_callable=mock_open, read_data="### Session - $session_date\n\n<CHAT_HISTORY>\n$chat_history\n</CHAT_HISTORY>")
-def test_generate_session_synthesis_injects_session_date_and_history(mock_file, mock_client_class):
+def test_generate_session_synthesis_injects_session_date_and_history(mock_file, mock_client_class, monkeypatch):
+    """Synthesis has an independent model role and receives the dated transcript."""
+    monkeypatch.setenv("GEMINI_SYNTHESIS_MODEL", "configured-synthesis")
     mock_client_instance = MagicMock()
     mock_client_class.return_value = mock_client_instance
 
@@ -117,6 +139,7 @@ def test_generate_session_synthesis_injects_session_date_and_history(mock_file, 
     mock_file.assert_called_once_with(expected_path, "r", encoding="utf-8")
     generate_content_kwargs = mock_client_instance.models.generate_content.call_args.kwargs
     assert "2026-03-30" in generate_content_kwargs["contents"]
+    assert generate_content_kwargs["model"] == "configured-synthesis"
     assert "User: Let's prioritize outreach." in generate_content_kwargs["contents"]
     assert generate_content_kwargs["config"]["thinking_config"] == {"thinking_level": "high"}
     assert result.content == "### Session - 2026-03-30\n- Decided to focus on outreach."

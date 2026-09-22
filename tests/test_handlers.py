@@ -27,6 +27,8 @@ from orchestrator.session_manager import (
     timeout_inactive_session
 )
 from reasoning.flash_client import FlashResponse
+from reasoning.model_client import ModelReply
+from reasoning.routing import RoutingDecision
 from reasoning.schemas import ProposalThreadDraft, ProposedEvent
 from persistence.models import (
     ArtifactChangeSummary,
@@ -49,9 +51,272 @@ from persistence.models import (
 )
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["review", "proposal"])
+@pytest.mark.parametrize(
+    "action, message",
+    [
+        ("explore", "Actually, is there a better way to do this?"),
+        ("change_topic", "Let's talk about the interview instead."),
+        ("pause", "Let's pause this for now."),
+        ("resume", "Let's return to that plan."),
+        ("continue", "Yes, that works."),
+    ],
+)
+async def test_pending_work_survives_discussion_and_navigation(kind, action, message):
+    """Typed routing must reach the handler before any draft revision or rejection."""
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.effective_chat.id = 456
+    update.message.text = message
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.bot_data = {"allowed_user_id": 123}
+    context.user_data = {"session_state": "ACTIVE", "chat_history": []}
+    context.job_queue.get_jobs_by_name.return_value = ()
+    gate = {"review_id": "review_test", "stage": "weekly_plan", "text": "Proposed weekly plan"}
+    item = make_proposal_item()
+    if kind == "review":
+        context.user_data["active_review_stage_confirmation"] = gate.copy()
+        workflow_key = "review:review_test:weekly_plan"
+    else:
+        context.user_data["pending_confirmations"] = [(item.id, 999)]
+        workflow_key = item.id
+    if action == "resume":
+        context.user_data["paused_workflow_key"] = workflow_key
+
+    route = RoutingDecision(operation="discuss", target_id=workflow_key)
+    with (
+        patch("bot.handlers.route_turn", return_value=route) as classify,
+        patch("bot.handlers.get_proposal_item", return_value=item),
+        patch("bot.handlers.process_message", new_callable=AsyncMock, return_value=FlashResponse(message="Let's discuss.")) as process,
+        patch("bot.handlers.revise_active_review_stage", new_callable=AsyncMock) as revise_review,
+        patch("bot.handlers.revise_active_proposal_item", new_callable=AsyncMock) as revise_item,
+        patch("bot.handlers.reject_write") as reject,
+        patch("bot.handlers.confirm_write") as confirm,
+    ):
+        await handle_message(update, context)
+
+    revise_review.assert_not_awaited()
+    revise_item.assert_not_awaited()
+    reject.assert_not_called()
+    confirm.assert_not_called()
+    if kind == "review":
+        assert context.user_data["active_review_stage_confirmation"] == gate
+        assert "Proposed weekly plan" in str(classify.call_args.args[2])
+    else:
+        assert context.user_data["pending_confirmations"] == [(item.id, 999)]
+        assert item.summary in str(classify.call_args.args[2])
+    assert "paused_workflow_key" not in context.user_data
+    assert process.await_args.args == (message, context)
+    assert not process.await_args.kwargs["routing_decision"].allows_calendar_proposals
+
+
+@pytest.mark.asyncio
+@patch("bot.handlers.route_turn", side_effect=ValueError("Routing unavailable"))
+@patch("bot.handlers.revise_active_review_stage", new_callable=AsyncMock)
+async def test_failed_interpretation_preserves_pending_review(mock_revise, mock_classify):
+    """An outage before routing cannot silently consume a pending review gate."""
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.text = "Change it"
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.bot_data = {"allowed_user_id": 123}
+    gate = {"review_id": "review_test", "stage": "weekly_plan", "text": "Current plan"}
+    previous_turn = [{"role": "user", "content": "Change it"}, {"role": "assistant", "content": "Earlier answer"}]
+    context.user_data = {
+        "session_state": "ACTIVE", "active_review_stage_confirmation": gate.copy(),
+        "chat_history": previous_turn.copy(),
+    }
+    context.job_queue.get_jobs_by_name.return_value = ()
+
+    await handle_message(update, context)
+
+    mock_revise.assert_not_awaited()
+    assert context.user_data["active_review_stage_confirmation"] == gate
+    assert context.user_data["chat_history"] == previous_turn
+    update.message.reply_text.assert_awaited_once_with("Routing unavailable")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "edited", "resolved"])
+async def test_revision_dispatches_selected_draft_only_if_still_current(change):
+    """Two pending drafts must resolve by ID, with stale interpretations rejected."""
+    first = make_proposal_item()
+    second = first.model_copy(update={"id": "pi_second", "summary": "Dentist"})
+    items = {first.id: first, second.id: second}
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.effective_chat.id = 456
+    update.message.text = "Move the dentist appointment to 3pm."
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.bot_data = {"allowed_user_id": 123}
+    context.user_data = {
+        "session_state": "ACTIVE",
+        "pending_confirmations": [(first.id, 100), (second.id, 200)],
+    }
+    context.job_queue.get_jobs_by_name.return_value = ()
+
+    def classify(text, history, state):
+        """Simulate a background change while the model is selecting its target."""
+        assert [draft["id"] for draft in state["drafts"]] == [first.id, second.id]
+        if change == "edited":
+            items[second.id] = second.model_copy(update={"summary": "Updated dentist appointment"})
+        elif change == "resolved":
+            items[second.id] = second.model_copy(update={"status": ProposalItemStatus.ACCEPTED})
+        return RoutingDecision(operation="revise_draft", target_id=second.id)
+
+    with (
+        patch("bot.handlers.get_proposal_item", side_effect=items.get),
+        patch("bot.handlers.route_turn", side_effect=classify) as route,
+        patch("bot.handlers.revise_active_proposal_item", new_callable=AsyncMock, return_value=True) as revise,
+        patch("bot.handlers.process_message", new_callable=AsyncMock) as process,
+    ):
+        await handle_message(update, context)
+
+    process.assert_not_awaited()
+    route.assert_called_once()
+    if change is None:
+        revise.assert_awaited_once_with(context, 456, second.id, 200, update.message.text)
+    else:
+        revise.assert_not_awaited()
+        assert "changed while" in update.message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_new_draft_request_can_coexist_with_pending_draft():
+    """Pending work must not swallow a separate, explicitly requested proposal."""
+    item = make_proposal_item()
+    context = MagicMock()
+    context.bot_data = {"allowed_user_id": 123}
+    context.user_data = {"session_state": "ACTIVE", "pending_confirmations": [(item.id, 999)]}
+    context.job_queue.get_jobs_by_name.return_value = ()
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.text = "Keep that draft, and propose a separate dentist appointment."
+    update.message.reply_text = AsyncMock()
+    response = FlashResponse(
+        message="Here is a separate proposal.", calendar_planning_mode="propose",
+        proposal_thread=ProposalThreadDraft(
+            title="Dentist", rationale="A separate request", proposed_events=[ProposedEvent(
+                summary="Dentist", start_time="2026-09-19T15:00:00-04:00", end_time="2026-09-19T16:00:00-04:00",
+                description="Dental appointment.",
+            )],
+        ),
+    )
+    with (
+        patch("bot.handlers.get_proposal_item", return_value=item),
+        patch("bot.handlers.route_turn", return_value=RoutingDecision(operation="create_draft", target_id=None)),
+        patch("bot.handlers.process_message", new_callable=AsyncMock, return_value=response),
+        patch("bot.handlers.send_proposal_thread", new_callable=AsyncMock) as send,
+        patch("bot.handlers.revise_active_proposal_item", new_callable=AsyncMock) as revise,
+    ):
+        await handle_message(update, context)
+
+    send.assert_awaited_once()
+    revise.assert_not_awaited()
+    assert context.user_data["pending_confirmations"] == [(item.id, 999)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["artifact_retry", "final_review"])
+async def test_non_revisable_work_cannot_enter_revision_handler(kind):
+    """Recovery and deterministic review gates keep their existing button actions."""
+    context = MagicMock()
+    context.bot_data = {"allowed_user_id": 123}
+    context.user_data = {"session_state": "ACTIVE"}
+    context.job_queue.get_jobs_by_name.return_value = ()
+    if kind == "artifact_retry":
+        context.user_data["active_artifact_write_retry"] = {"write_id": "write_1"}
+        target_id = "artifact:write_1"
+    else:
+        context.user_data["active_review_stage_confirmation"] = {"review_id": "review_1", "stage": "final_review"}
+        target_id = "review:review_1:final_review"
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.text = "Revise that."
+    update.message.reply_text = AsyncMock()
+
+    with (
+        patch("bot.handlers.route_turn", return_value=RoutingDecision(operation="revise_draft", target_id=target_id)) as route,
+        patch("bot.handlers.revise_active_review_stage", new_callable=AsyncMock) as revise,
+        patch("bot.handlers.process_message", new_callable=AsyncMock) as process,
+    ):
+        await handle_message(update, context)
+
+    assert route.call_args.args[2]["drafts"][0]["can_revise"] is False
+    revise.assert_not_awaited()
+    process.assert_not_awaited()
+    assert "not available" in update.message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending, selected_operation, effective_operation", [
+    ("none", "discuss", "discuss"),
+    ("none", "revise_draft", "clarify"),
+    ("proposal", "discuss", "discuss"),
+    ("review", "discuss", "discuss"),
+])
+async def test_message_classifies_once_through_handler_and_response_generation(pending, selected_operation, effective_operation):
+    """Exercise both layers together; only the external model calls are stubbed."""
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.effective_chat.id = 456
+    update.message.text = "Can we think through the alternatives?"
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.bot_data = {"allowed_user_id": 123}
+    context.user_data = {
+        "session_state": "ACTIVE",
+        "chat_history": [{"role": "user", "content": "We are brainstorming."}],
+    }
+    context.job_queue.get_jobs_by_name.return_value = ()
+    target_id = None
+    item = make_proposal_item()
+    if pending == "proposal":
+        context.user_data["pending_confirmations"] = [(item.id, 999)]
+        target_id = item.id
+    elif pending == "review":
+        context.user_data["active_review_stage_confirmation"] = {
+            "review_id": "review_test", "stage": "weekly_plan", "text": "Proposed plan",
+        }
+        target_id = "review:review_test:weekly_plan"
+    decision = RoutingDecision(operation=selected_operation, target_id=target_id)
+    reply = "Which draft did you mean?" if effective_operation == "clarify" else "Let's compare."
+    with (
+        patch("bot.handlers.get_proposal_item", return_value=item),
+        patch("reasoning.routing.generate_structured", return_value=ModelReply(
+            text=decision.model_dump_json(), model="test", latency_ms=1,
+            input_tokens=50, output_tokens=10, finish_reason="stop",
+        )) as classify,
+        patch("orchestrator.router.build_context", return_value="Context"),
+        patch("orchestrator.router.generate_flash_response", return_value=FlashResponse(message=reply)) as generate,
+        patch("bot.handlers.revise_active_proposal_item", new_callable=AsyncMock) as revise,
+    ):
+        await handle_message(update, context)
+
+    classify.assert_called_once()
+    generate.assert_called_once()
+    revise.assert_not_awaited()
+    payload = classify.call_args.kwargs["payload"]
+    assert len(payload["state"]["drafts"]) == (0 if pending == "none" else 1)
+    assert payload["conversation"] == [{"role": "user", "content": "We are brainstorming."}]
+    assert generate.call_args.kwargs["allow_calendar_proposals"] is False
+    effective = RoutingDecision(operation=effective_operation, target_id=target_id)
+    assert effective.model_dump_json() in generate.call_args.kwargs["context_block"]
+    update.message.reply_text.assert_awaited_once_with(reply)
+    assert context.user_data["chat_history"][-2:] == [
+        {"role": "user", "content": update.message.text},
+        {"role": "assistant", "content": reply},
+    ]
+
+
+@pytest.mark.asyncio
 @patch('bot.handlers.start_session')
 @patch('bot.handlers.process_message', new_callable=AsyncMock)
-async def test_handle_message(mock_process_message, mock_start_session):
+@patch('bot.handlers.route_turn', return_value=RoutingDecision(operation="discuss", target_id=None))
+async def test_handle_message(mock_route, mock_process_message, mock_start_session):
     # 1. Arrange: Set up our mocks
     mock_flash_response = FlashResponse(
         message="This is a mocked response from David."
@@ -75,7 +340,13 @@ async def test_handle_message(mock_process_message, mock_start_session):
 
     # 3. Assert: Verify the routing logic worked correctly
     mock_start_session.assert_called_once_with(context)
-    mock_process_message.assert_awaited_once_with("Hello David", context)
+    mock_route.assert_called_once_with("Hello David", [], {
+        "drafts": [], "active_target_id": None, "can_create_draft": True,
+    })
+    mock_process_message.assert_awaited_once_with(
+        "Hello David", context, routing_decision=mock_route.return_value,
+        routing_state=mock_route.call_args.args[2],
+    )
     update.message.reply_text.assert_called_once_with("This is a mocked response from David.")
     context.job_queue.run_once.assert_called_once_with(
         timeout_inactive_session,
@@ -112,7 +383,9 @@ async def test_handle_message_drops_unauthorized_user(mock_process_message):
 @patch('bot.handlers.send_proposal_thread', new_callable=AsyncMock)
 @patch('bot.handlers.start_session')
 @patch('bot.handlers.process_message', new_callable=AsyncMock)
+@patch('bot.handlers.route_turn', return_value=RoutingDecision(operation="create_draft", target_id=None))
 async def test_handle_message_uses_proposal_thread_when_present(
+    mock_route,
     mock_process_message,
     mock_start_session,
     mock_send_proposal_thread,
@@ -188,7 +461,9 @@ async def test_normalize_calendar_action_rejects_utc_clock_time_for_toronto(
 @pytest.mark.asyncio
 @patch('bot.handlers.send_proposal_thread', new_callable=AsyncMock)
 @patch('bot.handlers.process_message', new_callable=AsyncMock)
+@patch('bot.handlers.route_turn', return_value=RoutingDecision(operation="create_draft", target_id=None))
 async def test_handle_message_rolls_back_failed_proposal_turn_from_chat_history(
+    mock_route,
     mock_process_message,
     mock_send_proposal_thread,
 ):
@@ -226,13 +501,20 @@ async def test_handle_message_rolls_back_failed_proposal_turn_from_chat_history(
         "chat_history": [
             {"role": "user", "content": "Earlier request"},
             {"role": "assistant", "content": "Earlier response"},
-            {"role": "user", "content": "Cancel this event"},
-            {"role": "assistant", "content": "I can cancel that."},
         ],
     }
     context.bot_data = {"allowed_user_id": 123}
     context.job_queue.get_jobs_by_name.return_value = ()
 
+    async def generate_response(text, context, **kwargs):
+        """Mirror successful generation before proposal validation rejects it."""
+        context.user_data["chat_history"].extend([
+            {"role": "user", "content": text},
+            {"role": "assistant", "content": "I can cancel that."},
+        ])
+        return mock_process_message.return_value
+
+    mock_process_message.side_effect = generate_response
     await handle_message(update, context)
 
     assert context.user_data["chat_history"] == [
@@ -302,7 +584,8 @@ async def test_revise_active_proposal_item_updates_proposal_in_place(
     assert "📝 *Revision in progress...*" in edit_kwargs["text"]
     assert edit_kwargs["parse_mode"] == "Markdown"
     mock_mark_in_revision.assert_called_once_with("pi_123", feedback="Move it to 10 instead")
-    assert mock_process_message.await_args.args[0].startswith("Revise the active calendar proposal")
+    assert mock_process_message.await_args.args[0] == "Move it to 10 instead"
+    assert mock_process_message.await_args.kwargs["workflow_context"].startswith("Revise the active calendar proposal")
     mock_revise_proposal_item.assert_called_once()
     mock_send_confirmation.assert_awaited_once()
 
@@ -482,7 +765,9 @@ async def test_send_proposal_thread_persists_mixed_batch_in_original_order(
 @patch('bot.handlers.get_proposal_item')
 @patch('bot.handlers.start_session')
 @patch('bot.handlers.process_message', new_callable=AsyncMock)
+@patch('bot.handlers.route_turn', return_value=RoutingDecision(operation="discuss", target_id=None))
 async def test_handle_message_untracks_stale_proposal_and_routes_normally(
+    mock_route,
     mock_process_message,
     mock_start_session,
     mock_get_proposal_item,
@@ -514,6 +799,8 @@ async def test_handle_message_untracks_stale_proposal_and_routes_normally(
     mock_process_message.assert_awaited_once_with(
         "Can you help me think through today instead?",
         context,
+        routing_decision=mock_route.return_value,
+        routing_state=mock_route.call_args.args[2],
     )
     update.message.reply_text.assert_awaited_once_with("Of course.")
 
@@ -651,7 +938,8 @@ async def test_revise_active_proposal_item_keeps_unresolved_item_tracked_across_
         "It is the sync with Alex",
     )
 
-    revision_prompt = mock_process_message.await_args.args[0]
+    assert mock_process_message.await_args.args[0] == "It is the sync with Alex"
+    revision_prompt = mock_process_message.await_args.kwargs["workflow_context"]
     assert "<CURRENT_CALENDAR_CONTEXT>" in revision_prompt
     assert "Existing Meeting" in revision_prompt
     assert "<PROPOSAL_THREAD_CONTEXT>" in revision_prompt
@@ -2072,7 +2360,11 @@ async def test_send_review_stage_gate_splits_oversized_gate_details():
 @patch('bot.handlers.send_review_stage_gate', new_callable=AsyncMock)
 @patch('bot.review_flow.revise_review_stage', new_callable=AsyncMock)
 @patch('bot.review_flow.load_review_workflow', new_callable=AsyncMock)
+@patch('bot.handlers.route_turn', return_value=RoutingDecision(
+    operation="revise_draft", target_id="review:review_test:week_review",
+))
 async def test_handle_message_revises_active_review_stage(
+    mock_classify,
     mock_load_review_workflow,
     mock_revise_review_stage,
     mock_send_review_stage_gate,
@@ -2146,13 +2438,25 @@ async def test_handle_message_revises_active_review_stage(
 @patch('bot.handlers.discard_review_workflow', new_callable=AsyncMock)
 @patch('bot.handlers.start_session')
 @patch('bot.handlers.process_message', new_callable=AsyncMock)
-async def test_handle_message_discards_resume_prompt_then_routes_normally(
+@patch('bot.handlers.load_review_workflow', new_callable=AsyncMock)
+@patch('bot.handlers.route_turn', return_value=RoutingDecision(
+    operation="discuss", target_id=None,
+))
+async def test_handle_message_preserves_resume_prompt_when_changing_topic(
+    mock_classify,
+    mock_load_review,
     mock_process_message,
     mock_start_session,
     mock_discard_review_workflow,
 ):
     mock_process_message.return_value = FlashResponse(
         message="Let's start fresh."
+    )
+    mock_load_review.return_value = ReviewWorkflowRecord(
+        id="review_test", created_at="2026-09-18T00:00:00Z", updated_at="2026-09-18T00:00:00Z",
+        current_stage=ReviewStage.WEEKLY_PLAN,
+        source_snapshot=SourceSnapshot(goals_markdown="", weekly_state_markdown="", decision_log_markdown=""),
+        weekly_plan=StageCheckpoint(summary="Work mornings; exercise evenings."),
     )
 
     update = MagicMock()
@@ -2170,12 +2474,12 @@ async def test_handle_message_discards_resume_prompt_then_routes_normally(
 
     await handle_message(update, context)
 
-    mock_discard_review_workflow.assert_awaited_once_with(context, "review_test")
+    mock_discard_review_workflow.assert_not_awaited()
     mock_start_session.assert_called_once_with(context)
-    mock_process_message.assert_awaited_once_with("Let's talk about today instead.", context)
-    update.message.reply_text.assert_any_await(
-        "I discarded the interrupted Sunday review and will treat this as a new message."
-    )
+    assert mock_process_message.await_args.args == ("Let's talk about today instead.", context)
+    assert mock_process_message.await_args.kwargs["routing_decision"].operation == "discuss"
+    assert "Work mornings; exercise evenings." in str(mock_classify.call_args.args[2])
+    assert context.user_data["active_review_resume_prompt"] == {"review_id": "review_test"}
     update.message.reply_text.assert_any_await("Let's start fresh.")
 
 

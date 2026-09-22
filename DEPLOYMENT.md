@@ -45,6 +45,10 @@ At minimum, the production env file needs:
 
 Use `ops/david/david.env.example` as the template.
 
+Routing defaults to Gemini 3.5 Flash-Lite through Google's native API, using
+`GEMINI_API_KEY`. Set `DAVID_ROUTING_MODEL=openai/gpt-5.6-luna` and
+`OPENROUTER_API_KEY` to select Luna; both use low reasoning.
+
 ## First deploy
 
 1. Put the repo on the server at `/opt/david`.

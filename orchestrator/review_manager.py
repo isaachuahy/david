@@ -6,6 +6,7 @@ from typing import Iterable, Optional, Type, TypeVar
 from google import genai
 from loguru import logger
 from pydantic import BaseModel
+from config import get_model_name
 
 from observability.sentry import capture_exception as capture_sentry_exception
 from observability.context_usage import gemini_token_usage, record_model_usage
@@ -44,8 +45,6 @@ from reasoning.schemas import (
 from runtime_paths import get_context_dir, get_prompt_path
 
 
-GEMINI_FLASH_MODEL = "gemini-3-flash-preview"
-GEMINI_PRO_MODEL = "gemini-3-pro-preview"
 REVIEW_SYSTEM_INSTRUCTION = (
     "You are a precise structured reasoning engine for David's weekly review workflow. "
     "Follow the stage prompt and populate the response schema faithfully."
@@ -630,7 +629,7 @@ async def _repair_markdown_once(
         _generate_review_structured,
         prompt=prompt,
         response_schema=MarkdownRepairResponse,
-        model=GEMINI_FLASH_MODEL,
+        model=get_model_name("review"),
         operation=f"{artifact_name}_markdown_repair",
     )
     return response.repaired_markdown.strip()
@@ -760,26 +759,6 @@ def _materialize_decision_log_change_proposal(
     )
 
 
-def _select_review_model(
-    stage: ReviewStage,
-    *,
-    context_chars: int,
-    retry_count: int = 0,
-) -> str:
-    """
-    Chooses the review model for a stage using a small, explicit heuristic.
-
-    Flash is the default for every stage. Pro is reserved only for explicit
-    retry paths, which keeps routine Sunday review behavior predictable while
-    preserving a higher-capacity fallback for transient structured-output
-    failures.
-    """
-    if retry_count > 0:
-        return GEMINI_PRO_MODEL
-
-    return GEMINI_FLASH_MODEL
-
-
 def _generate_review_structured(
     *,
     prompt: str,
@@ -882,7 +861,7 @@ async def _run_checkpoint_stage(
     request structured output, retry with Pro when Flash fails, then store the
     parsed response in the stage-specific checkpoint field.
     """
-    model = _select_review_model(stage, context_chars=len(prompt))
+    model = get_model_name("review")
 
     try:
         response = await asyncio.to_thread(
@@ -893,16 +872,16 @@ async def _run_checkpoint_stage(
             operation=operation,
         )
     except Exception as error:
-        if model == GEMINI_PRO_MODEL or _is_non_retryable_review_generation_error(error):
+        if model == get_model_name("review_fallback") or _is_non_retryable_review_generation_error(error):
             raise
 
         retry_operation = f"{operation}_retry"
-        logger.warning("Retrying {} with {} after {} failed.", operation, GEMINI_PRO_MODEL, model)
+        logger.warning("Retrying {} with {} after {} failed.", operation, get_model_name("review_fallback"), model)
         response = await asyncio.to_thread(
             _generate_review_structured,
             prompt=prompt,
             response_schema=response_schema,
-            model=GEMINI_PRO_MODEL,
+            model=get_model_name("review_fallback"),
             operation=retry_operation,
         )
 
@@ -1164,10 +1143,7 @@ async def run_goals_audit_stage(
         stage=ReviewStage.GOALS_AUDIT,
         revision_feedback=revision_feedback,
     )
-    proposal_model = _select_review_model(
-        ReviewStage.GOALS_AUDIT,
-        context_chars=len(proposal_prompt),
-    )
+    proposal_model = get_model_name("review")
     proposal_operation = "goals_change_revision" if revision_feedback else "goals_change"
 
     try:
@@ -1179,21 +1155,21 @@ async def run_goals_audit_stage(
             operation=proposal_operation,
         )
     except Exception as error:
-        if proposal_model == GEMINI_PRO_MODEL or _is_non_retryable_review_generation_error(error):
+        if proposal_model == get_model_name("review_fallback") or _is_non_retryable_review_generation_error(error):
             raise
 
         retry_operation = f"{proposal_operation}_retry"
         logger.warning(
             "Retrying {} with {} after {} failed.",
             proposal_operation,
-            GEMINI_PRO_MODEL,
+            get_model_name("review_fallback"),
             proposal_model,
         )
         proposal = await asyncio.to_thread(
             _generate_review_structured,
             prompt=proposal_prompt,
             response_schema=GoalsChangeProposalResponse,
-            model=GEMINI_PRO_MODEL,
+            model=get_model_name("review_fallback"),
             operation=retry_operation,
         )
 
@@ -1235,7 +1211,7 @@ async def run_memory_audit_stage(
         stage=ReviewStage.MEMORY_AUDIT,
         revision_feedback=revision_feedback,
     )
-    model = _select_review_model(ReviewStage.MEMORY_AUDIT, context_chars=len(prompt))
+    model = get_model_name("review")
     operation = "memory_audit_revision" if revision_feedback else "memory_audit"
 
     try:
@@ -1247,16 +1223,16 @@ async def run_memory_audit_stage(
             operation=operation,
         )
     except Exception as error:
-        if model == GEMINI_PRO_MODEL or _is_non_retryable_review_generation_error(error):
+        if model == get_model_name("review_fallback") or _is_non_retryable_review_generation_error(error):
             raise
 
         retry_operation = f"{operation}_retry"
-        logger.warning("Retrying {} with {} after {} failed.", operation, GEMINI_PRO_MODEL, model)
+        logger.warning("Retrying {} with {} after {} failed.", operation, get_model_name("review_fallback"), model)
         response = await asyncio.to_thread(
             _generate_review_structured,
             prompt=prompt,
             response_schema=MemoryAuditResponse,
-            model=GEMINI_PRO_MODEL,
+            model=get_model_name("review_fallback"),
             operation=retry_operation,
         )
 
@@ -1269,10 +1245,7 @@ async def run_memory_audit_stage(
         stage=ReviewStage.MEMORY_AUDIT,
         revision_feedback=revision_feedback,
     )
-    proposal_model = _select_review_model(
-        ReviewStage.MEMORY_AUDIT,
-        context_chars=len(proposal_prompt),
-    )
+    proposal_model = get_model_name("review")
     proposal_operation = (
         "decision_log_change_revision"
         if revision_feedback
@@ -1288,21 +1261,21 @@ async def run_memory_audit_stage(
             operation=proposal_operation,
         )
     except Exception as error:
-        if proposal_model == GEMINI_PRO_MODEL or _is_non_retryable_review_generation_error(error):
+        if proposal_model == get_model_name("review_fallback") or _is_non_retryable_review_generation_error(error):
             raise
 
         retry_operation = f"{proposal_operation}_retry"
         logger.warning(
             "Retrying {} with {} after {} failed.",
             proposal_operation,
-            GEMINI_PRO_MODEL,
+            get_model_name("review_fallback"),
             proposal_model,
         )
         proposal = await asyncio.to_thread(
             _generate_review_structured,
             prompt=proposal_prompt,
             response_schema=DecisionLogChangeProposalResponse,
-            model=GEMINI_PRO_MODEL,
+            model=get_model_name("review_fallback"),
             operation=retry_operation,
         )
 
@@ -1332,7 +1305,7 @@ async def run_weekly_plan_stage(
         stage=ReviewStage.WEEKLY_PLAN,
         revision_feedback=revision_feedback,
     )
-    model = _select_review_model(ReviewStage.WEEKLY_PLAN, context_chars=len(prompt))
+    model = get_model_name("review")
     operation = "weekly_plan_revision" if revision_feedback else "weekly_plan"
 
     try:
@@ -1344,16 +1317,16 @@ async def run_weekly_plan_stage(
             operation=operation,
         )
     except Exception as error:
-        if model == GEMINI_PRO_MODEL or _is_non_retryable_review_generation_error(error):
+        if model == get_model_name("review_fallback") or _is_non_retryable_review_generation_error(error):
             raise
 
         retry_operation = f"{operation}_retry"
-        logger.warning("Retrying {} with {} after {} failed.", operation, GEMINI_PRO_MODEL, model)
+        logger.warning("Retrying {} with {} after {} failed.", operation, get_model_name("review_fallback"), model)
         response = await asyncio.to_thread(
             _generate_review_structured,
             prompt=prompt,
             response_schema=WeeklyPlanResponse,
-            model=GEMINI_PRO_MODEL,
+            model=get_model_name("review_fallback"),
             operation=retry_operation,
         )
 
@@ -1402,7 +1375,7 @@ async def run_scheduling_pass_stage(
         stage=ReviewStage.SCHEDULING_PASS,
         revision_feedback=revision_feedback,
     )
-    model = _select_review_model(ReviewStage.SCHEDULING_PASS, context_chars=len(prompt))
+    model = get_model_name("review")
     operation = "scheduling_pass_revision" if revision_feedback else "scheduling_pass"
 
     try:
@@ -1414,16 +1387,16 @@ async def run_scheduling_pass_stage(
             operation=operation,
         )
     except Exception as error:
-        if model == GEMINI_PRO_MODEL or _is_non_retryable_review_generation_error(error):
+        if model == get_model_name("review_fallback") or _is_non_retryable_review_generation_error(error):
             raise
 
         retry_operation = f"{operation}_retry"
-        logger.warning("Retrying {} with {} after {} failed.", operation, GEMINI_PRO_MODEL, model)
+        logger.warning("Retrying {} with {} after {} failed.", operation, get_model_name("review_fallback"), model)
         response = await asyncio.to_thread(
             _generate_review_structured,
             prompt=prompt,
             response_schema=SchedulingPassResponse,
-            model=GEMINI_PRO_MODEL,
+            model=get_model_name("review_fallback"),
             operation=retry_operation,
         )
 
@@ -1443,7 +1416,7 @@ async def generate_scheduling_proposals(
     narrower: instantiate the confirmed direction without re-deciding strategy.
     """
     prompt = _render_scheduling_proposals_prompt(record)
-    model = _select_review_model(ReviewStage.SCHEDULING_PASS, context_chars=len(prompt))
+    model = get_model_name("review")
     operation = "scheduling_proposals"
 
     try:
@@ -1455,16 +1428,16 @@ async def generate_scheduling_proposals(
             operation=operation,
         )
     except Exception as error:
-        if model == GEMINI_PRO_MODEL or _is_non_retryable_review_generation_error(error):
+        if model == get_model_name("review_fallback") or _is_non_retryable_review_generation_error(error):
             raise
 
         retry_operation = f"{operation}_retry"
-        logger.warning("Retrying {} with {} after {} failed.", operation, GEMINI_PRO_MODEL, model)
+        logger.warning("Retrying {} with {} after {} failed.", operation, get_model_name("review_fallback"), model)
         response = await asyncio.to_thread(
             _generate_review_structured,
             prompt=prompt,
             response_schema=SchedulingProposalResponse,
-            model=GEMINI_PRO_MODEL,
+            model=get_model_name("review_fallback"),
             operation=retry_operation,
         )
 

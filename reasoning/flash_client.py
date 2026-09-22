@@ -6,6 +6,7 @@ from loguru import logger
 from observability.sentry import capture_exception as capture_sentry_exception
 from observability.context_usage import gemini_token_usage, record_model_usage
 
+from config import get_model_name
 from reasoning.parser import parse_model_response
 from reasoning.schemas import CalendarPlanningMode, ProposalThreadDraft
 from runtime_paths import DEFAULT_PROMPTS_DIR, get_prompt_path
@@ -13,10 +14,17 @@ from runtime_paths import DEFAULT_PROMPTS_DIR, get_prompt_path
 # Kept for existing tests and diagnostics; prompt reads use get_prompt_path.
 PROMPTS_DIR = str(DEFAULT_PROMPTS_DIR)
 
-class FlashResponse(BaseModel):
+class ConversationResponse(BaseModel):
+    """Conversation-only turns have no fields capable of creating event drafts."""
+
     message: str = Field(
         description="The text response to send directly back to the user."
     )
+
+
+class FlashResponse(ConversationResponse):
+    """Adds calendar drafts only for turns routed to concrete scheduling."""
+
     calendar_planning_mode: CalendarPlanningMode = Field(
         default="none",
         description=(
@@ -62,7 +70,8 @@ def _format_chat_history(chat_history: list[dict]) -> str:
     return "\n\n".join(lines)
 
 def generate_flash_response(user_message: str, context_block: str, chat_history: Optional[list[dict]] = None,
-                            thinking_level: Optional[str] = None) -> FlashResponse:
+                            thinking_level: Optional[str] = None,
+                            allow_calendar_proposals: bool = True) -> FlashResponse:
     """
     Sends the assembled context and user message to Gemini Flash.
     Enforces a strict Pydantic schema for the response.
@@ -73,6 +82,14 @@ def generate_flash_response(user_message: str, context_block: str, chat_history:
     client = genai.Client()
     
     system_instruction = _read_prompt_template("system_prompt.txt")
+    response_schema = FlashResponse if allow_calendar_proposals else ConversationResponse
+    if not allow_calendar_proposals:
+        system_instruction += (
+            "\nThis turn is conversation only. Answer, explore alternatives, or ask a "
+            "focused clarification using the current workflow context. Keep pending "
+            "drafts intact. Do not claim to create, revise, accept, reject, or execute "
+            "calendar proposals. Confirmation remains with the existing buttons."
+        )
     
     prompt = f"{context_block}\n\n"
     
@@ -87,7 +104,7 @@ def generate_flash_response(user_message: str, context_block: str, chat_history:
     # Base configuration
     generation_config = {
         'response_mime_type': 'application/json',
-        'response_schema': FlashResponse,
+        'response_schema': response_schema,
         'system_instruction': system_instruction,
         'temperature': 1.0
     }
@@ -95,7 +112,7 @@ def generate_flash_response(user_message: str, context_block: str, chat_history:
     if thinking_level:
         generation_config['thinking_config'] = {'thinking_level': thinking_level}
 
-    model = 'gemini-3-flash-preview'
+    model = get_model_name("chat")
     response = None
     try:
         response = client.models.generate_content(
@@ -117,7 +134,10 @@ def generate_flash_response(user_message: str, context_block: str, chat_history:
         )
 
     try:
-        return parse_model_response(response, FlashResponse)
+        parsed = parse_model_response(response, response_schema)
+        if not allow_calendar_proposals:
+            return FlashResponse(message=parsed.message, calendar_planning_mode="discuss")
+        return parsed
     except Exception as e:
         logger.error(f"Gemini Flash response parsing failed: {e}")
         capture_sentry_exception(e, component="gemini_flash", operation="parse_flash_response")
@@ -137,7 +157,7 @@ def generate_session_synthesis(chat_history: list[dict], session_date: str) -> S
         session_date=session_date
     )
 
-    model = 'gemini-3-flash-preview'
+    model = get_model_name("synthesis")
     response = None
     try:
         response = client.models.generate_content(

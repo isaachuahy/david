@@ -35,6 +35,7 @@ David is designed to:
 - [`uv`](https://docs.astral.sh/uv/) for dependency management
 - `python-telegram-bot`
 - Google Gemini via `google-genai`
+- Native Gemini for routing, with optional Luna through OpenRouter
 - Google Calendar API
 - SQLite
 - Loguru
@@ -52,6 +53,7 @@ You need:
 - a Telegram bot token
 - your Telegram user ID
 - a Gemini API key
+- an OpenRouter API key only if selecting Luna for routing
 - Google Calendar OAuth client credentials
 
 ### 2. Install
@@ -86,25 +88,43 @@ Notes:
 - `GOOGLE_CREDENTIALS_PATH` should point to your Google OAuth client JSON.
 - `GOOGLE_TOKEN_PATH` is where the authorized user token is stored.
 
+Model settings live in `config.py`. Routing defaults to `gemini-3.5-flash-lite`
+through Google's native API. Set `DAVID_ROUTING_MODEL=openai/gpt-5.6-luna` and
+`OPENROUTER_API_KEY` to select Luna through OpenRouter. Both use low reasoning.
+Chat, review, review fallback, and synthesis retain their Gemini models, with
+independent `GEMINI_<ROLE>_MODEL` overrides listed in `.env.example`.
+
+The router selects `discuss`, `create_draft`, `revise_draft`, or `clarify`, plus a
+pending draft ID when needed. Application state constrains those choices before
+dispatch. Discussion retains pending work; calendar writes still require buttons.
+Routing failures leave drafts unchanged and ask the user to retry.
+
 ### Context usage and calendar context
 
 Calendar context includes event start and end times. New weekly-review snapshots
 include the past seven days and the upcoming seven days, so scheduling sees
 existing commitments. All-day event end dates are explicitly marked exclusive.
 
-Use `/context` in Telegram to see current or last-session history size, measured
-model capacity, and cumulative reported token usage. A standalone weekly review
-also shows its latest request's model, input/output tokens, and capacity above any
-previous chat-session totals. Chat keeps the full
-current-session history. Each chat, review, and synthesis request emits a
-`model_context_usage` log; session finalization emits `session_context_usage` and
-saves its summary in SQLite's `session_usage` table before clearing history.
+Routing and chat receive the full current-session history, without message or
+character cuts. `/context` shows the last measured request capacity for each
+role/model, history size, and cumulative reported token usage. Gemini percentages
+use its published input limit; Luna percentages use its combined input/output
+window. Unknown model limits or missing usage are labeled unknown.
 
-Totals include repeatedly submitted history and thinking output. Cached input and
-thinking are subsets, not extra tokens. Missing usage or unknown model limits are
-labeled unknown. Capacity uses provider-reported counts after a request; this does
-not add automatic compaction or a preflight limit check. Telemetry stores counts,
-not conversation text.
+A standalone weekly review also shows its latest request's model, input/output
+tokens, and capacity above any previous chat-session totals.
+
+Each model request emits a `model_context_usage` log. After session synthesis,
+`session_context_usage` logs the session totals and peak occupancy; the summary
+is also saved in SQLite's `session_usage` table and remains available through
+`/context`. Counts include repeatedly submitted history, cached input, and thinking
+output; cached and thinking counts are subsets, not additional tokens. Logs contain
+counts, not transcripts. Measurements are returned by the provider after a request;
+this does not add automatic compaction or a preflight token-limit check.
+
+The [routing benchmarks](./evals/README.md) are exploratory comparisons. Production
+uses its own prompt and application state, without experimental endpoint pins or
+price caps. Benchmark accuracy does not establish end-to-end production reliability.
 
 ### 4. Add Google auth files
 

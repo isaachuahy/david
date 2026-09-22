@@ -32,7 +32,7 @@ def _count(value) -> int | None:
 
 
 def gemini_token_usage(response) -> dict:
-    """Normalize Gemini output to include thinking in session totals."""
+    """Normalize Gemini output to include thinking, matching OpenRouter totals."""
     usage = getattr(response, "usage_metadata", None)
     candidates = _count(getattr(usage, "candidates_token_count", None))
     thoughts = _count(getattr(usage, "thoughts_token_count", None))
@@ -179,7 +179,7 @@ def format_context_usage(user_data: dict) -> str:
     if not summary:
         if lines:
             return "\n".join(lines)
-        return "No model context measurements yet. Chat uses the full current-session history."
+        return "No model context measurements yet. Routing uses the full current-session history."
     active = bool(user_data.get("current_session_id")) and summary.get("session_id") == user_data["current_session_id"]
     history = history_size(user_data.get("chat_history", [])) if active else summary["history"]
     if lines:
@@ -187,7 +187,7 @@ def format_context_usage(user_data: dict) -> str:
     lines.extend([
         "Current session" if active else "Last completed session",
         f"History: {history['messages']:,} messages, {history['characters']:,} characters.",
-        "Full current-session history is sent to chat; no automatic truncation.",
+        "Full current-session history is sent to routing and chat; no automatic truncation.",
     ])
     for bucket in summary["models"].values():
         # Report each role/model separately: summing context percentages would be misleading.

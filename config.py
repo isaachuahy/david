@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -36,12 +37,66 @@ def _get_env(name: str) -> str | None:
     return cleaned or None
 
 
-# Published Gemini input capacity, checked 2026-09-18. Unknown models remain
-# unmeasured rather than borrowing another model's limit.
-# https://ai.google.dev/gemini-api/docs/models/gemini-3-flash-preview
-MODEL_CONTEXT_LIMITS = {
-    ("gemini", "gemini-3-flash-preview"): ("input", 1_048_576),
+ModelRole = Literal["chat", "review", "review_fallback", "synthesis"]
+
+# Keep provider model IDs in one place. Each role can be changed independently
+# through GEMINI_<ROLE>_MODEL without editing the conversation or review flows.
+MODEL_DEFAULTS: dict[ModelRole, str] = {
+    "chat": "gemini-3-flash-preview",
+    "review": "gemini-3-flash-preview",
+    "review_fallback": "gemini-3.1-pro-preview",
+    "synthesis": "gemini-3-flash-preview",
 }
+
+
+def get_model_name(role: ModelRole) -> str:
+    """Resolves a model role without requiring bot credentials or calendar access."""
+    default = MODEL_DEFAULTS[role]
+    return _get_env(f"GEMINI_{role.upper()}_MODEL") or default
+
+
+@dataclass(frozen=True)
+class RoutingModelConfig:
+    """Keeps production routing settings independent of the transport client."""
+
+    provider: str
+    model: str
+    reasoning: str
+    timeout_seconds: float = 10
+
+
+ROUTING_MODELS = {
+    "gemini-3.5-flash-lite": RoutingModelConfig(
+        "gemini", "gemini-3.5-flash-lite", "low",
+    ),
+    "openai/gpt-5.6-luna": RoutingModelConfig(
+        "openrouter", "openai/gpt-5.6-luna", "low",
+    ),
+}
+DEFAULT_ROUTING_MODEL = "gemini-3.5-flash-lite"
+
+# Published limits checked 2026-09-18. Gemini publishes an input limit;
+# Luna publishes a combined input/output window. Keep those denominators distinct.
+# https://ai.google.dev/gemini-api/docs/models
+# https://developers.openai.com/api/docs/models/gpt-5.6-luna
+MODEL_CONTEXT_LIMITS = {
+    ("gemini", "gemini-3.5-flash-lite"): ("input", 1_048_576),
+    ("gemini", "gemini-3-flash-preview"): ("input", 1_048_576),
+    ("gemini", "gemini-3.1-pro-preview"): ("input", 1_048_576),
+    ("openrouter", "openai/gpt-5.6-luna"): ("input_and_output", 1_050_000),
+}
+
+
+def get_routing_model() -> RoutingModelConfig:
+    """Selects a production candidate without experimental endpoint or price pins."""
+    model = _get_env("DAVID_ROUTING_MODEL") or DEFAULT_ROUTING_MODEL
+    # Existing deployments may still use the old OpenRouter-shaped selector.
+    # Preserve that setting while sending all Gemini routing directly to Google.
+    if model == "google/gemini-3.5-flash-lite":
+        model = "gemini-3.5-flash-lite"
+    if model not in ROUTING_MODELS:
+        raise ConfigError(f"Unsupported DAVID_ROUTING_MODEL: {model}")
+    return ROUTING_MODELS[model]
 
 
 def _require_env(name: str, *, placeholder_values: set[str] | None = None) -> str:
@@ -109,6 +164,9 @@ def load_config() -> AppConfig:
         "GEMINI_API_KEY",
         placeholder_values={"your_gemini_api_key_here"},
     )
+    # Validate routing access at startup instead of failing on the first turn.
+    if get_routing_model().provider == "openrouter":
+        _require_env("OPENROUTER_API_KEY", placeholder_values={"your_openrouter_api_key_here"})
     allowed_user_id = _load_allowed_user_id()
 
     db_path = _resolve_path("DAVID_DB_PATH", DEFAULT_DB_PATH)

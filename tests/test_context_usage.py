@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from config import MODEL_CONTEXT_LIMITS
 from bot.handlers import context_command, weekly_review_command
 from observability.context_usage import (
     finish_session_usage, format_context_usage, gemini_token_usage,
@@ -130,11 +129,11 @@ async def test_usage_follows_worker_threads_and_stays_with_its_session():
     second = {"current_session_id": "second"}
 
     async def call(data, tokens):
-        """Exercise the same thread propagation used by chat and reviews."""
+        """Exercise the same thread propagation used by routing and chat."""
         with usage_scope(data):
             await asyncio.to_thread(
-                record_model_usage, provider="gemini", model="gemini-3-flash-preview",
-                operation="chat", usage={"input_tokens": tokens, "output_tokens": 20},
+                record_model_usage, provider="gemini", model="gemini-3.5-flash-lite",
+                operation="routing", usage={"input_tokens": tokens, "output_tokens": 20},
                 history=[{"role": "user", "content": "Hello"}],
             )
 
@@ -146,19 +145,14 @@ async def test_usage_follows_worker_threads_and_stays_with_its_session():
     assert first_summary["history"] == {"messages": 1, "characters": 5}
 
 
-def test_cumulative_usage_is_distinct_from_window_occupancy(monkeypatch):
+def test_cumulative_usage_is_distinct_from_window_occupancy():
     """Repeated inputs add to cost totals but do not consume a growing context window."""
-    # Exercise combined windows without depending on a provider absent from this PR.
-    monkeypatch.setitem(
-        MODEL_CONTEXT_LIMITS,
-        ("test-provider", "combined-model"), ("input_and_output", 1_050_000),
-    )
     data = {"current_session_id": "session"}
     with usage_scope(data):
         for _ in range(2):
             # Cached input and reasoning output are subsets, never added twice.
             record_model_usage(
-                provider="test-provider", model="combined-model", operation="chat",
+                provider="openrouter", model="openai/gpt-5.6-luna", operation="routing",
                 usage={"input_tokens": 1000, "output_tokens": 50, "cached_tokens": 500, "reasoning_tokens": 30},
                 history=[{"content": "Discuss only"}],
             )
@@ -192,7 +186,7 @@ def test_gemini_thinking_counts_and_input_limit_are_separate():
     assert usage == {"input_tokens": 1_048_576, "output_tokens": 150, "reasoning_tokens": 50, "cached_tokens": 200}
     data = {"current_session_id": "session"}
     with usage_scope(data):
-        record_model_usage(provider="gemini", model="gemini-3-flash-preview", operation="chat", usage=usage)
+        record_model_usage(provider="gemini", model="gemini-3.5-flash-lite", operation="routing", usage=usage)
     assert "100.00% input capacity" in format_context_usage(data)
     assert all(count is None for count in gemini_token_usage(None).values())
 

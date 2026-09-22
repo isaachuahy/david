@@ -204,6 +204,7 @@ token.json
 data/*.db
 data/*.db-journal
 data/*.pkl
+data/routing_benchmarks/
 
 # David Context Files
 context/*.md

@@ -7,6 +7,7 @@ from telegram.ext import ContextTypes
 
 from integrations.calendar import get_events_for_local_day
 from orchestrator.router import process_message
+from reasoning.routing import route_turn, valid_operation
 from orchestrator.confirmation_queue import (
     accept_proposal_item,
     confirm_write,
@@ -20,7 +21,8 @@ from orchestrator.trigger_scheduler import queue_trigger, consume_trigger
 from orchestrator.session_manager import (
     start_session, end_session, reset_session_timeout, cancel_session_timeout, get_session_state,
     is_session_active, get_tracked_confirmation_messages, 
-    untrack_confirmation_message, clear_tracked_confirmation_messages
+    untrack_confirmation_message,
+    get_chat_history, append_chat_history,
 )
 from orchestrator.artifact_writes import retry_artifact_write
 from orchestrator.review_manager import (
@@ -604,6 +606,8 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stage_status=StageStatus.IN_REVISION,
         )
         context.user_data[ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY] = {
+            # Retain the displayed draft as context for the user's next revision.
+            **(active_confirmation if isinstance(active_confirmation, dict) else {}),
             "review_id": record.id,
             "stage": stage.value,
         }
@@ -858,115 +862,138 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("There is no active session to close.")
 
 
+async def _pending_message_workflows(context: ContextTypes.DEFAULT_TYPE) -> dict[str, dict]:
+    """Exposes every live target without consuming pending work during discussion."""
+    workflows = {}
+    retry = context.user_data.get(ACTIVE_ARTIFACT_WRITE_RETRY_KEY)
+    if isinstance(retry, dict):
+        workflows[f"artifact:{retry.get('write_id')}"] = {
+            "kind": "artifact_retry", "can_revise": False, "details": dict(retry),
+            "required_next_step": "Use the Retry button to apply the already-confirmed write.",
+        }
+
+    gate = context.user_data.get(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY)
+    if isinstance(gate, dict) and gate.get("review_id") and gate.get("stage"):
+        workflows[f"review:{gate['review_id']}:{gate['stage']}"] = {
+            "kind": "review", "details": dict(gate),
+            "can_revise": not isinstance(retry, dict) and gate["stage"] != ReviewStage.FINAL_REVIEW.value,
+        }
+
+    resume = context.user_data.get(ACTIVE_REVIEW_RESUME_PROMPT_KEY)
+    if not isinstance(gate, dict) and isinstance(resume, dict) and resume.get("review_id"):
+        record = await load_review_workflow(resume["review_id"])
+        if record and record.workflow_status != ReviewWorkflowStatus.COMPLETED:
+            checkpoint = getattr(record, record.current_stage.value, None)
+            workflows[f"review:{record.id}:{record.current_stage.value}"] = {
+                "kind": "review_resume", "can_revise": False,
+                "details": {
+                    "review_id": record.id, "stage": record.current_stage.value,
+                    "checkpoint": checkpoint.model_dump(mode="json") if checkpoint else None,
+                },
+                "required_next_step": "Use the Resume button to recover the interrupted review.",
+            }
+
+    for item_id, message_id in get_tracked_confirmation_messages(context):
+        # Only live draft state should anchor an ambiguous follow-up. Remove
+        # stale UI references without altering the persisted proposal outcome.
+        if item_id.startswith("pi_"):
+            item = get_proposal_item(item_id)
+            if item and item.status in {ProposalItemStatus.ACTIVE, ProposalItemStatus.IN_REVISION}:
+                workflows[item_id] = {
+                    "kind": "proposal", "can_revise": True, "message_id": message_id,
+                    "details": item.model_dump(mode="json"),
+                }
+                continue
+        else:
+            item = get_pending_write(item_id)
+            if item and item.status == CalendarWriteStatus.PENDING:
+                workflows[item_id] = {
+                    "kind": "legacy_write", "can_revise": False,
+                    "details": item.model_dump(mode="json"),
+                    "required_next_step": "Use the confirmation buttons to resolve this older proposal.",
+                }
+                continue
+        untrack_confirmation_message(context, item_id)
+    return workflows
+
+
+def _routing_state(workflows: dict[str, dict]) -> dict:
+    """Keeps routing capabilities tied to the handlers available for each object."""
+    return {
+        # A reference to one draft must not hide another pending proposal.
+        "drafts": [
+            {"id": target_id, "status": "pending", **workflow}
+            for target_id, workflow in workflows.items()
+        ],
+        "active_target_id": next(iter(workflows)) if len(workflows) == 1 else None,
+        "can_create_draft": True,
+    }
+
+
 @authorized_only
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles ad-hoc messages by checking UI state and passing text to the Router."""
-    # Block new messages if the session is currently synthesising
+    """Classifies each incoming text once, validates it, and dispatches its operation."""
     if get_session_state(context) == SessionStatus.CLOSING:
         await update.message.reply_text("⏳ *I am currently synthesizing our last session. Please give me a moment...*", parse_mode="Markdown")
         return
 
-    resume_prompt = context.user_data.get(ACTIVE_REVIEW_RESUME_PROMPT_KEY)
-    if isinstance(resume_prompt, dict):
-        review_id = resume_prompt.get("review_id")
-        if review_id:
-            try:
-                await discard_review_workflow(context, review_id)
-                await update.message.reply_text(
-                    "I discarded the interrupted Sunday review and will treat this as a new message."
-                )
-            except Exception as error:
-                logger.error(f"Failed to discard interrupted review before handling message: {error}")
-                capture_sentry_exception(
-                    error,
-                    component="handlers",
-                    operation="discard_review_on_message",
-                    message="Failed to discard interrupted review before normal message routing.",
-                    tags={"review_id": review_id},
-                )
-                await update.message.reply_text(
-                    "I couldn't discard the interrupted Sunday review yet. Please try the resume or discard button first."
-                )
-                return
-
-    active_stage_confirmation = context.user_data.get(ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY)
-    if isinstance(active_stage_confirmation, dict):
-        review_id = active_stage_confirmation.get("review_id")
-        stage_value = active_stage_confirmation.get("stage")
-        if review_id and stage_value:
-            await mark_review_stage_revision_in_progress(
-                context,
-                update.effective_chat.id,
-                active_stage_confirmation,
-            )
-            revised_record = await revise_active_review_stage(
-                context,
-                review_id,
-                ReviewStage(stage_value),
-                update.message.text,
-            )
-            if revised_record:
-                await update.message.reply_text("📝 *Revision applied.*", parse_mode="Markdown")
-                await send_review_stage_gate(
-                    context,
-                    update.effective_chat.id,
-                    revised_record,
-                )
-                return
-
-    if await send_retryable_artifact_write_notice(context, update.effective_chat.id):
-        return
-
-    # Check if a text message was sent while a proposal is waiting for confirmation.
-    pending_confirmations = get_tracked_confirmation_messages(context)
-    if pending_confirmations:
-        active_items = [
-            (item_id, message_id)
-            for item_id, message_id in pending_confirmations
-            if item_id.startswith("pi_")
-        ]
-        for item_id, message_id in active_items:
-            item = get_proposal_item(item_id)
-            if not item or item.status not in {
-                ProposalItemStatus.ACTIVE,
-                ProposalItemStatus.IN_REVISION,
-            }:
-                # Stale tracked proposal UIs should not capture unrelated text.
-                # Once removed, this message can continue into normal routing.
-                untrack_confirmation_message(context, item_id)
-                continue
-
-            revised = await revise_active_proposal_item(
-                context,
-                update.effective_chat.id,
-                item_id,
-                message_id,
-                update.message.text,
-            )
-            if not revised:
-                await update.message.reply_text("That proposal is no longer available for revision.")
-            return
-
-        for write_id, message_id in pending_confirmations:
-            record = get_pending_write(write_id)
-            if record and record.status == CalendarWriteStatus.PENDING:
-                logger.info(f"New message received. Auto-rejecting interrupted write {write_id}.")
-                reject_write(write_id)
-                try:
-                    await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id, text="🚫 *Event cancelled due to new incoming message.*", parse_mode="Markdown")
-                except Exception as e:
-                    logger.error(f"Failed to update interrupted message UI: {e}")
-        clear_tracked_confirmation_messages(context)
-
     text = update.message.text
-    logger.info(f"Received message: {text}")
-    
     if not is_session_active(context):
         start_session(context)
     reset_session_timeout(context, update.effective_chat.id, update.effective_user.id)
-    
+    history_length_before_turn = len(get_chat_history(context))
+
     try:
-        response = await process_message(text, context)
+        # Older persisted sessions may contain this marker. Pending objects now
+        # remain available during discussion without a separate navigation state.
+        context.user_data.pop("paused_workflow_key", None)
+        workflows = await _pending_message_workflows(context)
+        state = _routing_state(workflows)
+        # One classification entry point for every message. Response generation
+        # receives this decision explicitly, including when no drafts are pending.
+        routing_decision = await asyncio.to_thread(
+            route_turn, text, get_chat_history(context), state,
+        )
+        if not valid_operation(routing_decision.model_dump(), state):
+            raise ValueError("That operation is not available for the pending draft. Please try again.")
+
+        if routing_decision.operation == "revise_draft":
+            workflow = workflows[routing_decision.target_id]
+            # Interpretation runs outside the event loop. Check again before
+            # revising so a resolved or changed proposal cannot be overwritten.
+            fresh_workflows = await _pending_message_workflows(context)
+            if (
+                fresh_workflows.get(routing_decision.target_id) != workflow
+                or not valid_operation(routing_decision.model_dump(), _routing_state(fresh_workflows))
+            ):
+                raise ValueError("That draft changed while I was reading your message. Please try again.")
+
+            if workflow["kind"] == "review":
+                gate = workflow["details"]
+                await mark_review_stage_revision_in_progress(context, update.effective_chat.id, gate)
+                revised_record = await revise_active_review_stage(
+                    context, gate["review_id"], ReviewStage(gate["stage"]), text,
+                )
+                if revised_record is not None:
+                    await update.message.reply_text("📝 *Revision applied.*", parse_mode="Markdown")
+                    await send_review_stage_gate(context, update.effective_chat.id, revised_record)
+                    append_chat_history(context, "user", text)
+                    append_chat_history(context, "assistant", "Revision applied.")
+                else:
+                    await update.message.reply_text("That review is no longer available for revision.")
+                return
+
+            if workflow["kind"] == "proposal":
+                revised = await revise_active_proposal_item(
+                    context, update.effective_chat.id, routing_decision.target_id, workflow["message_id"], text,
+                )
+                if not revised:
+                    await update.message.reply_text("That proposal is no longer available for revision.")
+                return
+
+        response = await process_message(
+            text, context, routing_decision=routing_decision, routing_state=state,
+        )
 
         if (
             response.calendar_planning_mode == "propose"
@@ -981,14 +1008,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await update.message.reply_text(response.message)
-    except ValueError as e:
-        logger.error(f"Calendar proposal validation error: {e}")
-        _rollback_failed_router_turn(context, text)
-        await update.message.reply_text(str(e))
-    except Exception as e:
-        logger.error(f"Error handling message: {e}")
-        if _is_calendar_auth_error(e):
+    except ValueError as error:
+        logger.error("Message processing failed validation: {}", error)
+        # Classification can fail before anything is appended. In particular,
+        # a repeated message must not erase an earlier, successfully answered turn.
+        if len(get_chat_history(context)) > history_length_before_turn:
+            _rollback_failed_router_turn(context, text)
+        await update.message.reply_text(str(error))
+    except Exception as error:
+        logger.error("Error handling message: {}", error)
+        if _is_calendar_auth_error(error):
             await update.message.reply_text(CALENDAR_AUTH_ERROR_TEXT)
             return
-
         await update.message.reply_text("Sorry, I encountered an error. Please check the logs.")
