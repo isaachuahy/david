@@ -1,8 +1,5 @@
 name: CI/CD
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 on:
   pull_request:
   push:
@@ -16,18 +13,20 @@ concurrency:
 
 jobs:
   unit-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
 
       - name: Sync dependencies
         run: uv sync
@@ -36,18 +35,20 @@ jobs:
         run: uv run pytest -q
 
   integration-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
 
       - name: Sync dependencies
         run: uv sync
@@ -67,7 +68,7 @@ jobs:
       - unit-test
       - integration-test
     timeout-minutes: 15
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Deploy to Lightsail over SSH
         uses: appleboy/ssh-action@v1.0.3
