@@ -11,6 +11,8 @@ def routing_environment(monkeypatch):
     """Keep startup tests independent of locally configured routing credentials."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
     monkeypatch.delenv("DAVID_ROUTING_MODEL", raising=False)
+    monkeypatch.delenv("DAVID_CONTEXT_EDITOR_URL", raising=False)
+    monkeypatch.delenv("DAVID_CONTEXT_EDITOR_PORT", raising=False)
 
 
 @patch("config._validate_google_auth_paths")
@@ -28,6 +30,8 @@ def test_load_config_reads_required_env_vars(mock_validate_paths, monkeypatch):
     assert config.gemini_api_key == "gemini-key"
     assert config.allowed_user_id == 123
     assert config.db_path == Path("/tmp/david.db")
+    assert config.context_editor_url is None
+    assert config.context_editor_port == 8080
     mock_validate_paths.assert_called_once_with(
         Path("/tmp/token.json"),
         Path("/tmp/credentials.json"),
@@ -108,3 +112,45 @@ def test_model_roles_support_independent_environment_overrides(monkeypatch, role
 
     monkeypatch.setenv(env_name, "   ")
     assert get_model_name(role) == MODEL_DEFAULTS[role]
+
+
+@pytest.fixture
+def editor_environment(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-telegram-token")
+    monkeypatch.setenv("GEMINI_API_KEY", "synthetic-gemini-key")
+    monkeypatch.setenv("ALLOWED_USER_ID", "123")
+    monkeypatch.setattr("config._validate_google_auth_paths", lambda *args: None)
+
+
+@pytest.mark.parametrize("url", ["https://context.example.com/context", "https://context.example.com:443/context"])
+def test_editor_accepts_https_page_url(editor_environment, monkeypatch, url):
+    monkeypatch.setenv("DAVID_CONTEXT_EDITOR_URL", url)
+    assert load_config().context_editor_url == url
+
+
+@pytest.mark.parametrize("url", [
+    "http://context.example.com/context", "https:///context", "https://context.example.com/",
+    "https://user:password@context.example.com/context", "https://context.example.com/context?token=x",
+    "https://context.example.com/context#fragment", "https://context.example.com:8443/context",
+    "https://context.example.com:invalid/context", "https://[broken/context", "https://bad host/context",
+])
+def test_editor_rejects_invalid_public_urls(editor_environment, monkeypatch, url):
+    monkeypatch.setenv("DAVID_CONTEXT_EDITOR_URL", url)
+    with pytest.raises(ConfigError, match="DAVID_CONTEXT_EDITOR_URL") as error:
+        load_config()
+    assert "password" not in str(error.value)
+
+
+@pytest.mark.parametrize("port", [1024, 8080, 65535])
+def test_editor_accepts_unprivileged_local_port(editor_environment, monkeypatch, port):
+    monkeypatch.setenv("DAVID_CONTEXT_EDITOR_URL", "https://context.example.com/context")
+    monkeypatch.setenv("DAVID_CONTEXT_EDITOR_PORT", str(port))
+    assert load_config().context_editor_port == port
+
+
+@pytest.mark.parametrize("port", ["0", "443", "65536", "abc", "1.5"])
+def test_editor_rejects_invalid_local_ports(editor_environment, monkeypatch, port):
+    monkeypatch.setenv("DAVID_CONTEXT_EDITOR_URL", "https://context.example.com/context")
+    monkeypatch.setenv("DAVID_CONTEXT_EDITOR_PORT", port)
+    with pytest.raises(ConfigError, match="DAVID_CONTEXT_EDITOR_PORT"):
+        load_config()

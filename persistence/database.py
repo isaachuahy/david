@@ -169,6 +169,9 @@ def init_db():
             "id": str,
             "artifact_type": str,
             "content": str,
+            # Keep the confirmed proposal's base revision available after a
+            # restart so retried writes can detect newer context edits.
+            "expected_revision": str,
             "status": str,
             "source_type": str,
             "source_id": str,
@@ -180,6 +183,14 @@ def init_db():
             "executed_at": str,
         }, pk="id")
         logger.info("Created table: artifact_writes")
+    else:
+        table = db["artifact_writes"]
+        existing_columns = {column.name for column in table.columns}
+        if "expected_revision" not in existing_columns:
+            # Existing proposals have no recorded base. Leave their revisions
+            # NULL instead of inventing one from today's live context.
+            table.add_column("expected_revision", str)
+            logger.info("Added column artifact_writes.expected_revision")
 
     logger.info("Database initialization complete.")
 

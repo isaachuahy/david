@@ -29,10 +29,10 @@ jobs:
           enable-cache: false
 
       - name: Sync dependencies
-        run: uv sync
+        run: uv sync --locked
 
       - name: Run tests
-        run: uv run pytest -q
+        run: uv run --locked pytest -q
 
   integration-test:
     runs-on: ubuntu-26.04
@@ -51,16 +51,33 @@ jobs:
           enable-cache: false
 
       - name: Sync dependencies
-        run: uv sync
+        run: uv sync --locked
 
       - name: Run cross-layer integration tests
         run: >
-          uv run pytest -q
+          uv run --locked pytest -q
           tests/test_main.py
           tests/test_handlers.py
           tests/test_router.py
           tests/test_confirmation_queue.py
           tests/test_context_builder.py
+          tests/test_context_editor_auth.py
+          tests/test_context_editor_server.py
+
+      - name: Set up Node for browser checks
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Install browser test runtime
+        run: |
+          npm install --prefix "$RUNNER_TEMP/context-editor-browser" --no-save --package-lock=false playwright@1.63.0
+          "$RUNNER_TEMP/context-editor-browser/node_modules/.bin/playwright" install --with-deps chromium
+
+      - name: Exercise editor with the real API
+        env:
+          PLAYWRIGHT_MODULE_PATH: ${{ runner.temp }}/context-editor-browser/node_modules/playwright
+        run: node scripts/test_context_editor_browser.cjs
 
   deploy:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
@@ -84,7 +101,7 @@ jobs:
             cd /opt/david
             git fetch origin main
             git reset --hard origin/main
-            uv sync
+            uv sync --locked
             # Bootstrap-only: install units if this is a fresh server.
             if [ ! -f /etc/systemd/system/david.service ]; then
               sudo /opt/david/ops/david/install_lightsail_systemd.sh

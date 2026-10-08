@@ -1,0 +1,9 @@
+{$DAVID_EDITOR_HOST} {
+    @editor path /context /api/context /api/context/*
+    handle @editor {
+        reverse_proxy 127.0.0.1:{$DAVID_EDITOR_PORT:8080}
+    }
+    handle {
+        respond "Not found" 404
+    }
+}

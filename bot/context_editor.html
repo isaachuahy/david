@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src https://telegram.org https://cdn.jsdelivr.net 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'">
+  <title>David · Context</title>
+  <!-- Telegram requires its SDK before other scripts. Preview dependencies are version-pinned with integrity checks. -->
+  <script defer src="https://telegram.org/js/telegram-web-app.js?64"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/marked@18.1.0/lib/marked.umd.js" integrity="sha384-IvVdUXkhyoD0shbjhiiOnuiTbervTaB0VJcnEcg3shUAMVOOF6lKj4ozJrCwvz6s" crossorigin="anonymous"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/dompurify@3.4.16/dist/purify.min.js" integrity="sha384-a7SzOxErzJ3ZpQz0zJ32d67dSitNzPcbfybc/ykU9KJhMgZkwqfSxlhhdJRS+XGL" crossorigin="anonymous"></script>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --background: #ffffff; --surface: #f1f3f5; --text: #17212b;
+      --muted: #566471; --line: #c9d1d9; --accent: #1765ac;
+      --button-text: #ffffff; --danger: #b42318;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 16px;
+    }
+    :root[data-theme="dark"] {
+      --background: #17212b; --surface: #232e3c; --text: #f5f7fa;
+      --muted: #b5c0cc; --line: #546273; --accent: #6cb6ff;
+      --button-text: #17212b; --danger: #ffb4ab;
+    }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body {
+      margin: 0; min-height: 100dvh; display: flex; flex-direction: column;
+      background: var(--tg-theme-bg-color, var(--background));
+      color: var(--tg-theme-text-color, var(--text));
+    }
+    button, textarea, select { font: inherit; }
+    button { cursor: pointer; min-height: 44px; padding: 10px 16px; border: 1px solid var(--line); border-radius: 9px; background: transparent; color: inherit; }
+    button:hover:not(:disabled) { background: var(--tg-theme-secondary-bg-color, var(--surface)); }
+    button:active:not(:disabled) { transform: translateY(1px); }
+    button:disabled { cursor: default; opacity: .5; }
+    :focus-visible { outline: 3px solid var(--tg-theme-link-color, var(--accent)); outline-offset: 3px; }
+    .primary { border-color: transparent; background: var(--tg-theme-button-color, var(--accent)); color: var(--tg-theme-button-text-color, var(--button-text)); font-weight: 600; }
+    .primary:hover:not(:disabled) { background: var(--tg-theme-button-color, var(--accent)); filter: brightness(.93); }
+    .quiet { border-color: transparent; padding-inline: 10px; color: var(--tg-theme-link-color, var(--accent)); }
+    header, main, .footer-inner { width: min(100%, 1120px); margin-inline: auto; padding-inline: 20px; }
+    header { padding-top: calc(20px + var(--tg-content-safe-area-inset-top, 0px)); }
+    h1 { font-size: 1.5rem; line-height: 1.25; margin: 0 0 6px; font-weight: 650; }
+    h2 { font-size: 1.2rem; margin: 0 0 6px; }
+    p { line-height: 1.5; margin: 0; }
+    .muted { color: var(--muted); }
+    .documents { display: flex; gap: 4px; margin-top: 22px; border-bottom: 1px solid var(--line); }
+    .documents button { flex: 1; border: 0; border-bottom: 3px solid transparent; border-radius: 0; padding-inline: 8px; }
+    .documents [aria-pressed="true"] { border-bottom-color: var(--tg-theme-link-color, var(--accent)); font-weight: 650; color: var(--tg-theme-link-color, var(--accent)); }
+    main { padding-block: 22px; flex: 1; }
+    .toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin: 20px 0 12px; }
+    .mode-controls { display: flex; gap: 2px; padding: 3px; background: var(--tg-theme-secondary-bg-color, var(--surface)); border-radius: 10px; }
+    .mode-controls button { border: 0; min-height: 38px; padding: 7px 14px; }
+    .mode-controls [aria-pressed="true"] { background: var(--tg-theme-bg-color, var(--background)); font-weight: 600; }
+    .workspace { display: grid; gap: 24px; }
+    .pane { min-width: 0; }
+    .pane-label { display: block; font-size: 1rem; font-weight: 600; margin: 0 0 10px; }
+    textarea { width: 100%; min-height: 240px; height: max(240px, calc(var(--tg-viewport-stable-height, 100dvh) - 520px)); padding: 16px; border: 1px solid var(--line); border-radius: 9px; resize: vertical; line-height: 1.6; color: inherit; background: var(--tg-theme-bg-color, var(--background)); }
+    textarea[readonly] { background: var(--tg-theme-secondary-bg-color, var(--surface)); }
+    .hint { font-size: .875rem; margin-top: 8px; }
+    .markdown { overflow-wrap: anywhere; line-height: 1.65; max-width: 72ch; }
+    .markdown > :first-child { margin-top: 0; }
+    .markdown h1 { font-size: 1.5rem; }
+    .markdown h2 { font-size: 1.2rem; }
+    .markdown h3 { font-size: 1.05rem; }
+    .markdown h1, .markdown h2, .markdown h3, .markdown h4 { margin: 1.6em 0 .5em; }
+    .markdown p, .markdown ul, .markdown ol, .markdown blockquote { margin: 0 0 1em; }
+    .markdown li + li { margin-top: .3em; }
+    .markdown a { color: var(--tg-theme-link-color, var(--accent)); }
+    .markdown pre, .raw-text { white-space: pre-wrap; overflow-wrap: anywhere; padding: 14px; border-radius: 8px; background: var(--tg-theme-secondary-bg-color, var(--surface)); font-size: .9rem; line-height: 1.6; max-height: 320px; overflow: auto; }
+    .markdown table { display: block; overflow-x: auto; border-collapse: collapse; max-width: 100%; }
+    .markdown th, .markdown td { padding: 8px 12px; border: 1px solid var(--line); }
+    .markdown blockquote { margin-inline: 0; padding-inline: 14px; border-left: 1px solid var(--line); }
+    .notice { margin-bottom: 20px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 9px; }
+    .notice[data-kind="error"] { border-color: var(--danger); }
+    .notice button { margin-top: 12px; }
+    .conflict { margin: 20px 0; padding-block: 20px; border-block: 1px solid var(--line); }
+    .conflict details { margin-top: 12px; }
+    summary { cursor: pointer; padding-block: 10px; font-weight: 600; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+    .history-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; margin-bottom: 20px; }
+    .history label { display: block; font-weight: 600; margin-bottom: 8px; }
+    select { width: 100%; min-height: 46px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--tg-theme-bg-color, var(--background)); color: inherit; margin-bottom: 20px; }
+    .history .markdown { margin-top: 8px; }
+    footer { position: fixed; bottom: 0; width: 100%; border-top: 1px solid var(--line); background: var(--tg-theme-bg-color, var(--background)); }
+    .footer-inner { padding-top: 12px; padding-bottom: calc(12px + max(env(safe-area-inset-bottom, 0px), var(--tg-safe-area-inset-bottom, 0px)) + var(--tg-content-safe-area-inset-bottom, 0px)); }
+    .save-state { display: flex; justify-content: space-between; gap: 12px; font-size: .875rem; margin-bottom: 10px; }
+    .footer-actions { display: flex; gap: 8px; }
+    .footer-actions .primary { margin-left: auto; min-width: 100px; }
+    dialog { max-width: min(440px, calc(100% - 32px)); padding: 24px; border: 1px solid var(--line); border-radius: 12px; background: var(--tg-theme-bg-color, var(--background)); color: inherit; }
+    dialog::backdrop { background: rgb(0 0 0 / .45); }
+    dialog .actions { justify-content: flex-end; margin-top: 24px; }
+    .loading-line { height: 16px; width: 80%; margin-block: 16px; border-radius: 4px; background: var(--tg-theme-secondary-bg-color, var(--surface)); }
+    .loading-line:nth-child(2) { width: 60%; }
+    @media (min-width: 900px) {
+      .workspace { grid-template-columns: 1fr 1fr; }
+      textarea { height: min(48dvh, 520px); }
+      .mode-controls { display: none; }
+      .documents { max-width: 480px; }
+      .footer-inner { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+      .save-state { flex: 1; margin: 0; }
+      .footer-actions { min-width: 330px; }
+    }
+    @media (max-width: 380px) {
+      header, main, .footer-inner { padding-inline: 14px; }
+      .footer-actions button { padding-inline: 10px; }
+    }
+    @media (prefers-reduced-motion: reduce) { button:active:not(:disabled) { transform: none; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Context</h1>
+    <p class="muted">Edit what David remembers.</p>
+    <nav class="documents" aria-label="Context documents">
+      <button type="button" data-document="goals" aria-pressed="true" disabled>Goals</button>
+      <button type="button" data-document="weekly_state" aria-pressed="false" disabled>This week</button>
+      <button type="button" data-document="decision_log" aria-pressed="false" disabled>Memory</button>
+    </nav>
+  </header>
+  <main>
+    <section id="notice" class="notice" hidden>
+      <p id="notice-text" role="status" aria-live="polite"></p>
+      <button id="retry-load" type="button" hidden>Try again</button>
+    </section>
+    <div id="loading" aria-label="Loading context"><p class="muted">Loading your context…</p><div class="loading-line"></div><div class="loading-line"></div><div class="loading-line"></div></div>
+    <section id="editor-view" hidden>
+      <h2 id="document-title">Goals</h2>
+      <p id="document-description" class="muted"></p>
+      <section id="conflict" class="conflict" hidden aria-labelledby="conflict-title">
+        <h2 id="conflict-title">Review the newer context</h2>
+        <p>Your draft is still in the editor. Compare it with the current saved text before continuing.</p>
+        <details open><summary>Current saved text</summary><pre id="current-text" class="raw-text"></pre></details>
+        <div class="actions"><button id="keep-draft" type="button">Keep draft and continue</button><button id="load-current" type="button">Load current text</button></div>
+      </section>
+      <div class="toolbar">
+        <div class="mode-controls" aria-label="Editor view"><button id="edit-mode" type="button" aria-pressed="true">Edit</button><button id="preview-mode" type="button" aria-pressed="false">Preview</button></div>
+        <button id="history-button" class="quiet" type="button">History</button>
+      </div>
+      <div class="workspace">
+        <div id="edit-pane" class="pane"><label class="pane-label" for="editor">Markdown</label><textarea id="editor" spellcheck="false" aria-describedby="editor-hint"></textarea><p id="editor-hint" class="muted hint">Keep the section headings. Changes take effect when you save.</p></div>
+        <div id="preview-pane" class="pane" hidden><h3 class="pane-label">Preview</h3><p id="preview-note" class="muted hint" hidden></p><article id="preview" class="markdown"></article></div>
+      </div>
+    </section>
+    <section id="history-view" class="history" hidden aria-labelledby="history-title">
+      <div class="history-heading"><div><h2 id="history-title">Previous versions</h2><p class="muted">Choose a version to preview before restoring.</p></div><button id="back-editor" class="quiet" type="button">Back to editor</button></div>
+      <p id="history-status" role="status"></p>
+      <label id="version-label" for="version-select" hidden>Saved version</label>
+      <select id="version-select" hidden></select>
+      <div id="version-preview" hidden><article id="history-preview" class="markdown"></article><details><summary>Markdown text</summary><pre id="history-text" class="raw-text"></pre></details></div>
+    </section>
+  </main>
+  <footer id="footer" hidden>
+    <div class="footer-inner">
+      <div class="save-state"><span id="save-state" role="status">No unsaved changes</span><span id="document-size" class="muted"></span></div>
+      <div class="footer-actions"><button id="cancel" type="button">Cancel</button><button id="copy" class="quiet" type="button">Copy text</button><button id="save" class="primary" type="button" disabled>Save</button></div>
+    </div>
+  </footer>
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-text">
+    <form method="dialog"><h2 id="confirm-title">Confirm change</h2><p id="confirm-text"></p><div class="actions"><button value="cancel" autofocus>Go back</button><button id="confirm-action" class="primary" value="confirm">Confirm</button></div></form>
+  </dialog>
+  <noscript><p>The editor needs JavaScript. Open it from David in Telegram.</p></noscript>
+  <script>
+    document.addEventListener("DOMContentLoaded", () => {
+      const telegram = window.Telegram?.WebApp;
+      const byId = (id) => document.getElementById(id);
+      const documents = new Map();
+      const definitions = {
+        goals: {label: "Goals", description: "Your longer-term goals and operating principles.", skeleton: "# Goals\n\n## Long-Term\n\n## Medium-Term\n\n## Operating Principles\n"},
+        weekly_state: {label: "This week", description: "Priorities, carryover, constraints, and execution focus.", skeleton: "# Weekly State\n\n## This Week\n\n### Top Priorities\n\n### Carryover\n\n### Constraints\n\n### Execution Focus\n"},
+        decision_log: {label: "Memory", description: "Rolling context and recent decisions.", skeleton: "# Decision Log\n\n## Current Rolling Context\n\n## Recent Decisions (Appended Daily)\n"},
+      };
+      const wideScreen = window.matchMedia("(min-width: 900px)");
+      const encoder = new TextEncoder();
+      let active = "goals";
+      let mode = "edit";
+      let busy = false;
+      let expired = false;
+      let historyOpen = false;
+      let selectedVersion = null;
+      let maxBytes = 256 * 1024;
+      let previewTimer;
+      const current = () => documents.get(active);
+      const dirty = (entry) => entry.draft !== entry.content;
+      const hasDrafts = () => [...documents.values()].some((entry) => dirty(entry) || entry.pending);
+
+      function notify(message = "", kind = "info") {
+        byId("notice").hidden = !message;
+        byId("notice").dataset.kind = kind;
+        byId("notice-text").textContent = message;
+      }
+
+      function preview(text, target) {
+        if (!window.marked || !window.DOMPurify) {
+          target.textContent = text;
+          target.style.whiteSpace = "pre-wrap";
+          return false;
+        }
+        // Preview text cannot load remote media, submit forms, or execute HTML.
+        const fragment = DOMPurify.sanitize(marked.parse(text), {
+          RETURN_DOM_FRAGMENT: true,
+          ALLOWED_TAGS: ["p", "br", "hr", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "strong", "em", "del", "blockquote", "pre", "code", "a", "table", "thead", "tbody", "tr", "th", "td"],
+          ALLOWED_ATTR: ["href", "title", "start"],
+          ALLOW_DATA_ATTR: false,
+        });
+        for (const link of fragment.querySelectorAll("a")) {
+          if (!/^https?:\/\//i.test(link.getAttribute("href") || "")) link.removeAttribute("href");
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+        }
+        target.style.whiteSpace = "normal";
+        target.replaceChildren(fragment);
+        return true;
+      }
+
+      async function api(path, body) {
+        if (!telegram?.initData || expired) {
+          const error = new Error("Copy any draft you need, then reopen the editor from David in Telegram.");
+          error.status = 401;
+          throw error;
+        }
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 30000);
+        try {
+          const response = await fetch(path, {
+            method: body ? "POST" : "GET",
+            headers: {Authorization: `tma ${telegram.initData}`, ...(body ? {"Content-Type": "application/json"} : {})},
+            body: body ? JSON.stringify(body) : undefined,
+            credentials: "omit", cache: "no-store", redirect: "error", signal: controller.signal,
+          });
+          const data = await response.json();
+          if (!response.ok) {
+            const error = new Error(data.message || "The editor could not complete this request.");
+            error.status = response.status;
+            error.data = data;
+            if (response.status === 401) expired = true;
+            throw error;
+          }
+          return data;
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+
+      function errorMessage(error) {
+        if (error.status === 401 && !documents.size) return "Open this editor from David in Telegram.";
+        if (error.status === 401) return "Your session is unavailable. Copy your draft, then reopen the editor from Telegram.";
+        return error.status ? error.message : "Could not reach David. Your draft is still here. Try again when connected.";
+      }
+
+      function render() {
+        const entry = current();
+        const loaded = Boolean(entry);
+        for (const tab of document.querySelectorAll("[data-document]")) {
+          tab.disabled = !loaded || busy;
+          tab.setAttribute("aria-pressed", String(tab.dataset.document === active));
+        }
+        byId("loading").hidden = loaded || !busy;
+        byId("editor-view").hidden = !loaded || historyOpen;
+        byId("history-view").hidden = !loaded || !historyOpen;
+        byId("footer").hidden = !loaded;
+        byId("retry-load").disabled = busy || expired;
+        if (!entry) return;
+        byId("document-title").textContent = definitions[active].label;
+        byId("document-description").textContent = definitions[active].description;
+        byId("editor").readOnly = busy || Boolean(entry.pending);
+        byId("edit-pane").hidden = !wideScreen.matches && mode !== "edit";
+        byId("preview-pane").hidden = !wideScreen.matches && mode !== "preview";
+        byId("edit-mode").setAttribute("aria-pressed", String(mode === "edit"));
+        byId("preview-mode").setAttribute("aria-pressed", String(mode === "preview"));
+        byId("conflict").hidden = !entry.conflict;
+        if (entry.conflict) byId("current-text").textContent = entry.conflict.content;
+        const bytes = encoder.encode(entry.draft).length;
+        byId("document-size").textContent = `${Math.ceil(bytes / 1024)} / ${Math.ceil(maxBytes / 1024)} KB`;
+        byId("save-state").textContent = entry.pending ? "Save awaiting confirmation" : dirty(entry) ? "Unsaved changes" : "No unsaved changes";
+        byId("save-state").style.color = bytes > maxBytes ? "var(--danger)" : "inherit";
+        byId("save").textContent = entry.pending ? (entry.pending.restoring ? (busy ? "Restoring…" : "Retry restore") : (busy ? "Saving…" : "Retry save")) : historyOpen ? "Restore" : "Save";
+        byId("save").disabled = busy || expired || Boolean(entry.conflict) || (!entry.pending && (historyOpen ? !selectedVersion : !dirty(entry) || !entry.draft.trim() || bytes > maxBytes));
+        byId("cancel").disabled = busy || expired || (!dirty(entry) && !entry.pending && !entry.conflict);
+        for (const id of ["history-button", "keep-draft", "load-current", "version-select", "back-editor"]) byId(id).disabled = busy;
+        byId("history-button").disabled ||= expired || Boolean(entry.pending);
+        byId("version-select").disabled ||= Boolean(entry.pending);
+        if (telegram?.isVersionAtLeast?.("6.2")) {
+          if (hasDrafts()) telegram.enableClosingConfirmation();
+          else telegram.disableClosingConfirmation();
+        }
+      }
+
+      function showDocument() {
+        if (!current()) { render(); return; }
+        byId("editor").value = current().draft;
+        byId("preview-note").hidden = preview(current().draft, byId("preview"));
+        byId("preview-note").textContent = "Preview could not load. You can still edit and save Markdown.";
+        render();
+      }
+
+      function confirmChange(message, action) {
+        const dialog = byId("confirm-dialog");
+        byId("confirm-text").textContent = message;
+        byId("confirm-action").textContent = action;
+        dialog.returnValue = "cancel";
+        return new Promise((resolve) => {
+          dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), {once: true});
+          dialog.showModal();
+        });
+      }
+
+      async function loadDocuments() {
+        busy = true;
+        notify();
+        byId("retry-load").hidden = true;
+        render();
+        try {
+          const data = await api("/api/context");
+          if (!data.documents?.length) throw new Error("Context response was empty.");
+          maxBytes = data.max_document_bytes;
+          for (const entry of data.documents) {
+            if (definitions[entry.artifact_type]) documents.set(entry.artifact_type, {...entry, draft: entry.exists ? entry.content : definitions[entry.artifact_type].skeleton, pending: null, conflict: null});
+          }
+          showDocument();
+        } catch (error) {
+          notify(errorMessage(error), "error");
+          byId("retry-load").hidden = expired || !telegram?.initData;
+        } finally {
+          busy = false;
+          render();
+        }
+      }
+
+      async function write() {
+        const entry = current();
+        if (busy || expired || entry.conflict) return;
+        if (!entry.pending && historyOpen) {
+          if (!selectedVersion) return;
+          const message = `Restore this version of ${definitions[active].label}? The current saved text will be backed up.${dirty(entry) ? " Your unsaved draft will be replaced after the restore succeeds." : ""}`;
+          if (!await confirmChange(message, "Restore version")) return;
+        }
+        // Retain the confirmed operation across timeouts and storage failures;
+        // retries must never invent a new ID or capture a newer base revision.
+        entry.pending ||= {
+          restoring: historyOpen,
+          content: historyOpen ? selectedVersion.document.content : entry.draft,
+          body: {
+            operation_id: crypto.randomUUID(), expected_revision: entry.revision,
+            ...(historyOpen ? {version_id: selectedVersion.version_id} : {content: entry.draft}),
+          },
+        };
+        busy = true;
+        notify(entry.pending.restoring ? "Restoring version…" : "Saving…");
+        render();
+        try {
+          const result = await api(`/api/context/${active}${entry.pending.restoring ? "/restore" : ""}`, entry.pending.body);
+          if (typeof result.document?.revision !== "string" || typeof result.saved_revision !== "string") throw new Error("Save confirmation was incomplete.");
+          const restored = entry.pending.restoring;
+          const confirmedContent = entry.pending.content;
+          entry.pending = null;
+          if (result.document.revision !== result.saved_revision) {
+            entry.draft = confirmedContent;
+            entry.conflict = result.document;
+            notify("Your save completed, then a newer edit arrived. Review the current text before continuing.", "error");
+          } else {
+            Object.assign(entry, result.document, {draft: result.document.content, conflict: null});
+            notify(restored ? "Previous version restored. The replaced text is in History." : "Saved. David will use this context.");
+          }
+          historyOpen = false;
+          selectedVersion = null;
+          showDocument();
+        } catch (error) {
+          if (error.status >= 400 && error.status < 500) {
+            entry.pending = null;
+            if (error.data?.current) entry.conflict = error.data.current;
+          }
+          notify(errorMessage(error) + (entry.pending ? " Use Retry to check this save before changing the draft." : ""), "error");
+          if (entry.conflict) historyOpen = false;
+        } finally {
+          busy = false;
+          render();
+        }
+      }
+
+      async function loadVersion() {
+        const versionId = byId("version-select").value;
+        selectedVersion = null;
+        byId("version-preview").hidden = true;
+        if (!versionId) { render(); return; }
+        busy = true;
+        byId("history-status").textContent = "Loading this version…";
+        render();
+        try {
+          selectedVersion = await api(`/api/context/${active}/versions/${encodeURIComponent(versionId)}`);
+          preview(selectedVersion.document.content, byId("history-preview"));
+          byId("history-text").textContent = selectedVersion.document.content;
+          byId("version-preview").hidden = false;
+          byId("history-status").textContent = "Preview only. Restore will replace the current saved text.";
+        } catch (error) {
+          notify(errorMessage(error), "error");
+          byId("history-status").textContent = "This version could not be loaded. Your saved context is unchanged.";
+        } finally {
+          busy = false;
+          render();
+        }
+      }
+
+      async function openHistory() {
+        if (busy || current().pending) return;
+        historyOpen = true;
+        selectedVersion = null;
+        busy = true;
+        notify();
+        byId("history-title").textContent = `${definitions[active].label} history`;
+        byId("history-status").textContent = "Loading previous versions…";
+        byId("version-preview").hidden = true;
+        byId("version-label").hidden = true;
+        byId("version-select").hidden = true;
+        render();
+        try {
+          const result = await api(`/api/context/${active}/versions`);
+          const select = byId("version-select");
+          select.replaceChildren(new Option("Choose a version", ""));
+          const formatter = new Intl.DateTimeFormat(undefined, {dateStyle: "medium", timeStyle: "medium"});
+          result.versions.forEach((version, index) => select.add(new Option(`${formatter.format(new Date(version.saved_at))}${index === 0 ? " · Latest backup" : ""}`, version.version_id)));
+          const empty = !result.versions.length;
+          byId("version-label").hidden = empty;
+          select.hidden = empty;
+          byId("history-status").textContent = empty ? "No previous versions yet. Saving a change backs up the text it replaces." : "Choose a saved version to preview.";
+        } catch (error) {
+          notify(errorMessage(error), "error");
+          byId("history-status").textContent = "History could not be loaded. Return to the editor and try again.";
+        } finally {
+          busy = false;
+          render();
+        }
+      }
+
+      byId("editor").addEventListener("input", () => {
+        const entry = current();
+        // Textareas normalize newlines. Keep CRLF for documents that use it consistently.
+        const crlf = entry.content.includes("\r\n") && !entry.content.replaceAll("\r\n", "").includes("\n");
+        entry.draft = crlf ? byId("editor").value.replaceAll("\n", "\r\n") : byId("editor").value;
+        if (!entry.conflict) notify();
+        const size = encoder.encode(entry.draft).length;
+        if (size > maxBytes) notify(`This draft exceeds ${Math.ceil(maxBytes / 1024)} KB. Shorten it before saving.`, "error");
+        clearTimeout(previewTimer);
+        if (wideScreen.matches) previewTimer = setTimeout(() => {
+          byId("preview-note").hidden = preview(current().draft, byId("preview"));
+        }, 150);
+        render();
+      });
+      for (const tab of document.querySelectorAll("[data-document]")) tab.addEventListener("click", () => {
+        active = tab.dataset.document;
+        historyOpen = false;
+        selectedVersion = null;
+        notify(current().pending ? "This document has an unfinished save. Use Retry to check it." : "");
+        showDocument();
+        byId("editor").scrollTop = 0;
+      });
+      byId("edit-mode").addEventListener("click", () => { mode = "edit"; render(); });
+      byId("preview-mode").addEventListener("click", () => { mode = "preview"; showDocument(); });
+      byId("save").addEventListener("click", write);
+      byId("retry-load").addEventListener("click", loadDocuments);
+      byId("history-button").addEventListener("click", openHistory);
+      byId("version-select").addEventListener("change", loadVersion);
+      byId("back-editor").addEventListener("click", () => { historyOpen = false; showDocument(); });
+      byId("keep-draft").addEventListener("click", () => {
+        const entry = current();
+        Object.assign(entry, entry.conflict, {conflict: null, pending: null});
+        notify("Review your draft, then Save to replace the current text.");
+        showDocument();
+      });
+      byId("load-current").addEventListener("click", async () => {
+        if (!await confirmChange("Discard your draft and load the current saved text?", "Load current text")) return;
+        const entry = current();
+        Object.assign(entry, entry.conflict, {draft: entry.conflict.content, conflict: null, pending: null});
+        notify("Current saved text loaded.");
+        showDocument();
+      });
+      byId("cancel").addEventListener("click", async () => {
+        const message = "Discard this draft and reload the saved context?" + (current().pending ? " A save already submitted may have completed." : "");
+        if (!await confirmChange(message, "Discard draft")) return;
+        busy = true;
+        render();
+        try {
+          const result = await api(`/api/context/${active}`);
+          Object.assign(current(), result.document, {draft: result.document.content, conflict: null, pending: null});
+          historyOpen = false;
+          notify("Saved context loaded.");
+          showDocument();
+        } catch (error) { notify(errorMessage(error), "error"); }
+        finally { busy = false; render(); }
+      });
+      byId("copy").addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(current().draft);
+          notify(expired ? "Draft copied. Reopen the editor from Telegram to continue." : "Draft copied.");
+        } catch {
+          historyOpen = false;
+          mode = "edit";
+          showDocument();
+          byId("editor").focus();
+          byId("editor").select();
+          notify("Text selected. Use your device’s Copy action to keep this draft.");
+        }
+      });
+      wideScreen.addEventListener("change", showDocument);
+      // Reserve the footer's actual height, including Telegram's safe-area insets.
+      new ResizeObserver(() => {
+        document.body.style.paddingBottom = `${byId("footer").getBoundingClientRect().height}px`;
+      }).observe(byId("footer"));
+      window.addEventListener("beforeunload", (event) => { if (hasDrafts()) { event.preventDefault(); event.returnValue = ""; } });
+      function applyTheme() {
+        document.documentElement.dataset.theme = telegram?.colorScheme || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      }
+      applyTheme();
+      if (telegram) {
+        telegram.ready();
+        telegram.expand();
+        telegram.onEvent("themeChanged", applyTheme);
+      }
+      loadDocuments();
+    });
+  </script>
+</body>
+</html>

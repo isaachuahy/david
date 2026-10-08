@@ -61,7 +61,7 @@ You need:
 ```bash
 git clone https://github.com/isaachuahy/david.git
 cd david
-uv sync
+uv sync --locked
 ```
 
 ### 3. Configure environment
@@ -126,6 +126,17 @@ The [routing benchmarks](./evals/README.md) are exploratory comparisons. Product
 uses its own prompt and application state, without experimental endpoint pins or
 price caps. Benchmark accuracy does not establish end-to-end production reliability.
 
+### Editing persistent context
+
+Send `/edit_context` in a private chat with David to open the Telegram Mini App.
+It provides Markdown editing and preview for Goals, This week, and Memory, plus
+previous versions and restore. Changes apply only when you save; newer edits
+produce a comparison before replacement. `/context` remains the usage command.
+
+The editor is disabled until `DAVID_CONTEXT_EDITOR_URL` names its public HTTPS
+address. Follow the [Lightsail HTTPS setup](ops/david/README.md#telegram-context-editor-over-https)
+to enable it. Context stays on the VPS, with Backblaze providing daily backups.
+
 ### 4. Add Google auth files
 
 Place your Google OAuth client credentials at the configured path, commonly:
@@ -151,7 +162,7 @@ David can boot without them, but the system is materially better when they are m
 ### 6. Run the bot
 
 ```bash
-uv run python main.py
+uv run --locked python main.py
 ```
 
 On successful startup, David will:

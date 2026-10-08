@@ -193,8 +193,16 @@ def test_gemini_thinking_counts_and_input_limit_are_separate():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("previous_session", [False, True])
-async def test_context_shows_standalone_review_usage(previous_session):
+async def test_context_shows_standalone_review_usage(previous_session, tmp_path, monkeypatch):
     """A real review call must reach /context even when no chat session owns it."""
+    context_dir = tmp_path / "context"
+    context_dir.mkdir()
+    monkeypatch.setenv("DAVID_CONTEXT_DIR", str(context_dir))
+    monkeypatch.setenv("DAVID_DB_PATH", str(tmp_path / "assistant.db"))
+    for filename in ("goals.md", "weekly_state.md", "decision_log.md"):
+        # Keep the review's real snapshot reads isolated from live context.
+        (context_dir / filename).write_text("# Context", encoding="utf-8")
+
     update = MagicMock()
     update.effective_user.id = 123
     update.effective_chat.id = 456
@@ -214,15 +222,14 @@ async def test_context_shows_standalone_review_usage(previous_session):
     previous_summary = deepcopy(context.user_data.get("last_session_usage"))
 
     with (
-        patch("orchestrator.review_manager._read_context_markdown", return_value="# Context"),
         patch("orchestrator.review_manager.get_past_events", return_value=[]),
         patch("orchestrator.review_manager.get_upcoming_events", return_value=[]),
         patch("orchestrator.review_manager.save_review_workflow_sync"),
         patch("orchestrator.review_manager.genai.Client") as client,
         patch("bot.handlers.send_review_stage_gate", new_callable=AsyncMock) as gate,
     ):
-        # Keep command routing, worker-thread generation, and usage attribution
-        # real; replace only external provider, persistence, and Telegram I/O.
+        # Keep command routing, snapshot reads, worker-thread generation, and usage
+        # attribution real; replace provider, review persistence, and Telegram I/O.
         client.return_value.models.generate_content.return_value = SimpleNamespace(
             parsed=WeekReviewResponse(summary="Review ready."),
             usage_metadata=SimpleNamespace(

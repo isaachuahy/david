@@ -14,6 +14,7 @@ from integrations.calendar import get_past_events, get_upcoming_events
 from orchestrator.artifact_writes import execute_artifact_replacement
 from orchestrator.review_artifacts import get_effective_artifact_content
 from orchestrator.time_utils import format_calendar_event_window
+from persistence.context_files import read_context_file
 from persistence.models import (
     ArtifactChangeSummary,
     ArtifactType,
@@ -42,7 +43,7 @@ from reasoning.schemas import (
     WeekReviewResponse,
     WeeklyPlanResponse,
 )
-from runtime_paths import get_context_dir, get_prompt_path
+from runtime_paths import get_prompt_path
 
 
 REVIEW_SYSTEM_INSTRUCTION = (
@@ -114,20 +115,6 @@ _DECISION_LOG_OPTIONAL_PLACEHOLDER_BULLETS = {
 def _utc_now_iso() -> str:
     """Returns a timezone-aware UTC timestamp for durable workflow records."""
     return datetime.now(timezone.utc).isoformat()
-
-
-def _read_context_markdown(filename: str) -> str:
-    """
-    Reads one context markdown file from disk.
-
-    Missing files are treated as empty strings so a review can still be
-    initialized during partial migrations or early setup.
-    """
-    path = get_context_dir() / filename
-    if not path.exists():
-        logger.warning("Context file {} was missing while building a review snapshot.", filename)
-        return ""
-    return path.read_text(encoding="utf-8").strip()
 
 
 def _format_snapshot_event_lines(events: list[dict]) -> list[str]:
@@ -898,27 +885,40 @@ async def build_review_source_snapshot() -> SourceSnapshot:
 
     The snapshot is captured once at review creation time so the multi-stage
     review can recover from process failures without re-reading a drifting
-    working set from disk on every resume.
+    working set from disk on every resume. Each document and its revision
+    come from one protected read so later confirmations can detect changes.
     """
     try:
         (
-            goals_markdown,
-            weekly_state_markdown,
-            decision_log_markdown,
+            goals,
+            weekly_state,
+            decision_log,
             past_events_raw,
             upcoming_events_raw,
         ) = await asyncio.gather(
-            asyncio.to_thread(_read_context_markdown, "goals.md"),
-            asyncio.to_thread(_read_context_markdown, "weekly_state.md"),
-            asyncio.to_thread(_read_context_markdown, "decision_log.md"),
+            asyncio.to_thread(read_context_file, ArtifactType.GOALS),
+            asyncio.to_thread(read_context_file, ArtifactType.WEEKLY_STATE),
+            asyncio.to_thread(read_context_file, ArtifactType.DECISION_LOG),
             asyncio.to_thread(get_past_events, days=7),
             asyncio.to_thread(get_upcoming_events, days=7),
         )
 
+        for document in (goals, weekly_state, decision_log):
+            # Missing context stays usable during initial setup. Its "missing"
+            # revision lets confirmation detect a file created after this read.
+            if not document.exists:
+                logger.warning(
+                    "Context file {}.md was missing while building a review snapshot.",
+                    document.artifact_type.value,
+                )
+
         return SourceSnapshot(
-            goals_markdown=goals_markdown,
-            weekly_state_markdown=weekly_state_markdown,
-            decision_log_markdown=decision_log_markdown,
+            goals_markdown=goals.content,
+            weekly_state_markdown=weekly_state.content,
+            decision_log_markdown=decision_log.content,
+            goals_revision=goals.revision,
+            weekly_state_revision=weekly_state.revision,
+            decision_log_revision=decision_log.revision,
             past_week_events=_format_snapshot_event_lines(past_events_raw or []),
             upcoming_events=_format_snapshot_event_lines(upcoming_events_raw or []),
         )

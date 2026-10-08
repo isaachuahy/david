@@ -2,8 +2,9 @@ import asyncio
 from functools import wraps
 from datetime import date, datetime, timedelta
 from loguru import logger
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 from telegram.ext import ContextTypes
+from telegram.helpers import escape_markdown
 
 from integrations.calendar import get_events_for_local_day
 from orchestrator.router import process_message
@@ -58,6 +59,7 @@ from bot.review_flow import (
     ACTIVE_REVIEW_RESUME_PROMPT_KEY,
     ACTIVE_REVIEW_STAGE_CONFIRMATION_KEY,
     ACTIVE_REVIEW_WORKFLOW_ID_KEY,
+    ReviewContextConflictError,
     advance_review_after_confirmed_stage,
     apply_confirmed_review_stage_artifacts,
     append_review_gate_status,
@@ -205,6 +207,25 @@ async def context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @authorized_only
+async def edit_context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Open the configured context Mini App for the authorized user's private chat."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Open a private chat with David and send /edit_context.")
+        return
+    url = context.bot_data.get("context_editor_url")
+    if not url:
+        await update.message.reply_text("The context editor is not configured yet.")
+        return
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(
+        "Edit context", web_app=WebAppInfo(url=url),
+    )]])
+    await update.message.reply_text(
+        "Edit your goals, this week's plan, and memory. Changes apply when you save.",
+        reply_markup=keyboard,
+    )
+
+
+@authorized_only
 async def test_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Temporary command to test the trigger queue."""
     trigger_type = context.args[0] if context.args else "daily_checkin"
@@ -328,12 +349,28 @@ async def _handle_artifact_write_retry(
 
     These retries are operational recovery for confirmed markdown changes; they
     replay stored content and should not rerun the model or mutate proposals.
+    Terminal conflicts require a fresh review instead of another retry button.
     """
     query = update.callback_query
     write_id = query.data.split("retry_artifact_write_")[1]
     executed_write = retry_artifact_write(write_id)
     if executed_write is None:
         await query.edit_message_text("❌ *This retry is no longer available.*", parse_mode="Markdown")
+        return
+
+    if executed_write.status == ArtifactWriteStatus.FAILED_TERMINAL:
+        # A retry may discover context changed after an earlier storage failure.
+        # Retire the retry control while keeping the durable review stage paused.
+        context.user_data.pop(ACTIVE_ARTIFACT_WRITE_RETRY_KEY, None)
+        await query.edit_message_text(
+            "⚠️ *This context update needs a new review.*\n\n"
+            + escape_markdown(
+                "Start a new review with /weekly_review to use the latest context.",
+                version=1,
+            ),
+            reply_markup=None,
+            parse_mode="Markdown",
+        )
         return
 
     if executed_write.status != ArtifactWriteStatus.EXECUTED:
@@ -385,7 +422,8 @@ async def _handle_review_stage_confirm(
 
     Artifact-producing stages must execute their confirmed markdown writes
     before downstream stages run, otherwise later prompts could read stale
-    decision-log or weekly-state context.
+    decision-log or weekly-state context. A context conflict retires the gate's
+    buttons and asks for a fresh review without advancing the saved workflow.
     """
     query = update.callback_query
     stage = ReviewStage(query.data.split("confirm_review_stage_")[1])
@@ -400,7 +438,30 @@ async def _handle_review_stage_confirm(
         await query.edit_message_text("❌ *This review stage is no longer available.*", parse_mode="Markdown")
         return
 
-    artifacts_applied = await apply_confirmed_review_stage_artifacts(context, stage, record)
+    try:
+        artifacts_applied = await apply_confirmed_review_stage_artifacts(context, stage, record)
+    except ReviewContextConflictError as error:
+        # Outdated or unknown source revisions cannot be repaired by replaying
+        # the write. Preserve the visible proposal and remove its controls.
+        context.user_data.pop(ACTIVE_ARTIFACT_WRITE_RETRY_KEY, None)
+        status_text = "⚠️ *The review remains paused.*\n\n" + escape_markdown(str(error), version=1)
+        status_appended = False
+        if isinstance(active_confirmation, dict):
+            status_appended = await append_review_gate_status(
+                context,
+                query.message.chat_id,
+                active_confirmation,
+                status_text,
+                reply_markup=None,
+            )
+        if not status_appended:
+            await query.edit_message_text(
+                status_text,
+                reply_markup=None,
+                parse_mode="Markdown",
+            )
+        return
+
     if not artifacts_applied:
         retry_state = context.user_data.get(ACTIVE_ARTIFACT_WRITE_RETRY_KEY)
         retry_write_id = (

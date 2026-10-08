@@ -1,8 +1,70 @@
 import asyncio
 from pathlib import Path
-from unittest.mock import ANY, MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
+
+import aiohttp
+import pytest
 
 import main
+
+
+@pytest.mark.asyncio
+async def test_editor_lifecycle_disabled():
+    application = SimpleNamespace(bot_data={"config": SimpleNamespace(context_editor_url=None)})
+    with patch("main.invalidate_restart_volatile_user_data", new_callable=AsyncMock) as reset:
+        with patch("main.web.AppRunner") as runner:
+            await main._post_init(application)
+            await main._post_shutdown(application)
+    reset.assert_awaited_once_with(application)
+    runner.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_editor_lifecycle_serves_page_then_closes(unused_tcp_port):
+    application = SimpleNamespace(bot_data={"config": SimpleNamespace(
+        context_editor_url="https://context.example.com/context",
+        context_editor_port=unused_tcp_port, telegram_bot_token="test-token", allowed_user_id=123,
+    )})
+    with patch("main.invalidate_restart_volatile_user_data", new_callable=AsyncMock) as reset:
+        await main._post_init(application)
+    reset.assert_awaited_once_with(application)
+    try:
+        async with aiohttp.ClientSession() as client:
+            async with client.get(f"http://127.0.0.1:{unused_tcp_port}/context") as response:
+                assert response.status == 200
+                assert "telegram-web-app.js" in await response.text()
+            async with client.get(f"http://127.0.0.1:{unused_tcp_port}/api/context") as response:
+                assert response.status == 401
+        assert application.bot_data["context_editor_url"] == "https://context.example.com/context"
+    finally:
+        await main._post_shutdown(application)
+    await main._post_shutdown(application)
+    assert "context_editor_runner" not in application.bot_data
+    assert "context_editor_url" not in application.bot_data
+    async with aiohttp.ClientSession() as client:
+        with pytest.raises(aiohttp.ClientConnectorError):
+            await client.get(f"http://127.0.0.1:{unused_tcp_port}/context")
+
+
+@pytest.mark.asyncio
+async def test_editor_bind_failure_cleans_up():
+    application = SimpleNamespace(bot_data={"config": SimpleNamespace(
+        context_editor_url="https://context.example.com/context",
+        context_editor_port=8080, telegram_bot_token="test-token", allowed_user_id=123,
+    )})
+    runner = SimpleNamespace(setup=AsyncMock(), cleanup=AsyncMock())
+    site = SimpleNamespace(start=AsyncMock(side_effect=OSError("port occupied")))
+    with patch("main.invalidate_restart_volatile_user_data", new_callable=AsyncMock):
+        with patch("main.web.AppRunner", return_value=runner) as factory:
+            with patch("main.web.TCPSite", return_value=site) as bind:
+                with pytest.raises(OSError, match="port occupied"):
+                    await main._post_init(application)
+    assert factory.call_args.kwargs["access_log"] is None
+    bind.assert_called_once_with(runner, "127.0.0.1", 8080)
+    runner.cleanup.assert_awaited_once()
+    assert "context_editor_runner" not in application.bot_data
+    assert "context_editor_url" not in application.bot_data
 from persistence.models import (
     ReviewStage,
     ReviewWorkflowRecord,
@@ -92,6 +154,8 @@ def test_main_initializes_db_and_reconciles_sessions_before_polling(
         db_path=Path("/tmp/assistant.db"),
         google_token_path=Path("/tmp/token.json"),
         google_credentials_path=Path("/tmp/credentials.json"),
+        context_editor_url=None,
+        context_editor_port=8080,
     )
 
     app = MagicMock()
@@ -101,6 +165,7 @@ def test_main_initializes_db_and_reconciles_sessions_before_polling(
     builder.token.return_value = builder
     builder.persistence.return_value = builder
     builder.post_init.return_value = builder
+    builder.post_shutdown.return_value = builder
     builder.build.return_value = app
 
     assert main.main() == 0
@@ -122,7 +187,11 @@ def test_main_initializes_db_and_reconciles_sessions_before_polling(
     )
     builder.token.assert_called_once_with("token")
     builder.persistence.assert_called_once_with(mock_pickle_persistence.return_value)
-    builder.post_init.assert_called_once_with(main.invalidate_restart_volatile_user_data)
+    builder.post_init.assert_called_once_with(main._post_init)
+    builder.post_shutdown.assert_called_once_with(main._post_shutdown)
+    assert app.bot_data["config"] is mock_load_config.return_value
+    commands = {handler.args[0].callback for handler in app.add_handler.call_args_list}
+    assert main.edit_context_command in commands
     assert app.bot_data["allowed_user_id"] == 123
     mock_setup_scheduler.assert_called_once_with(app, 123)
     app.job_queue.run_once.assert_not_called()
@@ -160,6 +229,8 @@ def test_main_schedules_resume_prompt_for_latest_resumable_review(
         db_path=Path("/tmp/assistant.db"),
         google_token_path=Path("/tmp/token.json"),
         google_credentials_path=Path("/tmp/credentials.json"),
+        context_editor_url=None,
+        context_editor_port=8080,
     )
     older_review = ReviewWorkflowRecord(
         id="review_old",
@@ -189,6 +260,7 @@ def test_main_schedules_resume_prompt_for_latest_resumable_review(
     builder.token.return_value = builder
     builder.persistence.return_value = builder
     builder.post_init.return_value = builder
+    builder.post_shutdown.return_value = builder
     builder.build.return_value = app
 
     assert main.main() == 0

@@ -1,9 +1,11 @@
 import asyncio
 import httpcore
 import httpx
+from aiohttp import web
 from loguru import logger
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
@@ -27,8 +29,9 @@ from orchestrator.session_manager import (
 )
 from persistence.database import get_telegram_persistence_path, init_db
 from config import ConfigError, load_config
+from bot.context_editor_server import create_context_editor_app
 from bot.handlers import (
-    start, done_command, context_command, test_trigger, test_schedule,
+    start, done_command, context_command, edit_context_command, test_trigger, test_schedule,
     weekly_review_command,
     handle_confirm, handle_reject, handle_review_resume, handle_start_trigger,
     handle_delay_trigger, handle_clear_trigger_queue,
@@ -38,6 +41,35 @@ from bot.review_flow import (
     select_latest_resumable_review,
     send_review_resume_prompt,
 )
+
+
+async def _post_init(application: Application) -> None:
+    """Reset volatile bot state and start the optional editor on localhost."""
+    await invalidate_restart_volatile_user_data(application)
+    config = application.bot_data["config"]
+    if config.context_editor_url is None:
+        return
+    runner = web.AppRunner(create_context_editor_app(
+        bot_token=config.telegram_bot_token,
+        allowed_user_id=config.allowed_user_id,
+    ), access_log=None)
+    try:
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", config.context_editor_port).start()
+    except BaseException:
+        await runner.cleanup()
+        raise
+    application.bot_data["context_editor_runner"] = runner
+    application.bot_data["context_editor_url"] = config.context_editor_url
+    logger.info("Context editor listening on localhost:{}", config.context_editor_port)
+
+
+async def _post_shutdown(application: Application) -> None:
+    """Close the editor listener after the Telegram application shuts down."""
+    runner = application.bot_data.pop("context_editor_runner", None)
+    application.bot_data.pop("context_editor_url", None)
+    if runner is not None:
+        await runner.cleanup()
 
 
 async def _send_review_resume_prompt_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -152,16 +184,19 @@ def main() -> int:
             ApplicationBuilder()
             .token(config.telegram_bot_token)
             .persistence(persistence)
-            .post_init(invalidate_restart_volatile_user_data)
+            .post_init(_post_init)
+            .post_shutdown(_post_shutdown)
             .build()
         )
         app.bot_data["allowed_user_id"] = config.allowed_user_id
+        app.bot_data["config"] = config
 
         # Restrict the bot to only respond to a specific user for security reasons
         user_filter = filters.User(user_id=config.allowed_user_id)
         app.add_handler(CommandHandler("start", start, filters=user_filter))
         app.add_handler(CommandHandler("done", done_command, filters=user_filter))
         app.add_handler(CommandHandler("context", context_command, filters=user_filter))
+        app.add_handler(CommandHandler("edit_context", edit_context_command, filters=user_filter))
         app.add_handler(CommandHandler("test_trigger", test_trigger, filters=user_filter))
         app.add_handler(CommandHandler("test_schedule", test_schedule, filters=user_filter))
         app.add_handler(CommandHandler("weekly_review", weekly_review_command, filters=user_filter))

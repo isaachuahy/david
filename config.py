@@ -2,6 +2,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -27,6 +28,8 @@ class AppConfig:
     db_path: Path
     google_token_path: Path
     google_credentials_path: Path
+    context_editor_url: str | None = None
+    context_editor_port: int = 8080
 
 
 def _get_env(name: str) -> str | None:
@@ -154,6 +157,32 @@ def _validate_google_auth_paths(token_path: Path, credentials_path: Path) -> Non
     )
 
 
+def _load_context_editor_settings() -> tuple[str | None, int]:
+    url = _get_env("DAVID_CONTEXT_EDITOR_URL")
+    if url is None:
+        return None, 8080
+    message = "DAVID_CONTEXT_EDITOR_URL must be an HTTPS URL ending in /context, without credentials, query, or fragment."
+    try:
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme != "https" or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path != "/context" or parsed.query or parsed.fragment
+            or parsed.port not in {None, 443}
+            or any(character.isspace() for character in url)
+        ):
+            raise ValueError
+    except ValueError:
+        raise ConfigError(message) from None
+    try:
+        port = int(_get_env("DAVID_CONTEXT_EDITOR_PORT") or "8080")
+    except ValueError:
+        raise ConfigError("DAVID_CONTEXT_EDITOR_PORT must be an integer from 1024 to 65535.") from None
+    if not 1024 <= port <= 65535:
+        raise ConfigError("DAVID_CONTEXT_EDITOR_PORT must be an integer from 1024 to 65535.")
+    return url, port
+
+
 def load_config() -> AppConfig:
     """Loads and validates the runtime configuration required to boot David."""
     telegram_bot_token = _require_env(
@@ -174,6 +203,7 @@ def load_config() -> AppConfig:
     google_credentials_path = get_google_credentials_path()
 
     _validate_google_auth_paths(google_token_path, google_credentials_path)
+    context_editor_url, context_editor_port = _load_context_editor_settings()
 
     return AppConfig(
         telegram_bot_token=telegram_bot_token,
@@ -182,4 +212,6 @@ def load_config() -> AppConfig:
         db_path=db_path,
         google_token_path=google_token_path,
         google_credentials_path=google_credentials_path,
+        context_editor_url=context_editor_url,
+        context_editor_port=context_editor_port,
     )
