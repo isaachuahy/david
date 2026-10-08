@@ -154,11 +154,19 @@ class ArtifactWriteRecord(BaseModel):
     Review stages and future manual-edit flows should create one of these only
     after user confirmation. The workflow advances after execution succeeds;
     failures keep the operation retryable without rerunning the LLM.
+    The expected revision preserves the proposal's original base across retries
+    so a later write cannot silently replace newer context.
     """
 
     id: str
     artifact_type: ArtifactType
     content: str
+    # Legacy writes have no recorded base. Omit the absent field so they remain
+    # writable before the database gains its expected_revision column.
+    expected_revision: Optional[str] = Field(
+        default=None,
+        exclude_if=lambda revision: revision is None,
+    )
     status: ArtifactWriteStatus = ArtifactWriteStatus.PENDING
     source_type: ArtifactWriteSourceType
     source_id: Optional[str] = None
@@ -213,12 +221,19 @@ class SourceSnapshot(BaseModel):
 
     Storing one shared snapshot avoids copying the same source materials into
     each stage checkpoint while still giving later stages a stable baseline
-    for reasoning and recovery.
+    for reasoning and recovery. Document revisions preserve that baseline
+    for write checks when a review proposal is confirmed later.
     """
 
     goals_markdown: str
     weekly_state_markdown: str
     decision_log_markdown: str
+    # Capture each revision with its document read. Legacy snapshots lack this
+    # information: None means unknown, while "missing" means no file existed.
+    # Do not infer revisions from Markdown that an older reader may have trimmed.
+    goals_revision: Optional[str] = None
+    weekly_state_revision: Optional[str] = None
+    decision_log_revision: Optional[str] = None
     past_week_events: list[str] = Field(default_factory=list)
     upcoming_events: list[str] = Field(default_factory=list)
 

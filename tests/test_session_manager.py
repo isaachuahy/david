@@ -1,9 +1,13 @@
-import pytest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from orchestrator.session_manager import (
     SESSION_INACTIVITY_TIMEOUT,
     SESSION_READY_MESSAGE,
+    append_to_decision_log,
     invalidate_restart_volatile_user_data,
     get_session_timeout_job_name,
     timeout_inactive_session,
@@ -12,7 +16,92 @@ from orchestrator.session_manager import (
     end_session,
     reconcile_orphaned_sessions,
 )
-from persistence.models import SessionStatus
+from persistence.context_files import (
+    ContextConflictError,
+    list_context_versions,
+    read_context_file,
+    read_context_version,
+    replace_context_file,
+)
+from persistence.models import ArtifactType, SessionStatus
+
+
+@pytest.fixture
+def session_context_dir(tmp_path, monkeypatch):
+    """Keep session-note integration tests away from the VPS's live documents."""
+    context_dir = tmp_path / "context"
+    monkeypatch.setenv("DAVID_CONTEXT_DIR", str(context_dir))
+    return context_dir
+
+
+def test_session_append_preserves_memory_and_rejects_stale_editor_save(session_context_dir):
+    base = replace_context_file(
+        ArtifactType.DECISION_LOG,
+        "# Memory\r\n- Earlier decision  \r\n",
+        expected_revision="missing",
+    )
+
+    append_to_decision_log("  ### Session\n- New decision  ")
+
+    current = read_context_file(ArtifactType.DECISION_LOG)
+    assert current.content == base.content + "\n\n### Session\n- New decision\n"
+    [backup] = list_context_versions(ArtifactType.DECISION_LOG)
+    assert read_context_version(ArtifactType.DECISION_LOG, backup.version_id).content == base.content
+    with pytest.raises(ContextConflictError) as conflict:
+        replace_context_file(
+            ArtifactType.DECISION_LOG,
+            "# Memory\n- Older editor draft\n",
+            expected_revision=base.revision,
+        )
+    assert conflict.value.current == current
+    assert read_context_file(ArtifactType.DECISION_LOG) == current
+    assert list_context_versions(ArtifactType.DECISION_LOG) == [backup]
+
+
+def test_concurrent_session_appends_preserve_every_note(session_context_dir):
+    append_to_decision_log("Earlier decision")
+    base = read_context_file(ArtifactType.DECISION_LOG)
+    # Start all workers together to exercise the storage boundary shared by
+    # session synthesis and editor requests, without depending on note order.
+    start = Barrier(4)
+    notes = ["Session one", "Session two", "Session three", "Session four"]
+
+    def append_note(note):
+        """Wait for competing workers before submitting this session's note."""
+        start.wait(timeout=5)
+        append_to_decision_log(note)
+
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        list(workers.map(append_note, notes))
+
+    current = read_context_file(ArtifactType.DECISION_LOG)
+    assert current.content.startswith(base.content)
+    for note in notes:
+        assert current.content.count(f"\n\n{note}\n") == 1
+    assert len(list_context_versions(ArtifactType.DECISION_LOG)) == len(notes)
+
+
+def test_session_append_propagates_storage_failure_without_erasing_memory(session_context_dir):
+    append_to_decision_log("Earlier decision")
+    base = read_context_file(ArtifactType.DECISION_LOG)
+
+    with patch("persistence.context_files.os.replace", side_effect=OSError("disk error")):
+        with pytest.raises(OSError, match="disk error"):
+            append_to_decision_log("Failed session note")
+
+    assert read_context_file(ArtifactType.DECISION_LOG) == base
+    assert not list(session_context_dir.glob(".decision_log.md.*.tmp"))
+
+
+@pytest.mark.parametrize("content", ["", "  ", "\n\t\n"])
+def test_empty_session_note_does_not_change_memory(session_context_dir, content):
+    append_to_decision_log("Earlier decision")
+    base = read_context_file(ArtifactType.DECISION_LOG)
+
+    append_to_decision_log(content)
+
+    assert read_context_file(ArtifactType.DECISION_LOG) == base
+    assert list_context_versions(ArtifactType.DECISION_LOG) == []
 
 
 @patch("orchestrator.session_manager.get_db")

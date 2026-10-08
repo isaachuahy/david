@@ -1,7 +1,9 @@
 from datetime import date, datetime
+import hashlib
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, ANY
 from bot.handlers import (
+    edit_context_command,
     done_command,
     handle_message,
     handle_confirm,
@@ -49,6 +51,200 @@ from persistence.models import (
     StageCheckpoint,
     StageStatus,
 )
+from persistence.context_files import read_context_file, replace_context_file
+from persistence.database import get_db, init_db
+from persistence.review_workflows import load_review_workflow_sync, save_review_workflow_sync
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_id,chat_type,url,expected", [
+    (123, "private", "https://context.example.com/context", "button"),
+    (123, "private", None, "not configured"),
+    (123, "group", "https://context.example.com/context", "private chat"),
+    (999, "private", "https://context.example.com/context", None),
+])
+async def test_edit_context_command_access(user_id, chat_type, url, expected):
+    update = MagicMock()
+    update.effective_user.id = user_id
+    update.effective_chat.type = chat_type
+    update.callback_query = None
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.bot_data = {"allowed_user_id": 123, "context_editor_url": url}
+    context.user_data = {}
+    with patch("bot.handlers.process_message", new_callable=AsyncMock) as router:
+        await edit_context_command(update, context)
+    router.assert_not_awaited()
+    assert context.user_data == {}
+    if expected is None:
+        update.message.reply_text.assert_not_awaited()
+        return
+    update.message.reply_text.assert_awaited_once()
+    reply = update.message.reply_text.await_args
+    if expected == "button":
+        button = reply.kwargs["reply_markup"].inline_keyboard[0][0]
+        assert button.web_app.url == url
+        assert button.text == "Edit context"
+    else:
+        assert expected in reply.args[0]
+        assert "reply_markup" not in reply.kwargs
+
+
+@pytest.fixture(params=list(ArtifactType))
+def review_write_confirmation(request, tmp_path, monkeypatch):
+    """Build an authorized confirmation using disposable context and real SQLite."""
+    monkeypatch.setenv("DAVID_CONTEXT_DIR", str(tmp_path / "context"))
+    monkeypatch.setenv("DAVID_DB_PATH", str(tmp_path / "assistant.db"))
+    monkeypatch.setattr(
+        "orchestrator.artifact_writes.capture_sentry_exception",
+        lambda *args, **kwargs: None,
+    )
+    init_db()
+    artifact_type = request.param
+    stage, changes_field = {
+        ArtifactType.GOALS: (ReviewStage.GOALS_AUDIT, "goals_changes"),
+        ArtifactType.DECISION_LOG: (ReviewStage.MEMORY_AUDIT, "decision_log_changes"),
+        ArtifactType.WEEKLY_STATE: (ReviewStage.WEEKLY_PLAN, "weekly_state_changes"),
+    }[artifact_type]
+    base = replace_context_file(
+        artifact_type, "Original context\n", expected_revision="missing",
+    )
+    snapshot = SourceSnapshot(
+        goals_markdown="", weekly_state_markdown="", decision_log_markdown="",
+    )
+    # Pair this stage's frozen input with its actual revision, as review creation does.
+    setattr(snapshot, f"{artifact_type.value}_markdown", base.content)
+    setattr(snapshot, f"{artifact_type.value}_revision", base.revision)
+    record = ReviewWorkflowRecord(
+        id="review_confirmation",
+        workflow_status=ReviewWorkflowStatus.AWAITING_FEEDBACK,
+        current_stage=stage,
+        stage_status=StageStatus.AWAITING_FEEDBACK,
+        created_at="2026-10-08T00:00:00+00:00",
+        updated_at="2026-10-08T00:00:00+00:00",
+        source_snapshot=snapshot,
+        **{changes_field: ArtifactChangeSummary(proposed_markdown="Confirmed draft\n")},
+    )
+    save_review_workflow_sync(record)
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.callback_query.data = f"confirm_review_stage_{stage.value}"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.message.chat_id = 456
+    context = MagicMock()
+    context.bot_data = {"allowed_user_id": 123}
+    context.user_data = {
+        "active_review_workflow_id": record.id,
+        "active_review_stage_confirmation": {
+            "review_id": record.id,
+            "stage": stage.value,
+            "message_id": 999,
+            "text": "*Original gate*\n\nConfirmed draft",
+        },
+    }
+    context.bot.edit_message_text = AsyncMock()
+    return base, record, update, context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("saved_gate", [True, False])
+async def test_confirm_stale_context_preserves_document_and_pauses_review(
+    review_write_confirmation, saved_gate,
+):
+    """Reject stale drafts while preserving the gate or displaying a fallback notice."""
+    base, record, update, context = review_write_confirmation
+    newer = replace_context_file(
+        base.artifact_type, "New editor context\n", expected_revision=base.revision,
+    )
+    if not saved_gate:
+        context.user_data["active_review_stage_confirmation"].pop("message_id")
+
+    with patch("bot.handlers.advance_review_after_confirmed_stage", new_callable=AsyncMock) as advance:
+        await handle_confirm(update, context)
+
+    advance.assert_not_awaited()
+    assert read_context_file(base.artifact_type) == newer
+    assert load_review_workflow_sync(record.id) == record
+    assert "active_artifact_write_retry" not in context.user_data
+    [write] = list(get_db()["artifact_writes"].rows)
+    assert write["status"] == ArtifactWriteStatus.FAILED_TERMINAL.value
+    assert write["expected_revision"] == base.revision
+    if saved_gate:
+        context.bot.edit_message_text.assert_awaited_once()
+        update.callback_query.edit_message_text.assert_not_awaited()
+        sent = context.bot.edit_message_text.await_args.kwargs
+        assert sent["text"].startswith("*Original gate*")
+        assert sent["message_id"] == 999
+        text = sent["text"]
+    else:
+        context.bot.edit_message_text.assert_not_awaited()
+        update.callback_query.edit_message_text.assert_awaited_once()
+        sent = update.callback_query.edit_message_text.await_args.kwargs
+        text = update.callback_query.edit_message_text.await_args.args[0]
+    assert "review remains paused" in text
+    assert r"/weekly\_review" in text
+    assert sent["reply_markup"] is None
+    assert sent["parse_mode"] == "Markdown"
+
+
+@pytest.mark.asyncio
+async def test_confirm_legacy_review_requests_fresh_context_without_creating_write(
+    review_write_confirmation,
+):
+    """An unknown original revision cannot become a new write against today's file."""
+    base, record, update, context = review_write_confirmation
+    setattr(record.source_snapshot, f"{base.artifact_type.value}_revision", None)
+    save_review_workflow_sync(record)
+
+    with patch("bot.handlers.advance_review_after_confirmed_stage", new_callable=AsyncMock) as advance:
+        await handle_confirm(update, context)
+
+    advance.assert_not_awaited()
+    assert get_db()["artifact_writes"].count == 0
+    assert read_context_file(base.artifact_type) == base
+    assert load_review_workflow_sync(record.id) == record
+    context.bot.edit_message_text.assert_awaited_once()
+    notice = context.bot.edit_message_text.await_args.kwargs
+    assert "older review" in notice["text"]
+    assert r"/weekly\_review" in notice["text"]
+    assert notice["reply_markup"] is None
+    assert "active_artifact_write_retry" not in context.user_data
+
+
+@pytest.mark.asyncio
+async def test_retry_after_context_change_removes_terminal_retry_control(
+    review_write_confirmation,
+):
+    """A storage retry cannot overwrite an editor save made after the first attempt."""
+    base, record, update, context = review_write_confirmation
+    with patch("bot.handlers.advance_review_after_confirmed_stage", new_callable=AsyncMock) as advance:
+        with patch("persistence.context_files.os.replace", side_effect=OSError("disk error")):
+            await handle_confirm(update, context)
+        retry = context.user_data["active_artifact_write_retry"]
+        assert context.bot.edit_message_text.await_args.kwargs["reply_markup"] is not None
+        assert read_context_file(base.artifact_type) == base
+        failed = get_db()["artifact_writes"].get(retry["write_id"])
+        assert failed["status"] == ArtifactWriteStatus.FAILED_RETRYABLE.value
+        assert failed["expected_revision"] == base.revision
+        newer = replace_context_file(
+            base.artifact_type, "New editor context\n", expected_revision=base.revision,
+        )
+        update.callback_query.data = f"retry_artifact_write_{retry['write_id']}"
+
+        await handle_confirm(update, context)
+
+    advance.assert_not_awaited()
+    assert read_context_file(base.artifact_type) == newer
+    assert load_review_workflow_sync(record.id) == record
+    assert "active_artifact_write_retry" not in context.user_data
+    terminal = get_db()["artifact_writes"].get(retry["write_id"])
+    assert terminal["status"] == ArtifactWriteStatus.FAILED_TERMINAL.value
+    update.callback_query.edit_message_text.assert_awaited_once()
+    notice = update.callback_query.edit_message_text.await_args
+    assert "needs a new review" in notice.args[0]
+    assert r"/weekly\_review" in notice.args[0]
+    assert notice.kwargs["reply_markup"] is None
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["review", "proposal"])
@@ -1623,6 +1819,7 @@ async def test_handle_confirm_memory_audit_executes_decision_log_artifact_write(
     mock_advance_review_from_current_stage,
     mock_send_review_stage_gate,
 ):
+    """Memory confirmation preserves the review's captured document revision."""
     update = MagicMock()
     update.effective_user.id = 123
     update.callback_query = MagicMock()
@@ -1652,6 +1849,7 @@ async def test_handle_confirm_memory_audit_executes_decision_log_artifact_write(
             goals_markdown="# Goals",
             weekly_state_markdown="# Weekly State",
             decision_log_markdown="# Decision Log",
+            decision_log_revision=hashlib.sha256(b"# Decision Log").hexdigest(),
         ),
         memory_audit=StageCheckpoint(summary="Memory audit is ready."),
         decision_log_changes=ArtifactChangeSummary(
@@ -1678,6 +1876,7 @@ async def test_handle_confirm_memory_audit_executes_decision_log_artifact_write(
         id="awrite_memory",
         artifact_type=ArtifactType.DECISION_LOG,
         content=loaded_record.decision_log_changes.proposed_markdown,
+        expected_revision=loaded_record.source_snapshot.decision_log_revision,
         source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
         source_id="review_test",
         source_stage=ReviewStage.MEMORY_AUDIT.value,
@@ -1700,6 +1899,7 @@ async def test_handle_confirm_memory_audit_executes_decision_log_artifact_write(
         source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
         source_id="review_test",
         source_stage=ReviewStage.MEMORY_AUDIT.value,
+        expected_revision=loaded_record.source_snapshot.decision_log_revision,
     )
     mock_execute_artifact_write.assert_called_once_with(artifact_write)
     mock_transition_review_stage.assert_awaited_once_with(
@@ -1728,6 +1928,7 @@ async def test_handle_confirm_goals_audit_executes_goals_artifact_write(
     mock_advance_review_from_current_stage,
     mock_send_review_stage_gate,
 ):
+    """Goals confirmation uses the revision captured before the audit began."""
     update = MagicMock()
     update.effective_user.id = 123
     update.callback_query = MagicMock()
@@ -1757,6 +1958,7 @@ async def test_handle_confirm_goals_audit_executes_goals_artifact_write(
             goals_markdown="# Goals",
             weekly_state_markdown="# Weekly State",
             decision_log_markdown="# Decision Log",
+            goals_revision=hashlib.sha256(b"# Goals").hexdigest(),
         ),
         goals_audit=StageCheckpoint(summary="Goals audit is ready."),
         goals_changes=ArtifactChangeSummary(
@@ -1783,6 +1985,7 @@ async def test_handle_confirm_goals_audit_executes_goals_artifact_write(
         id="awrite_goals",
         artifact_type=ArtifactType.GOALS,
         content=loaded_record.goals_changes.proposed_markdown,
+        expected_revision=loaded_record.source_snapshot.goals_revision,
         source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
         source_id="review_test",
         source_stage=ReviewStage.GOALS_AUDIT.value,
@@ -1805,6 +2008,7 @@ async def test_handle_confirm_goals_audit_executes_goals_artifact_write(
         source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
         source_id="review_test",
         source_stage=ReviewStage.GOALS_AUDIT.value,
+        expected_revision=loaded_record.source_snapshot.goals_revision,
     )
     mock_execute_artifact_write.assert_called_once_with(artifact_write)
     mock_transition_review_stage.assert_awaited_once_with(
@@ -1833,6 +2037,7 @@ async def test_handle_confirm_memory_audit_recovers_when_weekly_plan_generation_
     mock_advance_review_from_current_stage,
     mock_send_review_stage_gate,
 ):
+    """A later reasoning failure preserves the already confirmed memory write."""
     update = MagicMock()
     update.effective_user.id = 123
     update.callback_query = MagicMock()
@@ -1863,6 +2068,7 @@ async def test_handle_confirm_memory_audit_recovers_when_weekly_plan_generation_
             goals_markdown="# Goals",
             weekly_state_markdown="# Weekly State",
             decision_log_markdown="# Decision Log",
+            decision_log_revision=hashlib.sha256(b"# Decision Log").hexdigest(),
         ),
         memory_audit=StageCheckpoint(summary="Memory audit is ready."),
         decision_log_changes=ArtifactChangeSummary(
@@ -1887,6 +2093,7 @@ async def test_handle_confirm_memory_audit_recovers_when_weekly_plan_generation_
         id="awrite_memory",
         artifact_type=ArtifactType.DECISION_LOG,
         content=loaded_record.decision_log_changes.proposed_markdown,
+        expected_revision=loaded_record.source_snapshot.decision_log_revision,
         source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
         source_id="review_test",
         source_stage=ReviewStage.MEMORY_AUDIT.value,
@@ -1930,6 +2137,7 @@ async def test_handle_confirm_memory_audit_failed_artifact_write_shows_retry(
     mock_transition_review_stage,
     mock_advance_review_from_current_stage,
 ):
+    """A storage failure retains the confirmed memory operation for retry."""
     update = MagicMock()
     update.effective_user.id = 123
     update.callback_query = MagicMock()
@@ -1957,6 +2165,7 @@ async def test_handle_confirm_memory_audit_failed_artifact_write_shows_retry(
             goals_markdown="# Goals",
             weekly_state_markdown="# Weekly State",
             decision_log_markdown="# Decision Log",
+            decision_log_revision=hashlib.sha256(b"# Decision Log").hexdigest(),
         ),
         memory_audit=StageCheckpoint(summary="Memory audit is ready."),
         decision_log_changes=ArtifactChangeSummary(
@@ -1967,6 +2176,7 @@ async def test_handle_confirm_memory_audit_failed_artifact_write_shows_retry(
         id="awrite_failed",
         artifact_type=ArtifactType.DECISION_LOG,
         content=loaded_record.decision_log_changes.proposed_markdown,
+        expected_revision=loaded_record.source_snapshot.decision_log_revision,
         source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
         source_id="review_test",
         source_stage=ReviewStage.MEMORY_AUDIT.value,
@@ -2500,6 +2710,7 @@ async def test_handle_confirm_weekly_plan_advances_to_scheduling_pass_gate(
     mock_send_review_stage_gate,
     mock_send_proposal_thread,
 ):
+    """Scheduling advances only after saving against the captured weekly revision."""
     update = MagicMock()
     update.effective_chat.id = 456
     update.effective_user.id = 123
@@ -2527,6 +2738,7 @@ async def test_handle_confirm_weekly_plan_advances_to_scheduling_pass_gate(
             goals_markdown="# Goals",
             weekly_state_markdown="# Weekly State",
             decision_log_markdown="# Decision Log",
+            weekly_state_revision=hashlib.sha256(b"# Weekly State").hexdigest(),
         ),
         weekly_state_changes=ArtifactChangeSummary(
             proposed_markdown="# Updated Weekly State",
@@ -2546,6 +2758,7 @@ async def test_handle_confirm_weekly_plan_advances_to_scheduling_pass_gate(
         id="awrite_weekly",
         artifact_type=ArtifactType.WEEKLY_STATE,
         content="# Updated Weekly State",
+        expected_revision=loaded_record.source_snapshot.weekly_state_revision,
         source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
         source_id="review_test",
         source_stage=ReviewStage.WEEKLY_PLAN.value,
@@ -2570,6 +2783,7 @@ async def test_handle_confirm_weekly_plan_advances_to_scheduling_pass_gate(
         source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
         source_id="review_test",
         source_stage=ReviewStage.WEEKLY_PLAN.value,
+        expected_revision=loaded_record.source_snapshot.weekly_state_revision,
     )
     mock_execute_artifact_write.assert_called_once_with(artifact_write)
     mock_load_review_workflow.assert_awaited_once_with("review_test")

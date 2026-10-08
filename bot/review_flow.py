@@ -21,7 +21,10 @@ from orchestrator.review_manager import (
     revise_review_stage,
     transition_review_stage,
 )
-from persistence.artifact_writes import list_retryable_artifact_writes_sync
+from persistence.artifact_writes import (
+    find_artifact_write_by_source_sync,
+    list_retryable_artifact_writes_sync,
+)
 from persistence.models import (
     ArtifactType,
     ArtifactWriteSourceType,
@@ -37,6 +40,10 @@ ACTIVE_ARTIFACT_WRITE_RETRY_KEY = "active_artifact_write_retry"
 ACTIVE_REVIEW_RESUME_PROMPT_KEY = "active_review_resume_prompt"
 ARTIFACT_MARKDOWN_CHUNK_SIZE = 3400
 REVIEW_GATE_MESSAGE_LIMIT = 3400
+
+
+class ReviewContextConflictError(RuntimeError):
+    """Tell the confirmation handler a fresh review is needed instead of a retry."""
 
 
 def select_latest_resumable_review(records):
@@ -585,7 +592,9 @@ async def apply_confirmed_review_stage_artifacts(
 
     Most checkpoint stages only advance. Memory audit and weekly plan also
     approve deterministic markdown replacements that downstream stages must see
-    before the workflow can continue.
+    before the workflow can continue. Writes use the review's captured revision,
+    never a new base read at confirmation. Context conflicts require a fresh
+    review; storage failures keep the confirmed operation available for retry.
     """
     artifact_by_stage = {
         ReviewStage.GOALS_AUDIT: ArtifactType.GOALS,
@@ -605,17 +614,60 @@ async def apply_confirmed_review_stage_artifacts(
     if changes is None or not changes.proposed_markdown:
         return True
 
-    write = create_artifact_write(
-        artifact_type=artifact_by_stage[stage],
-        content=changes.proposed_markdown,
-        source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
-        source_id=record.id,
-        source_stage=stage.value,
-    )
+    artifact_type = artifact_by_stage[stage]
+    revision_by_stage = {
+        ReviewStage.GOALS_AUDIT: record.source_snapshot.goals_revision,
+        ReviewStage.MEMORY_AUDIT: record.source_snapshot.decision_log_revision,
+        ReviewStage.WEEKLY_PLAN: record.source_snapshot.weekly_state_revision,
+    }
+    expected_revision = revision_by_stage[stage]
+    if expected_revision is None:
+        # Older reviews may already have a confirmed operation. Recover that
+        # exact operation, but never create a new write against today's file.
+        write = find_artifact_write_by_source_sync(
+            artifact_type=artifact_type,
+            source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
+            source_id=record.id,
+            source_stage=stage.value,
+        )
+        if write is None or write.content != changes.proposed_markdown:
+            context.user_data.pop(ACTIVE_ARTIFACT_WRITE_RETRY_KEY, None)
+            raise ReviewContextConflictError(
+                f"This older review cannot verify the original version of {artifact_type.value}.md. "
+                "Start a new review with /weekly_review."
+            )
+    else:
+        try:
+            write = create_artifact_write(
+                artifact_type=artifact_type,
+                content=changes.proposed_markdown,
+                source_type=ArtifactWriteSourceType.SUNDAY_REVIEW,
+                source_id=record.id,
+                source_stage=stage.value,
+                expected_revision=expected_revision,
+            )
+        except ValueError as error:
+            # A source ID identifies one confirmed draft. Revision feedback
+            # must not silently reuse a write for different text or a new base.
+            context.user_data.pop(ACTIVE_ARTIFACT_WRITE_RETRY_KEY, None)
+            raise ReviewContextConflictError(
+                "This stage already has a different confirmed context update. "
+                "Start a new review with /weekly_review."
+            ) from error
+
     executed_write = execute_artifact_write(write)
     if executed_write.status == ArtifactWriteStatus.EXECUTED:
         context.user_data.pop(ACTIVE_ARTIFACT_WRITE_RETRY_KEY, None)
         return True
+
+    if executed_write.status == ArtifactWriteStatus.FAILED_TERMINAL:
+        # Repeating a stale save would erase newer context. Do not expose it
+        # as a retryable operation or advance past this uncommitted stage.
+        context.user_data.pop(ACTIVE_ARTIFACT_WRITE_RETRY_KEY, None)
+        raise ReviewContextConflictError(
+            f"The proposed update to {artifact_type.value}.md can no longer be applied safely. "
+            "Start a new review with /weekly_review to use the latest context."
+        )
 
     context.user_data[ACTIVE_ARTIFACT_WRITE_RETRY_KEY] = {
         "write_id": executed_write.id,

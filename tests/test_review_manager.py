@@ -1,3 +1,4 @@
+import hashlib
 import json
 from unittest.mock import patch
 
@@ -19,8 +20,14 @@ from orchestrator.review_manager import (
     revise_review_stage,
     start_weekly_review_workflow,
 )
+from persistence.context_files import (
+    ContextConflictError,
+    read_context_file,
+    replace_context_file,
+)
 from persistence.models import (
     ArtifactChangeSummary,
+    ArtifactType,
     ReviewStage,
     ReviewWorkflowRecord,
     ReviewWorkflowStatus,
@@ -44,10 +51,24 @@ from reasoning.schemas import (
 )
 
 
-def test_legacy_snapshot_without_upcoming_events_loads_from_sqlite(tmp_path, monkeypatch):
-    """Reviews saved before upcoming calendar context remain resumable."""
+@pytest.fixture
+def review_context_dir(tmp_path, monkeypatch):
+    """Keep snapshot integration tests away from live context and review records."""
+    context_dir = tmp_path / "context"
+    context_dir.mkdir()
+    monkeypatch.setenv("DAVID_CONTEXT_DIR", str(context_dir))
+    monkeypatch.setenv("DAVID_DB_PATH", str(tmp_path / "assistant.db"))
+    return context_dir
+
+
+def test_legacy_snapshot_without_revisions_or_upcoming_events_loads_from_sqlite(tmp_path, monkeypatch):
+    """Older reviews remain resumable without guessing their original revisions."""
     from persistence.database import get_db, init_db
-    from persistence.review_workflows import load_resumable_review_workflows_sync
+    from persistence.review_workflows import (
+        load_resumable_review_workflows_sync,
+        load_review_workflow_sync,
+        save_review_workflow_sync,
+    )
 
     monkeypatch.setenv("DAVID_DB_PATH", str(tmp_path / "assistant.db"))
     init_db()
@@ -61,7 +82,9 @@ def test_legacy_snapshot_without_upcoming_events_loads_from_sqlite(tmp_path, mon
         ),
     )
     legacy_state = record.model_dump(mode="json")
-    legacy_state["source_snapshot"].pop("upcoming_events")
+    for field in ("upcoming_events", "goals_revision", "weekly_state_revision", "decision_log_revision"):
+        # Simulate the JSON actually stored before calendar and revision fields existed.
+        legacy_state["source_snapshot"].pop(field)
     get_db()["review_workflows"].insert({
         "id": record.id,
         "workflow_status": record.workflow_status.value,
@@ -74,18 +97,30 @@ def test_legacy_snapshot_without_upcoming_events_loads_from_sqlite(tmp_path, mon
     assert restored.id == record.id
     assert restored.source_snapshot.upcoming_events == []
     assert restored.source_snapshot.goals_markdown == "# Goals"
+    assert restored.source_snapshot.goals_revision is None
+    assert restored.source_snapshot.weekly_state_revision is None
+    assert restored.source_snapshot.decision_log_revision is None
+    save_review_workflow_sync(restored)
+    assert load_review_workflow_sync(restored.id) == restored
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("upcoming", [True, False])
 @patch("orchestrator.review_manager.get_effective_artifact_content", return_value="# Context")
-@patch("orchestrator.review_manager._read_context_markdown", return_value="# Context")
 @patch("orchestrator.review_manager.get_upcoming_events")
 @patch("orchestrator.review_manager.get_past_events")
 async def test_review_snapshot_carries_calendar_windows_into_scheduling(
-    mock_past, mock_upcoming, mock_read, mock_effective, upcoming,
+    mock_past, mock_upcoming, mock_effective, upcoming, review_context_dir,
 ):
     """Exercise snapshot creation so future events cannot disappear before planning."""
+    documents = {
+        ArtifactType.GOALS: "  # Goals\r\n- Keep café time  \r\n",
+        ArtifactType.WEEKLY_STATE: "# Weekly State\n- Focus this week\n",
+        ArtifactType.DECISION_LOG: "\n# Decision Log\n- Earlier decision\n\n",
+    }
+    for artifact_type, content in documents.items():
+        # Seed exact bytes so a snapshot cannot trim text or normalize line endings.
+        (review_context_dir / f"{artifact_type.value}.md").write_bytes(content.encode("utf-8"))
     mock_past.return_value = [{
         "summary": "Last week's work",
         "start": {"dateTime": "2026-09-14T09:00:00-04:00"},
@@ -110,6 +145,12 @@ async def test_review_snapshot_carries_calendar_windows_into_scheduling(
 
     mock_past.assert_called_once_with(days=7)
     mock_upcoming.assert_called_once_with(days=7)
+    for artifact_type, content in documents.items():
+        # Every review input must retain the revision of the text actually read.
+        assert getattr(snapshot, f"{artifact_type.value}_markdown") == content
+        assert getattr(snapshot, f"{artifact_type.value}_revision") == hashlib.sha256(
+            content.encode("utf-8")
+        ).hexdigest()
     assert "2026-09-14T10:00:00-04:00" in snapshot.past_week_events[0]
     if upcoming:
         # Check the consumer, not just the snapshot field, to protect this seam.
@@ -119,6 +160,93 @@ async def test_review_snapshot_carries_calendar_windows_into_scheduling(
         assert snapshot.upcoming_events == []
         assert "No events returned for this period." in prompt
         assert "No events found in the past week." not in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("artifact_type", list(ArtifactType))
+@patch("orchestrator.review_manager.get_upcoming_events", return_value=[])
+@patch("orchestrator.review_manager.get_past_events", return_value=[])
+async def test_review_snapshot_keeps_read_revision_when_document_changes(
+    mock_past, mock_upcoming, artifact_type, review_context_dir,
+):
+    """An edit after reading cannot pair frozen review text with a newer revision."""
+    from persistence.database import init_db
+    from persistence.review_workflows import load_review_workflow_sync, save_review_workflow_sync
+
+    init_db()
+    original = replace_context_file(
+        artifact_type, "  Original review input\r\n", expected_revision="missing",
+    )
+
+    def read_then_edit(requested_type):
+        """Apply an editor save immediately after the review's protected file read."""
+        document = read_context_file(requested_type)
+        if requested_type == artifact_type:
+            replace_context_file(
+                requested_type, "New editor content", expected_revision=document.revision,
+            )
+        return document
+
+    with patch("orchestrator.review_manager.read_context_file", side_effect=read_then_edit):
+        snapshot = await build_review_source_snapshot()
+    record = ReviewWorkflowRecord(
+        id="review_concurrent_edit",
+        created_at="2026-10-08T00:00:00+00:00",
+        updated_at="2026-10-08T00:00:00+00:00",
+        source_snapshot=snapshot,
+    )
+    save_review_workflow_sync(record)
+    restored = load_review_workflow_sync(record.id)
+    assert restored == record
+    revision = getattr(restored.source_snapshot, f"{artifact_type.value}_revision")
+    assert revision == original.revision
+    assert getattr(restored.source_snapshot, f"{artifact_type.value}_markdown") == original.content
+    current = read_context_file(artifact_type)
+    assert current.content == "New editor content"
+    assert current.revision != revision
+    with pytest.raises(ContextConflictError):
+        replace_context_file(artifact_type, "Review proposal", expected_revision=revision)
+    assert read_context_file(artifact_type) == current
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.get_upcoming_events", return_value=[])
+@patch("orchestrator.review_manager.get_past_events", return_value=[])
+async def test_review_snapshot_distinguishes_empty_and_missing_documents(
+    mock_past, mock_upcoming, review_context_dir,
+):
+    """An empty live file has a known revision; an absent file has a missing base."""
+    (review_context_dir / "weekly_state.md").write_bytes(b"")
+
+    snapshot = await build_review_source_snapshot()
+
+    assert snapshot.weekly_state_markdown == ""
+    assert snapshot.weekly_state_revision == hashlib.sha256(b"").hexdigest()
+    assert snapshot.goals_markdown == ""
+    assert snapshot.goals_revision == "missing"
+    assert snapshot.decision_log_markdown == ""
+    assert snapshot.decision_log_revision == "missing"
+
+
+@pytest.mark.asyncio
+@patch("orchestrator.review_manager.capture_sentry_exception")
+@patch("orchestrator.review_manager.get_upcoming_events", return_value=[])
+@patch("orchestrator.review_manager.get_past_events", return_value=[])
+async def test_review_snapshot_reports_storage_failure(
+    mock_past, mock_upcoming, mock_capture_exception, review_context_dir,
+):
+    """A broken file read prevents review creation and reaches failure reporting."""
+    (review_context_dir / "goals.md").mkdir()
+
+    with pytest.raises(IsADirectoryError) as failure:
+        await build_review_source_snapshot()
+
+    mock_capture_exception.assert_called_once_with(
+        failure.value,
+        component="review_manager",
+        operation="build_review_source_snapshot",
+        message="Failed to build the Sunday review source snapshot.",
+    )
 
 
 VALID_WEEKLY_STATE_MARKDOWN = """# Weekly State
@@ -170,12 +298,13 @@ This file stores durable goals and operating principles for David.
 
 
 @patch("orchestrator.artifact_writes.get_db")
-@patch("orchestrator.artifact_writes.get_context_dir")
+@patch("persistence.context_files.get_context_dir")
 def test_execute_weekly_state_update_persists_snapshot_and_writes_file(
     mock_get_context_dir,
     mock_get_db,
     tmp_path,
 ):
+    """Weekly saves keep the live file, undo backup, and snapshot consistent."""
     mock_get_context_dir.return_value = tmp_path
     weekly_state_path = tmp_path / "weekly_state.md"
     weekly_state_path.write_text("# Previous Weekly State", encoding="utf-8")
@@ -183,6 +312,10 @@ def test_execute_weekly_state_update_persists_snapshot_and_writes_file(
     success = execute_weekly_state_update("# Updated Weekly State")
 
     assert success is True
+    assert weekly_state_path.read_text(encoding="utf-8") == "# Updated Weekly State"
+    # The shared store preserves the previous document for the editor's undo history.
+    [backup_path] = list(tmp_path.glob("weekly_state_backup_*.md"))
+    assert backup_path.read_text(encoding="utf-8") == "# Previous Weekly State"
     mock_get_db.return_value["weekly_snapshots"].insert.assert_called_once()
     snapshot_row = mock_get_db.return_value["weekly_snapshots"].insert.call_args.args[0]
     assert snapshot_row["weekly_state_content"] == "# Updated Weekly State"
@@ -1373,11 +1506,12 @@ async def test_repair_review_stage_for_gate_recovers_missing_final_review_checkp
 
 
 @patch("orchestrator.artifact_writes.capture_sentry_exception")
-@patch("orchestrator.artifact_writes.get_context_dir", side_effect=OSError("disk error"))
+@patch("persistence.context_files.get_context_dir", side_effect=OSError("disk error"))
 def test_execute_weekly_state_update_reports_failures(
     mock_get_context_dir,
     mock_capture_exception,
 ):
+    """Storage failures still reach the weekly-review failure reporting path."""
     success = execute_weekly_state_update("# Updated Weekly State")
 
     assert success is False

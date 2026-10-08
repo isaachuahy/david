@@ -8,12 +8,12 @@ from telegram.ext import Application, ContextTypes
 
 from observability.sentry import capture_exception as capture_sentry_exception
 from observability.context_usage import finish_session_usage, usage_scope
+from persistence.context_files import append_to_decision_log as append_context_decision_log
 from persistence.database import get_db
 from orchestrator.confirmation_queue import get_pending_write, reject_write
 from orchestrator.trigger_scheduler import prompt_next_trigger
 from persistence.models import CalendarWriteStatus, SessionRecord, SessionStatus
 from reasoning.flash_client import generate_session_synthesis
-from runtime_paths import get_context_dir
 
 SESSION_INACTIVITY_TIMEOUT = timedelta(minutes=30)
 SESSION_TIMEOUT_JOB_PREFIX = "session_inactivity_timeout"
@@ -200,12 +200,9 @@ def reconcile_orphaned_sessions() -> int:
     logger.info(f"Reconciled {len(orphaned_sessions)} orphaned ACTIVE/CLOSING session(s).")
     return len(orphaned_sessions)
 
-def append_to_decision_log(content: str):
-    """Appends synthesized session notes to the decision log."""
-    decision_log_path = get_context_dir() / "decision_log.md"
-    decision_log_path.parent.mkdir(parents=True, exist_ok=True)
-    with decision_log_path.open("a", encoding="utf-8") as f:
-        f.write(f"\n\n{content.strip()}\n")
+def append_to_decision_log(content: str) -> None:
+    """Append session notes through the shared context store; propagate storage errors."""
+    append_context_decision_log(content)
 
 def persist_decision(session_id: str, content: str):
     """Persists a synthesized session decision block to SQLite."""
