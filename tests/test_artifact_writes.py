@@ -241,7 +241,6 @@ def test_retry_artifact_write_marks_already_applied_content_executed(
 
 
 def test_stale_write_preserves_newer_context(pending_goal_write):
-    """A draft confirmed against an older base cannot overwrite a later edit."""
     current = read_context_file(ArtifactType.GOALS)
     newer = replace_context_file(
         ArtifactType.GOALS,
@@ -266,7 +265,6 @@ def test_stale_write_preserves_newer_context(pending_goal_write):
 
 
 def test_disk_failure_retry_preserves_original_revision(pending_goal_write, artifact_runtime):
-    """An I/O retry reapplies the confirmed payload with its original file base."""
     original = read_context_file(ArtifactType.GOALS)
     with patch("persistence.context_files.os.replace", side_effect=OSError("disk full")):
         failed = execute_artifact_write(pending_goal_write)
@@ -287,7 +285,6 @@ def test_disk_failure_retry_preserves_original_revision(pending_goal_write, arti
 
 
 def test_retry_refuses_edits_made_after_disk_failure(pending_goal_write):
-    """Retry must not adopt a newer revision to force an old failed draft through."""
     with patch("persistence.context_files.os.replace", side_effect=OSError("disk full")):
         failed = execute_artifact_write(pending_goal_write)
 
@@ -307,7 +304,6 @@ def test_retry_refuses_edits_made_after_disk_failure(pending_goal_write):
 
 
 def test_completed_write_does_not_replay_over_later_edits(pending_goal_write):
-    """Repeated execution of a completed save preserves subsequent manual edits."""
     executed = execute_artifact_write(pending_goal_write)
     current = read_context_file(ArtifactType.GOALS)
     newer = replace_context_file(
@@ -360,7 +356,6 @@ def test_legacy_write_requires_base_unless_already_applied(artifact_runtime, alr
     ids=["different_content", "different_base"],
 )
 def test_operation_reuse_rejects_different_payload_or_base(pending_goal_write, override):
-    """Reusing a save ID cannot authorize a different document or refresh its base."""
     arguments = {
         "artifact_type": pending_goal_write.artifact_type,
         "content": pending_goal_write.content,
@@ -380,7 +375,6 @@ def test_operation_reuse_rejects_different_payload_or_base(pending_goal_write, o
 
 
 def test_duplicate_save_reuses_original_operation(pending_goal_write):
-    """Repeated editor requests produce one durable operation and one file change."""
     executed = execute_artifact_write(pending_goal_write)
     duplicate = create_artifact_write(
         artifact_type=executed.artifact_type,
@@ -485,7 +479,6 @@ def test_concurrent_identical_payload_does_not_replace_twice(pending_goal_write)
 
 
 def test_session_append_invalidates_older_editor_draft(artifact_runtime):
-    """An editor cannot erase synthesized notes appended after it loaded memory."""
     base = append_to_decision_log("## Recent Decisions (Appended Daily)\n- Earlier note")
     record = create_artifact_write(
         artifact_type=ArtifactType.DECISION_LOG,

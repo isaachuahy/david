@@ -35,7 +35,6 @@ def session_context_dir(tmp_path, monkeypatch):
 
 
 def test_session_append_preserves_memory_and_rejects_stale_editor_save(session_context_dir):
-    """Session synthesis preserves exact earlier text and invalidates old drafts."""
     base = replace_context_file(
         ArtifactType.DECISION_LOG,
         "# Memory\r\n- Earlier decision  \r\n",
@@ -60,7 +59,6 @@ def test_session_append_preserves_memory_and_rejects_stale_editor_save(session_c
 
 
 def test_concurrent_session_appends_preserve_every_note(session_context_dir):
-    """Overlapping session workers cannot overwrite each other's synthesized notes."""
     append_to_decision_log("Earlier decision")
     base = read_context_file(ArtifactType.DECISION_LOG)
     # Start all workers together to exercise the storage boundary shared by
@@ -79,13 +77,11 @@ def test_concurrent_session_appends_preserve_every_note(session_context_dir):
     current = read_context_file(ArtifactType.DECISION_LOG)
     assert current.content.startswith(base.content)
     for note in notes:
-        # Each queued synthesis must appear once in the resulting live memory.
         assert current.content.count(f"\n\n{note}\n") == 1
     assert len(list_context_versions(ArtifactType.DECISION_LOG)) == len(notes)
 
 
 def test_session_append_propagates_storage_failure_without_erasing_memory(session_context_dir):
-    """A failed publish leaves live memory intact and lets synthesis report failure."""
     append_to_decision_log("Earlier decision")
     base = read_context_file(ArtifactType.DECISION_LOG)
 
@@ -99,7 +95,6 @@ def test_session_append_propagates_storage_failure_without_erasing_memory(sessio
 
 @pytest.mark.parametrize("content", ["", "  ", "\n\t\n"])
 def test_empty_session_note_does_not_change_memory(session_context_dir, content):
-    """Empty synthesis adds neither blank text nor a version to memory history."""
     append_to_decision_log("Earlier decision")
     base = read_context_file(ArtifactType.DECISION_LOG)
 

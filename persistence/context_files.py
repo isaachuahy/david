@@ -214,7 +214,6 @@ def list_context_versions(artifact_type: ArtifactType) -> list[ContextVersion]:
             )
             versions.append((metadata.st_mtime_ns, version))
         versions.sort(key=lambda entry: (entry[0], entry[1].version_id), reverse=True)
-        # Return metadata only; the user chooses a version before loading text.
         return [version for _, version in versions]
 
 

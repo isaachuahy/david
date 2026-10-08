@@ -201,13 +201,7 @@ def reconcile_orphaned_sessions() -> int:
     return len(orphaned_sessions)
 
 def append_to_decision_log(content: str) -> None:
-    """Append session notes through the same protected store as editor saves.
-
-    The shared store keeps existing text and an undo backup, then publishes
-    the complete file atomically. Its lock prevents overlapping bot writes,
-    and its new revision prevents an older editor draft from erasing notes.
-    Storage errors propagate to the synthesis task's failure reporting.
-    """
+    """Append session notes through the shared context store; propagate storage errors."""
     append_context_decision_log(content)
 
 def persist_decision(session_id: str, content: str):

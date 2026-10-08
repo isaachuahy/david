@@ -184,10 +184,6 @@ def _rollback_failed_router_turn(context: ContextTypes.DEFAULT_TYPE, user_text: 
         chat_history.pop()
 
 
-# Handlers for Telegram bot commands and messages.
-# These are the entry points for all user interactions, and they delegate to the Router and other orchestrator components to handle the logic and state management. 
-# The handlers also manage session state and ensure that the user experience is smooth and responsive, even when waiting for LLM responses or handling confirmations.
-
 @authorized_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /start command."""
